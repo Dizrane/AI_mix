@@ -101,6 +101,8 @@ struct AudioAssetExtractor: Sendable {
         visit(root)
         return result
     }
+    /// Package-builder entry point: re-resolve an asset's REAL exported file on disk (same matching as extraction). Used for a final filesystem resolution before copying into the package.
+    func resolvedFile(audioID: String, trackName: String, in directory: URL) -> URL? { resolveExportedFile(audioID: audioID, trackName: trackName, in: directory) }
     /// Unambiguous WAV↔track match: the canonical `audio_track_NNN.wav` first, then a file named after the Logic track (what Logic's "All Tracks as Audio Files…" produces). No manual path entry needed.
     private func resolveExportedFile(audioID: String, trackName: String, in directory: URL) -> URL? {
         let manager = FileManager.default
