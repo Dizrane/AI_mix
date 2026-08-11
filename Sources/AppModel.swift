@@ -22,17 +22,27 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
     func ensurePluginInventory() { if availablePlugins.isEmpty { availablePlugins = pluginInventory.discoverAvailable() } }
     func generateAIPackage() { guard let snapshot = normalized else { aiPackageStatus = "Run a full analysis first."; return }; ensurePluginInventory(); aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: audioAssets, plugins: availablePlugins); let r = packageReadiness; aiPackageStatus = "AI package generated (\(r.overall.rawValue)) · \(availablePlugins.count) plugins available." + (r.audioTotal > 0 && r.audioExported < r.audioTotal ? " Audio incomplete: \(r.audioTotal - r.audioExported) WAV missing." : "") }
     func savePackage() {
-        guard let snapshot = normalized, let store else { aiPackageStatus = "Run a full analysis first."; return }
+        guard let snapshot = normalized, let raw, let store else { aiPackageStatus = "Run a full analysis first."; return }
         ensurePluginInventory()
-        let markdown = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: audioAssets, plugins: availablePlugins); aiPackage = markdown
         let project = snapshot.project.name.value ?? "project"
-        let audioManifest = AudioManifest(assets: audioAssets); let packageManifest = PackageManifest(project: project, assets: audioAssets); let r = packageReadiness
         Task {
+            // Final filesystem resolution before assembling: re-resolve every asset against the confirmed current/audio directory
+            // (resolveExportedFile) and re-validate with AVAudioFile, so actualExportedPath and status reflect the real files right now.
+            let audioDir = await store.folderURL("audio")
+            let freshAssets = audioExtractor.extract(raw: raw, normalized: snapshot, audioDirectory: audioDir)
+            audioAssets = freshAssets
+            let markdown = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins); aiPackage = markdown
+            let audioManifest = AudioManifest(assets: freshAssets); let packageManifest = PackageManifest(project: project, assets: freshAssets)
+            let expected = freshAssets.filter { $0.status == .exported }.count
             do {
-                let result = try await store.savePackage(projectName: project, markdown: markdown, snapshot: snapshot, audioManifest: audioManifest, packageManifest: packageManifest, assets: audioAssets)
+                let result = try await store.savePackage(projectName: project, markdown: markdown, snapshot: snapshot, audioManifest: audioManifest, packageManifest: packageManifest, assets: freshAssets, audioExtractor: audioExtractor, probe: AudioFileProbe())
                 packageFolderURL = result.folder; packageZipURL = result.zip; aiPackageURL = result.folder.appendingPathComponent("AI_MIX_ANALYSIS.md")
-                aiPackageStatus = "Package saved (\(r.overall.rawValue)) — \(result.copiedWAVs) WAV copied\(result.zip != nil ? ", zip ready" : "").\(r.audioTotal > 0 && r.audioExported < r.audioTotal ? " Audio incomplete: \(r.audioTotal - r.audioExported) WAV missing." : "")"
-                log.append("Package saved to \(result.folder.path) (\(result.copiedWAVs) WAV, zip: \(result.zip != nil)).")
+                if result.copiedWAVs == expected && result.missing.isEmpty {
+                    aiPackageStatus = "Package saved (\(packageReadiness.overall.rawValue)) — \(result.copiedWAVs)/\(expected) WAV copied\(result.zip != nil ? ", zip ready" : "")."
+                } else {
+                    aiPackageStatus = "Package incomplete — \(result.copiedWAVs)/\(expected) WAV copied; not ready. Missing: \(result.missing.joined(separator: "; "))"
+                }
+                log.append("Package saved to \(result.folder.path): \(result.copiedWAVs)/\(expected) WAV copied, zip: \(result.zip != nil).")
             } catch { aiPackageStatus = "Could not save package: \(error.localizedDescription)" }
         }
     }
@@ -127,19 +137,35 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
             }
         }
     }
-    /// Polls the audio folder for real WAVs and verifies each via AVAudioFile (inside the extractor). Status comes only from files that actually exist and open.
+    /// Waits for the REAL final WAVs, then finalises. Logic may briefly write `<name>.wav` and then rename it to `<name>_1.wav`;
+    /// to avoid recording an intermediate file, the export is only considered done when every track is exported AND the resolved
+    /// file set + sizes are unchanged between two consecutive scans (stable final names, not mid-write / mid-rename). A final
+    /// authoritative rescan then sets `actualExportedPath` from the files that actually exist. Each file is still validated via AVAudioFile inside the extractor.
     private func pollForExports(audioDir: URL) async {
         guard let store, let raw, let normalized else { exportPhase = .idle; return }
-        var assets = audioAssets
-        for _ in 0..<40 { // up to ~2 minutes
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            assets = audioExtractor.extract(raw: raw, normalized: normalized, audioDirectory: audioDir)
+        func fileSignature(_ assets: [AudioAsset]) -> [String] {
+            assets.filter { $0.status == .exported }.compactMap { asset -> String? in
+                guard let relative = asset.actualExportedPath.value else { return nil }
+                let url = audioDir.appendingPathComponent((relative as NSString).lastPathComponent)
+                let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int
+                return "\(asset.audioID)|\(relative)|\(size.map(String.init) ?? "?")"
+            }.sorted()
+        }
+        var previousSignature: [String]? = nil
+        for _ in 0..<80 { // up to ~2 minutes at 1.5s
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            let assets = audioExtractor.extract(raw: raw, normalized: normalized, audioDirectory: audioDir)
             audioAssets = assets
             let summary = AudioManifest(assets: assets).summary
             audioStatus = "Detecting exported WAV… \(summary.exported)/\(summary.assets) ready."
-            if summary.assets > 0 && summary.exported == summary.assets { break }
+            let signature = fileSignature(assets)
+            if summary.assets > 0, summary.exported == summary.assets, signature == previousSignature { break } // stable final state
+            previousSignature = signature
         }
-        let manifest = AudioManifest(assets: assets); let summary = manifest.summary
+        // Final authoritative rescan of the audio directory — `exported` and `actualExportedPath` come only from the files that really exist now.
+        let finalAssets = audioExtractor.extract(raw: raw, normalized: normalized, audioDirectory: audioDir)
+        audioAssets = finalAssets
+        let manifest = AudioManifest(assets: finalAssets); let summary = manifest.summary
         _ = try? await store.save(manifest, folder: "metadata", name: "audio_manifest.json")
         _ = try? await store.saveText(manifest.markdown(), folder: "metadata", name: "AUDIO_ASSETS.md")
         if !aiPackage.isEmpty { generateAIPackage() }

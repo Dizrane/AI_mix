@@ -235,13 +235,11 @@ struct AnalysisScreen: View {
     }
     @ViewBuilder private func checklist(_ s: NormalizedSnapshot) -> some View {
         let sends = s.tracks.reduce(0) { $0 + ($1.channel?.sends.count ?? 0) }
-        let plugins = s.tracks.reduce(0) { $0 + ($1.channel?.plugins.count ?? 0) }
         VStack(alignment: .leading, spacing: 8) {
             CheckRow(title: "Logic connection", detail: model.connection.localizedName ?? "Logic Pro")
             CheckRow(title: "Project discovery", detail: projectSummary(s))
             CheckRow(title: "Track discovery", detail: "\(s.linking.logicalTracks) logical tracks")
             CheckRow(title: "Channel discovery", detail: "\(s.linking.channelCandidates) mixer channels")
-            CheckRow(title: "Plugin discovery", detail: plugins == 0 ? "none loaded" : "\(plugins)")
             CheckRow(title: "Routing & sends", detail: sends == 0 ? "none" : "\(sends) sends")
             CheckRow(title: "Snapshot generation", detail: "saved to Data/current")
         }
@@ -337,6 +335,10 @@ struct PackageScreen: View {
                 Divider()
                 StatusRow("AI Package", packageLabel, packageState)
             }
+            HStack(spacing: 16) {
+                Text("Plugins").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+                Label("Available: \(model.availablePlugins.count)", systemImage: "square.stack.3d.up").font(.caption).foregroundStyle(.secondary)
+            }
             if !r.errors.isEmpty { Card { ForEach(r.errors, id: \.self) { Label($0, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.red) } } }
             if !r.missingAudio.isEmpty {
                 Card {
@@ -360,6 +362,7 @@ struct PackageScreen: View {
             }
             StageFooter(title: "Continue to Review", enabled: !model.aiPackage.isEmpty) { model.go(to: .review) }
         }
+        .onAppear { model.ensurePluginInventory() }
     }
     private var packageLabel: String { switch r.overall { case .ready: "Ready"; case .incomplete: "Incomplete"; case .error: "Integrity error"; case .notReady: "Not ready" } }
     private var packageState: IndicatorState { switch r.overall { case .ready: .ok; case .incomplete: .warn; case .error: .error; case .notReady: .idle } }

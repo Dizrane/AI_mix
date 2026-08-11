@@ -17,9 +17,13 @@ actor SessionStore {
     func reveal(url: URL) { NSWorkspace.shared.activateFileViewerSelecting([url]) }
     /// Clears only audio files inside the app-owned current/audio working folder before a fresh export. Never touches other locations.
     func clearAudioFiles() { let dir = folderURL("audio"); let manager = FileManager.default; guard let files = try? manager.contentsOfDirectory(atPath: dir.path) else { return }; for file in files where ["wav", "aif", "aiff", "caf"].contains((file as NSString).pathExtension.lowercased()) { try? manager.removeItem(at: dir.appendingPathComponent(file)) } }
-    /// Assembles current/package with the markdown, JSON snapshots and only the REAL exported WAVs, then best-effort zips it. Never fabricates files.
-    func savePackage(projectName: String, markdown: String, snapshot: NormalizedSnapshot, audioManifest: AudioManifest, packageManifest: PackageManifest, assets: [AudioAsset]) throws -> (folder: URL, zip: URL?, copiedWAVs: Int) {
+    /// Assembles current/package with the markdown, JSON snapshots and the REAL exported WAVs, then best-effort zips it. Never fabricates files.
+    /// Each exported asset is resolved against the confirmed audio directory (current/audio) at copy time — `actualExportedPath` if it still
+    /// exists, otherwise re-resolved via the extractor — validated with AVAudioFile, copied, and the destination is verified. `copiedWAVs`
+    /// counts only files that were actually written; `missing` names any exported asset whose WAV could not be resolved/validated/copied.
+    func savePackage(projectName: String, markdown: String, snapshot: NormalizedSnapshot, audioManifest: AudioManifest, packageManifest: PackageManifest, assets: [AudioAsset], audioExtractor: AudioAssetExtractor, probe: AudioFileProbe) throws -> (folder: URL, zip: URL?, copiedWAVs: Int, missing: [String]) {
         let manager = FileManager.default
+        let audioDir = folderURL("audio") // the confirmed source directory: current/audio
         let pkg = sessionURL.appendingPathComponent("package", isDirectory: true)
         if manager.fileExists(atPath: pkg.path) { try manager.removeItem(at: pkg) }
         try manager.createDirectory(at: pkg.appendingPathComponent("audio"), withIntermediateDirectories: true)
@@ -27,20 +31,30 @@ actor SessionStore {
         try JSONEncoder.pretty.encode(snapshot).write(to: pkg.appendingPathComponent("logic_snapshot.json"), options: .atomic)
         try JSONEncoder.pretty.encode(audioManifest).write(to: pkg.appendingPathComponent("audio_manifest.json"), options: .atomic)
         try JSONEncoder.pretty.encode(packageManifest).write(to: pkg.appendingPathComponent("manifest.json"), options: .atomic)
-        var copied = 0
+        var copied = 0; var missing: [String] = []
         for asset in assets where asset.status == .exported {
-            guard let relative = asset.actualExportedPath.value else { continue }
-            let source = sessionURL.appendingPathComponent(relative)
-            let destination = pkg.appendingPathComponent(relative)
-            guard manager.fileExists(atPath: source.path) else { continue }
+            let label = asset.trackName.value ?? asset.audioID
+            // 1. Final filesystem resolution: prefer actualExportedPath if the file still exists, else re-resolve the real file in current/audio.
+            var source: URL? = nil
+            if let relative = asset.actualExportedPath.value {
+                let candidate = sessionURL.appendingPathComponent(relative)
+                if manager.fileExists(atPath: candidate.path) { source = candidate }
+            }
+            if source == nil { source = audioExtractor.resolvedFile(audioID: asset.audioID, trackName: asset.trackName.value ?? "", in: audioDir) }
+            guard let realFile = source, manager.fileExists(atPath: realFile.path) else { missing.append("\(label): no WAV found in current/audio"); continue }
+            // 2. Validate the real file via AVAudioFile before counting it.
+            guard probe.read(realFile) != nil else { missing.append("\(label): \(realFile.lastPathComponent) is not a readable audio file"); continue }
+            // 3. Copy the actual file into package/audio/<actual filename>, then 4. verify the destination exists.
+            let destination = pkg.appendingPathComponent("audio").appendingPathComponent(realFile.lastPathComponent)
             if manager.fileExists(atPath: destination.path) { try? manager.removeItem(at: destination) }
-            try manager.copyItem(at: source, to: destination); copied += 1
+            do { try manager.copyItem(at: realFile, to: destination) } catch { missing.append("\(label): copy failed (\(error.localizedDescription))"); continue }
+            if manager.fileExists(atPath: destination.path) { copied += 1 } else { missing.append("\(label): destination missing after copy") }
         }
         let safeName = projectName.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: ":", with: "_")
         let zipURL = sessionURL.appendingPathComponent("AI_Mix_Analysis_\(safeName.isEmpty ? "project" : safeName).zip")
         if manager.fileExists(atPath: zipURL.path) { try? manager.removeItem(at: zipURL) }
         let zip: URL? = ((try? runDitto(source: pkg, dest: zipURL)) == true) ? zipURL : nil
-        return (pkg, zip, copied)
+        return (pkg, zip, copied, missing)
     }
     private func runDitto(source: URL, dest: URL) throws -> Bool {
         let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto"); process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", source.path, dest.path]
