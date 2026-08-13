@@ -39,6 +39,13 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
                 analysisSessionID = "analysis_\(ISO8601DateFormatter().string(from: Date()))"
                 raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil
                 log.append("Previous AI Mix Assistant analysis data removed. Starting a clean read-only scan.")
+                let exporter = exporter
+                let mixerOutcome = await Task.detached(priority: .userInitiated) { exporter.ensureMixerVisible() }.value
+                switch mixerOutcome {
+                case .alreadyVisible: log.append("Logic's Mixer is already visible.")
+                case .opened(let item): log.append("Opened Logic's Mixer via \u{2018}\(item)\u{2019} so the scan sees every channel strip.")
+                case .failed(let step, let detail): log.append("Could not open Logic's Mixer automatically (\(step)): \(detail) The scan continues, but channel-strip facts may be missing — open the Mixer (X) in Logic and rescan for full data.")
+                }
                 let analyzer = analyzer
                 let onProgress: @Sendable (Int) -> Void = { [weak self] count in Task { @MainActor in self?.scanProgress = count } }
                 let work = Task.detached(priority: .userInitiated) { try analyzer.fullScan(progress: onProgress) }
