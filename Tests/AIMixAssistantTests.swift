@@ -111,13 +111,38 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
 @Test func packageRendersProvenSendsAndClassifiedRouting() {
     let s = normalize(headers: [], strips: [realStrip("c1", "Aux 1", output: "Stereo Output", sends: [("Bus 3", "0")], emptySendSlots: 1, afterChannelMode: "Bus 1")])
     let md = AIPackageGenerator().make(snapshot: s, sessionID: "t")
-    #expect(md.contains("- Output: known: Stereo Output"))
-    #expect(md.contains("- Input: known: Bus 1"))
-    #expect(md.contains("- Destination: known: Bus 3"))
+    #expect(md.contains("- Output: known: Stereo Output · kind: stereo_output"))
+    #expect(md.contains("- Input: known: Bus 1 · kind: bus"))
+    #expect(md.contains("- Destination: known: Bus 3 · kind: bus"))
     #expect(md.contains("- Bypass: known: false"))
     #expect(md.contains("- Level: requires_probe"))
     #expect(md.contains("- none: no destination button on this strip is left unclassified"))
     #expect(!md.contains("no confirmed send facts"))
+}
+@Test func destinationKindsFollowLogicCaptionGrammar() {
+    // The kind separates "output to the stereo bus" from "output into a bus" (and hardware I/O) without weakening honesty:
+    // it is derived from the same caption grammar the routing classifier accepts, and an unknown caption gets NO kind.
+    #expect(RoutingDestinationKind.classify("Bus 12") == .bus)
+    #expect(RoutingDestinationKind.classify("St Out") == .stereoOutput)
+    #expect(RoutingDestinationKind.classify("Stereo Out") == .stereoOutput)
+    #expect(RoutingDestinationKind.classify("Stereo Output") == .stereoOutput)
+    #expect(RoutingDestinationKind.classify("Output 1-2") == .hardwareOutput)
+    #expect(RoutingDestinationKind.classify("Output") == .hardwareOutput)
+    #expect(RoutingDestinationKind.classify("Input 3") == .hardwareInput)
+    #expect(RoutingDestinationKind.classify("Input 1-2") == .hardwareInput)
+    #expect(RoutingDestinationKind.classify("No Output") == .notConnected)
+    #expect(RoutingDestinationKind.classify("No Input") == .notConnected)
+    #expect(RoutingDestinationKind.classify("Mastering Assistant") == nil)
+    #expect(RoutingDestinationKind.classify("Bus") == nil) // no number: not a destination caption Logic uses
+}
+@Test func unclassifiedRoutingButtonsStillCarryTheirDestinationKind() {
+    // A button whose SLOT stays requires_probe still names a grammar-proven destination, and the kind narrows what the
+    // slot could be: a "St Out" destination can be an output but never a send or an aux input (sends feed buses).
+    let s = normalize(headers: [headerNode("h", "Track 6 “Audio 5”")], strips: [stripNode("c", "Audio 5")])
+    let md = AIPackageGenerator().make(snapshot: s, sessionID: "t")
+    #expect(md.contains("- Destination: known: Bus 1 · kind: bus"))
+    #expect(md.contains("- Destination: known: St Out · kind: stereo_output"))
+    #expect(md.contains("Slot kind (send / output / aux input): requires_probe"))
 }
 
 // MARK: - Track ↔ Channel linking (regression scenarios A–E)
@@ -349,7 +374,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.7`"))
+    #expect(md.contains("Package schema: `2.8`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -567,7 +592,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.7`"))
+    #expect(md.contains("Package schema: `2.8`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
