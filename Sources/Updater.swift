@@ -53,7 +53,28 @@ struct AppUpdater: Sendable {
         return AppUpdate(tag: release.tag_name, assetName: asset.name, assetURL: asset.browser_download_url)
     }
 
+    /// The GitHub website's `releases/latest` page redirects to `releases/tag/<tag>`. Unlike the JSON API, that web endpoint
+    /// has no anonymous 60-requests/hour-per-IP rate limit — a real user on a shared network hit that limit and every update
+    /// check answered 403 — so the redirect is the primary source of the latest tag and the API is only the fallback. The
+    /// asset name and URL follow the Release workflow's fixed naming scheme; a wrong construction cannot install anything,
+    /// because the download fails on a missing asset and the unpacked bundle is verified against the tag before the swap.
+    static func update(fromLatestReleasePage url: URL) -> AppUpdate? {
+        let parts = url.pathComponents
+        guard parts.count >= 2, parts[parts.count - 2] == "tag" else { return nil }
+        let tag = parts[parts.count - 1]
+        guard parseVersion(tag) != nil else { return nil }
+        let asset = "AI-Mix-Assistant-\(tag)-macos-universal.zip"
+        guard let assetURL = URL(string: "https://github.com/\(repository)/releases/download/\(tag)/\(asset)") else { return nil }
+        return AppUpdate(tag: tag, assetName: asset, assetURL: assetURL)
+    }
+
     func latestRelease() async throws -> AppUpdate {
+        var pageRequest = URLRequest(url: URL(string: "https://github.com/\(Self.repository)/releases/latest")!)
+        pageRequest.httpMethod = "HEAD"
+        pageRequest.timeoutInterval = 15
+        if let (_, response) = try? await URLSession.shared.data(for: pageRequest),
+           let http = response as? HTTPURLResponse, http.statusCode == 200, let page = http.url,
+           let update = Self.update(fromLatestReleasePage: page) { return update }
         var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(Self.repository)/releases/latest")!)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 15
@@ -166,7 +187,7 @@ enum UpdateError: LocalizedError {
     case noAppAsset(String)
     var errorDescription: String? {
         switch self {
-        case .badResponse(let code): "GitHub answered \(code.map(String.init) ?? "with no HTTP status") instead of the latest release."
+        case .badResponse(let code): "GitHub answered \(code.map(String.init) ?? "with no HTTP status") instead of the latest release." + (code == 403 ? " A 403 usually means GitHub's anonymous API rate limit for this network (60 requests/hour per address); try again later." : "")
         case .noAppAsset(let tag): "Release \(tag) has no AI-Mix-Assistant ZIP asset to download."
         }
     }
