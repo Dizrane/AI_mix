@@ -118,6 +118,13 @@ private func projectSnapshot(_ nodes: [RawAccessibilityNode], windowTitle: Strin
     let labelOnly = projectSnapshot([ax("AXStaticText", id: "label", title: "Tempo")])
     #expect(labelOnly.project.tempo.state == .unavailable)
 }
+@Test func transportStateNeedsAStateNotASwitchPosition() {
+    // Logic's play/stop controls publish "0"/"1"; that is not a transport state and was published as "Transport: known: 0".
+    let numeric = projectSnapshot([ax("AXButton", id: "play", desc: "Play", value: "0")])
+    #expect(numeric.project.transportState.state == .unknown); #expect(numeric.project.transportState.value == nil)
+    let textual = projectSnapshot([ax("AXStaticText", id: "lcd", desc: "Transport", value: "Playing")])
+    #expect(textual.project.transportState.value == "Playing")
+}
 @Test func projectNameComesFromTheMainWindowDocument() {
     let s = projectSnapshot([], windowTitle: "fanlove — Tracks", document: "file:///Users/dizrane/Music/Logic/fanlove.logicx")
     #expect(s.project.name.value == "fanlove") // the project file name wins over the window title, which carries the view name
@@ -259,12 +266,23 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 // MARK: - AI package: delivery modes & rendering polish
 
-@Test func packageDeclaresDeliveryModes() {
-    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t")
-    #expect(md.contains("Package schema: `2.2`"))
-    #expect(md.contains("Delivery modes"))
-    #expect(md.contains("FULL PACKAGE")); #expect(md.contains("THIS DOCUMENT ONLY")); #expect(md.contains("NO AUDIO CAPABILITY"))
-    #expect(md.contains("NEVER pretend to have listened"))
+@Test func packageStatesTheFullPackageDelivery() {
+    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
+    #expect(md.contains("Package schema: `2.3`"))
+    #expect(md.contains("DELIVERY: FULL PACKAGE"))
+    #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
+    #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
+}
+/// What "Copy for AI" hands over: no JSON, no WAVs. The document must not send the reader looking for files or invite a faked
+/// listening report — the earlier text ordered exactly that even when only the Markdown was pasted.
+@Test func markdownOnlyDeliveryNeverAsksForFilesOrListening() {
+    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .markdownOnly)
+    #expect(md.contains("DELIVERY: THIS DOCUMENT ONLY"))
+    #expect(md.contains("never state or imply that it listened to the audio"))
+    #expect(!md.contains("listen to ALL available WAV audio assets in `audio/`"))
+    #expect(!md.contains("First, analyse the audio yourself"))
+    #expect(!md.contains("The external AI must listen to the provided WAV files"))
+    #expect(md.contains("measured audio metrics")) // the metrics are named as the audio evidence that does exist
 }
 @Test func packageRendersNumbersRounded() {
     let asset = AudioAsset(audioID: "audio_track_001", logicalTrackID: "track_1", trackName: .known("Beat"), expectedExportPath: "audio/Beat.wav", actualExportedPath: .known("audio/Beat.wav"), sourceFile: .unavailable, status: .exported, statusReason: nil, regions: [], durationSeconds: .known(135.85066666666665), sampleRate: .known(44100), channels: .known(2), bitDepth: .known(16), format: .known("PCM"), trackAXPath: nil)
@@ -282,6 +300,14 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(!md.contains("- Group: unavailable")); #expect(!md.contains("- Automation: unavailable")) // pure-unavailable noise compressed…
     #expect(md.contains("- Unavailable: Automation, Group")); #expect(md.contains("- Unavailable: Output"))
     #expect(md.contains("- Pan: known: -20")); #expect(md.contains("- Volume: known: -1.5 dB")) // …while known facts keep their own lines
+}
+/// The AX meter section is empty by nature (Logic publishes no numeric meters), and next to per-file LUFS/peak numbers a bare
+/// "LUFS: unavailable" reads as "no loudness data at all". It says which kind of reading it is and where the real numbers are.
+@Test func meterSectionDistinguishesItselfFromFileMeasurements() {
+    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t")
+    #expect(md.contains("## Logic on-screen meters (AX)"))
+    #expect(md.contains("not measurements of the audio files"))
+    #expect(!md.contains("## Audio / meter data"))
 }
 
 // MARK: - Launching another application (Logic Pro, own relaunch)
@@ -446,12 +472,31 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.2`"))
+    #expect(md.contains("Package schema: `2.3`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
     #expect(md.contains("Stereo correlation L/R: unavailable")) // mono WAV — honest state, not a fabricated number
     #expect(md.contains("measured facts about the audio files, not musical judgements")) // External AI Instructions updated
+    #expect(md.contains("Regions (1): `region_001`")) // regions name their provenance on one line; pixel geometry is not timing
+    #expect(!md.contains("timeline x:"))
+}
+/// A share that rounds to zero used to print "0% silent" directly above its own silence ranges, and a peak just under full scale
+/// printed as "-0.0 dBTP". Both read as measurement errors, so a value that rounds to zero keeps a decimal or drops the sign.
+@Test func metrics11_sharesAndSignedZeroesReadAsMeasurements() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    // 20 s of tone with a single 0.2 s silent window: 1 % silence, plus a full-scale sine whose true peak rounds to zero.
+    var samples = sineSamples(1000, amplitude: 1, seconds: 20)
+    for index in 48_000..<57_600 { samples[index] = 0 }
+    try writeFloatWAV(dir.appendingPathComponent("audio_track_001.wav"), channels: [samples])
+    let raw = audioSnapshot()
+    let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
+    let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
+    #expect(!md.contains("-0.0 dBTP")); #expect(!md.contains("-0.0 dBFS")); #expect(!md.contains("-0.0 LUFS")) // a peak just under full scale is not a negative zero
+    #expect(md.contains("1% silent") || md.contains("1.0% silent"))
+    #expect(md.contains("bass 60–250 Hz")) // every band range carries its unit
 }
 @Test func metrics10_manifestCarriesMetricsThroughJSON() throws {
     let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)

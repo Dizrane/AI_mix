@@ -15,7 +15,7 @@ struct SnapshotNormalizer: Sendable {
             guard let node = all.first(where: { node in node.value?.isEmpty == false && labels.contains { label in [node.title, node.description].compactMap { $0 }.contains { captionMatches($0, label) } } }), let value = node.value else { return .unavailable }
             return .known(value, source: node.id)
         }
-        let project = ProjectFacts(name: projectName(raw.application), tempo: bpm(namedFact(["tempo", "bpm"])), timeSignature: namedFact(["time signature"]), keySignature: namedFact(["key signature", "key"]), sampleRate: decimal(namedFact(["sample rate"])), transportState: namedFact(["transport", "play", "stop"]))
+        let project = ProjectFacts(name: projectName(raw.application), tempo: bpm(namedFact(["tempo", "bpm"])), timeSignature: namedFact(["time signature"]), keySignature: namedFact(["key signature", "key"]), sampleRate: decimal(namedFact(["sample rate"])), transportState: transport(namedFact(["transport", "play", "stop"])))
 
         // Discover both AX representations from the application subtree only. `targets` re-inspect the same windows and would double every element under a different path id, so they are excluded here (identical names are still kept distinct as separate objects).
         let rootNodes = flatten(raw.root)
@@ -177,6 +177,10 @@ struct SnapshotNormalizer: Sendable {
     private func trackName(_ title: String) -> String { guard let first = title.firstIndex(of: "“"), let last = title.lastIndex(of: "”"), first < last else { return title }; return String(title[title.index(after: first)..<last]) }
     private func slug(_ name: String) -> String { let mapped = name.localizedLowercase.map { $0.isLetter || $0.isNumber ? $0 : "_" }; let joined = String(mapped); let collapsed = joined.split(separator: "_", omittingEmptySubsequences: true).joined(separator: "_"); return collapsed.isEmpty ? "unnamed" : collapsed }
     private func boolValue(_ value: String?) -> Bool? { guard let value else { return nil }; if value == "1" || value.localizedCaseInsensitiveCompare("on") == .orderedSame { return true }; if value == "0" || value.localizedCaseInsensitiveCompare("off") == .orderedSame { return false }; return nil }
+    /// A transport state is a state, not a switch position. The control bar's play/stop controls publish plain "0"/"1" values, which
+    /// say nothing about whether Logic is playing, recording or stopped, so a value with no letters in it is not evidence: the fact
+    /// stays `unknown` (a control was found, its value means nothing here) instead of announcing "Transport: known: 0".
+    private func transport(_ fact: Fact<String>) -> Fact<String> { guard let value = fact.value else { return fact }; return value.contains(where: \.isLetter) ? fact : .init(state: .unknown, value: nil, source: fact.source) }
     private func bpm(_ fact: Fact<String>) -> Fact<Double> { guard let number = decimal(fact).value else { return .init(state: fact.state == .unavailable ? .unavailable : .unknown, value: nil, source: fact.source) }; guard number > 0 && number <= 999 else { return .init(state: .unknown, value: nil, source: fact.source) }; return .known(number, source: fact.source) }
     private func decimal(_ fact: Fact<String>) -> Fact<Double> { guard let value = fact.value, let number = decimalValue(value) else { return .init(state: fact.value == nil ? fact.state : .unknown, value: nil, source: fact.source) }; return .known(number, source: fact.source) }
     private func decimalValue(_ value: String?) -> Double? { guard let value else { return nil }; return value.replacingOccurrences(of: ",", with: ".").split(whereSeparator: { !$0.isNumber && $0 != "." && $0 != "-" }).compactMap { Double($0) }.first }

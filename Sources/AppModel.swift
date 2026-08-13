@@ -129,7 +129,7 @@ struct ApplicationLauncher: Sendable {
     @Published var packageFolderURL: URL?; @Published var packageZipURL: URL?
     var packageReadiness: PackageReadiness { PackageReadiness.evaluate(snapshot: normalized, assets: audioAssets) }
     func ensurePluginInventory() { if availablePlugins.isEmpty { availablePlugins = pluginInventory.discoverAvailable() } }
-    func generateAIPackage() { guard let snapshot = normalized else { aiPackageStatus = "Run a full analysis first."; return }; ensurePluginInventory(); aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: audioAssets, plugins: availablePlugins); let r = packageReadiness; aiPackageStatus = "AI package generated (\(r.overall.rawValue)) · \(availablePlugins.count) plugins available." + (r.audioTotal > 0 && r.audioExported < r.audioTotal ? " Audio incomplete: \(r.audioTotal - r.audioExported) WAV missing." : "") }
+    func generateAIPackage() { guard let snapshot = normalized else { aiPackageStatus = "Run a full analysis first."; return }; ensurePluginInventory(); aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: audioAssets, plugins: availablePlugins, delivery: .markdownOnly); let r = packageReadiness; aiPackageStatus = "AI package generated (\(r.overall.rawValue)) · \(availablePlugins.count) plugins available." + (r.audioTotal > 0 && r.audioExported < r.audioTotal ? " Audio incomplete: \(r.audioTotal - r.audioExported) WAV missing." : "") }
     func savePackage() {
         guard let snapshot = normalized, let raw, let store else { aiPackageStatus = "Run a full analysis first."; return }
         ensurePluginInventory()
@@ -140,7 +140,10 @@ struct ApplicationLauncher: Sendable {
             let audioDir = await store.folderURL("audio")
             let freshAssets = await analyzedAssets(raw: raw, normalized: snapshot, audioDir: audioDir)
             audioAssets = freshAssets
-            let markdown = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins); aiPackage = markdown
+            // Two readers, two deliveries: the folder/ZIP ships the JSON and WAVs next to the document, while the on-screen text is
+            // what "Copy for AI" puts on the clipboard — Markdown alone, so it must say so instead of pointing at files.
+            let markdown = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .fullPackage)
+            aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .markdownOnly)
             let audioManifest = AudioManifest(assets: freshAssets); let packageManifest = PackageManifest(project: project, assets: freshAssets)
             let expected = freshAssets.filter { $0.status == .exported }.count
             do {
