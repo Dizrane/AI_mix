@@ -244,7 +244,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     try writeWAV(wav)
     let before = try FileManager.default.attributesOfItem(atPath: wav.path)
     let asset = extractAudio(audioSnapshot(), dir: dir).first { $0.audioID == "audio_track_001" }
-    #expect(asset?.status == .exported); #expect(asset?.sampleRate.value == 44100); #expect(asset?.channels.value == 1); #expect(asset?.bitDepth.value == 16); #expect(asset?.format.value == "PCM")
+    #expect(asset?.status == .exported); #expect(asset?.sampleRate.value == 44100); #expect(asset?.channels.value == 1); #expect(asset?.bitDepth.value == 16); #expect(asset?.format.value == "PCM (integer)")
     let after = try FileManager.default.attributesOfItem(atPath: wav.path)
     #expect((before[.modificationDate] as? Date) == (after[.modificationDate] as? Date))
     #expect((before[.size] as? Int) == (after[.size] as? Int))
@@ -268,7 +268,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.4`"))
+    #expect(md.contains("Package schema: `2.5`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -486,7 +486,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.4`"))
+    #expect(md.contains("Package schema: `2.5`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
@@ -495,6 +495,25 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     #expect(md.contains("Regions (1): `region_001`")) // regions name their provenance on one line; pixel geometry is not timing
     #expect(!md.contains("1 region: region_001")) // provenance counts regions; the ID list lives under the asset alone
     #expect(!md.contains("timeline x:"))
+    #expect(md.contains("Format: known: PCM (float)")) // "Bit depth: 32" alone is ambiguous; the probe now says which PCM it is
+    #expect(md.contains("Technical faults measured from the exported files: none")) // clean file → the digest says so up front
+}
+/// Measured faults must be visible at the top of Audio Assets, not only buried inside ten per-asset metric blocks: a file
+/// with digital clipping and a DC offset gets one digest line naming its track and every fault found.
+@Test func metrics12_technicalFaultsAreDigestedUpFront() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    var samples = sineSamples(1000, amplitude: 0.5, seconds: 2).map { $0 + 0.01 } // DC offset of 1% full scale
+    for index in 1_000..<1_010 { samples[index] = 1.0 } // a 10-sample run on the digital ceiling
+    try writeFloatWAV(dir.appendingPathComponent("audio_track_001.wav"), channels: [samples])
+    let raw = audioSnapshot()
+    let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
+    let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
+    #expect(md.contains("Technical faults measured from the exported files (full numbers under each asset):"))
+    #expect(md.contains("clipped sample"))
+    #expect(md.contains("DC offset 0.01"))
+    #expect(!md.contains("Technical faults measured from the exported files: none"))
 }
 /// A share that rounds to zero used to print "0% silent" directly above its own silence ranges, and a peak just under full scale
 /// printed as "-0.0 dBTP". Both read as measurement errors, so a value that rounds to zero keeps a decimal or drops the sign.

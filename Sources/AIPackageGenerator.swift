@@ -8,7 +8,7 @@ enum PackageDelivery: Sendable { case markdownOnly, fullPackage }
 
 /// Provider-neutral export of normalized, evidence-based DAW facts for any external LLM.
 struct AIPackageGenerator: Sendable {
-    static let schemaVersion = "2.4"
+    static let schemaVersion = "2.5"
     func make(snapshot: NormalizedSnapshot, sessionID: String, audio: [AudioAsset] = [], plugins: [PluginInventoryItem] = [], probes: [ProbeType] = ProbeType.allCases, delivery: PackageDelivery = .fullPackage) -> String {
         let readiness = PackageReadiness.evaluate(snapshot: snapshot, assets: audio)
         var out: [String] = []
@@ -115,6 +115,7 @@ struct AIPackageGenerator: Sendable {
         if assets.isEmpty { out += ["", "- No audio assets prepared. Run Prepare Audio Export after a read-only analysis."]; return out }
         let regionTotal = assets.reduce(0) { $0 + $1.regions.count }
         out += ["", "- Logic audio tracks: \(assets.count) • Audio regions: \(regionTotal) • Assets (WAV targets): \(assets.count)", "- Exported: \(assets.filter { $0.status == .exported }.count) • Requires user export: \(assets.filter { $0.status == .requiresUserExport }.count) • Failed: \(assets.filter { $0.status == .failed }.count)"]
+        out += technicalFaultsDigest(assets)
         for asset in assets {
             out += ["", "### Audio Asset \(asset.audioID)", "- logicalTrackID: known: \(asset.logicalTrackID)", "- Logic Track Name: \(render(asset.trackName))", "- WAV file: \(render(asset.actualExportedPath))", "- Expected export path: known: \(asset.expectedExportPath)", "- Status: known: \(asset.status.rawValue)"]
             if let reason = asset.statusReason { out += ["- Status note: \(reason)"] }
@@ -141,6 +142,21 @@ struct AIPackageGenerator: Sendable {
         } else { out += ["  - Silence map: \(m.silenceIntervals.state.rawValue)"] }
         out += [metric("DC offset (mean of channel means)", m.dcOffsetMean, digits: 6, unit: ""), m.clippedSampleCount.value.map { "  - Clipped samples (|x| ≥ 1 − 1e-4, runs ≥ 3): known: \($0)" } ?? "  - Clipped samples: \(m.clippedSampleCount.state.rawValue)"]
         return out
+    }
+    /// Measured technical faults surfaced once, up front: an inter-sample peak over full scale, digital clipping, or a notable
+    /// DC offset is exactly what the reader must not have to dig out of ten per-asset metric blocks. Full numbers stay per asset.
+    private func technicalFaultsDigest(_ assets: [AudioAsset]) -> [String] {
+        let faults = assets.compactMap { asset -> String? in
+            guard let m = asset.metrics else { return nil }
+            var found: [String] = []
+            if let peak = m.truePeakDBTP.value, peak >= 0.05 { found.append("true peak +\(rounded(peak, digits: 1)) dBTP over full scale") }
+            if let clipped = m.clippedSampleCount.value, clipped > 0 { found.append(plural(clipped, "clipped sample")) }
+            if let dc = m.dcOffsetMean.value, abs(dc) >= 0.001 { found.append("DC offset \(rounded(dc, digits: 6))") }
+            return found.isEmpty ? nil : "- `\(asset.logicalTrackID)` \u{201C}\(asset.trackName.value ?? asset.audioID)\u{201D}: \(found.joined(separator: " • "))"
+        }
+        guard assets.contains(where: { $0.metrics != nil }) else { return [] }
+        if faults.isEmpty { return ["", "Technical faults measured from the exported files: none — no digital clipping, no true peak above 0 dBTP, no notable DC offset."] }
+        return ["", "Technical faults measured from the exported files (full numbers under each asset):", ""] + faults
     }
     private func metric(_ label: String, _ value: Fact<Double>, digits: Int, unit: String) -> String { guard let number = value.value else { return "  - \(label): \(value.state.rawValue)" }; return "  - \(label): known: \(rounded(number, digits: digits))\(unit)" }
     /// A value that rounds to zero prints as zero: "-0.0 dBTP" reads like a measurement error rather than a peak just under full scale.
@@ -183,7 +199,7 @@ struct AIPackageGenerator: Sendable {
     /// The exact JSON contract the app's Review screen decodes and validates (`MixPlan` / `MixCommand`). The document must
     /// spell it out, or the model invents its own shape and the user's paste fails with "Invalid MixPlan JSON".
     private func mixPlanSchemaSection() -> [String] {
-        ["", "## Mix Plan schema (machine-validated)", "", "The application validates the pasted Mix Plan technically against the current snapshot — targets must exist in the facts above, values must sit inside reported ranges. It never judges musical merit, and nothing is written to Logic Pro.", "", "- Every field shown in the example is required on every action; `parameters` may be `{}` only when the action truly takes none.", "- `action` must be one of: `set_volume`, `set_pan`, `set_mute`, `set_solo`, `set_plugin_bypass`, `set_plugin_parameter`. No other action is implemented; anything else is rejected as unsupported.", "- Target a track with `target.trackID` = the `logicalTrackID` used throughout this document, or `target.trackName` = the exact Logic track name.", "- `set_plugin_bypass` and `set_plugin_parameter` additionally need `target.pluginID` or `target.pluginName`, and `set_plugin_parameter` needs `target.parameterID` or `target.parameterName` plus a numeric `parameters.value`. When no plug-in facts were captured for the track, these validate as `requires_probe`, not as executable actions.", "", "```json", Self.mixPlanExampleJSON, "```"]
+        ["", "## Mix Plan schema (machine-validated)", "", "The application validates the pasted Mix Plan technically against the current snapshot — targets must exist in the facts above, and plug-in parameter values must sit inside their reported ranges. It never judges musical merit, and nothing is written to Logic Pro.", "", "- Every field shown in the example is required on every action; `parameters` may be `{}` only when the action truly takes none.", "- `action` must be one of: `set_volume`, `set_pan`, `set_mute`, `set_solo`, `set_plugin_bypass`, `set_plugin_parameter`. No other action is implemented; anything else is rejected as unsupported.", "- Target a track with `target.trackID` = the `logicalTrackID` used throughout this document, or `target.trackName` = the exact Logic track name.", "- `set_plugin_bypass` and `set_plugin_parameter` additionally need `target.pluginID` or `target.pluginName`, and `set_plugin_parameter` needs `target.parameterID` or `target.parameterName` plus a numeric `parameters.value`. When no plug-in facts were captured for the track, these validate as `requires_probe`, not as executable actions.", "", "```json", Self.mixPlanExampleJSON, "```"]
     }
     static let mixPlanExampleJSON = """
 {

@@ -60,7 +60,7 @@ struct AudioFileProbe: Sendable {
         let format = file.fileFormat; let asbd = format.streamDescription.pointee
         let duration = format.sampleRate > 0 ? Double(file.length) / format.sampleRate : 0
         let bits = asbd.mBitsPerChannel > 0 ? Int(asbd.mBitsPerChannel) : nil
-        let name = asbd.mFormatID == kAudioFormatLinearPCM ? "PCM" : fourCharCode(asbd.mFormatID)
+        let name = asbd.mFormatID == kAudioFormatLinearPCM ? (asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0 ? "PCM (float)" : "PCM (integer)") : fourCharCode(asbd.mFormatID)
         return .init(durationSeconds: duration, sampleRate: format.sampleRate, channels: Int(format.channelCount), bitDepth: bits, format: name)
     }
     private func fourCharCode(_ code: AudioFormatID) -> String { let bytes = [UInt8((code >> 24) & 0xFF), UInt8((code >> 16) & 0xFF), UInt8((code >> 8) & 0xFF), UInt8(code & 0xFF)]; return String(bytes: bytes, encoding: .ascii)?.trimmingCharacters(in: .whitespaces) ?? "unknown" }
