@@ -9,7 +9,9 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
     @Published var stage: WorkflowStage = .connection
     @Published var raw: RawSnapshot?; @Published var normalized: NormalizedSnapshot?; @Published var aiPackage = ""; @Published var aiPackageURL: URL?; @Published var aiPackageStatus = ""; @Published var planText = ""; @Published var validated: [ValidatedCommand] = []; @Published var analyzerState: AnalyzerVisualState = .ready; @Published var log: [String] = []; @Published var audioAssets: [AudioAsset] = []; @Published var audioStatus = ""; @Published var exportPhase: AudioExportPhase = .idle; @Published var showExportConfirm = false; private var analysisSessionID = "unsaved_session"
     @Published var availablePlugins: [PluginInventoryItem] = []
-    let analyzer: any DAWAnalyzer = LogicAccessibilityAnalyzer(); let normalizer = SnapshotNormalizer(); let validator = CommandValidator(); let audioExtractor = AudioAssetExtractor(); let exporter = LogicExportAutomator(); let pluginInventory = PluginInventory(); private var store: SessionStore?
+    let analyzer: any DAWAnalyzer = LogicAccessibilityAnalyzer(); let normalizer = SnapshotNormalizer(); let validator = CommandValidator(); let audioExtractor = AudioAssetExtractor(); let metricsAnalyzer = AudioMetricsAnalyzer(); let exporter = LogicExportAutomator(); let pluginInventory = PluginInventory(); private var store: SessionStore?
+    /// Metrics of already-analyzed WAVs keyed by absolute path; entries are reused only while the file's size and modification date match, so Refresh Export Status never re-analyzes unchanged files.
+    private var metricsCache: [String: AudioMetrics] = [:]
     private let storeInitFailure: String?
     init() {
         do { store = try SessionStore(); storeInitFailure = nil } catch { store = nil; storeInitFailure = error.localizedDescription }
@@ -79,7 +81,7 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
             do {
                 try await store.resetForNewAnalysis()
                 analysisSessionID = "analysis_\(ISO8601DateFormatter().string(from: Date()))"
-                raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil
+                raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil; metricsCache = [:]
                 log.append("Previous AI Mix Assistant analysis data removed. Starting a clean read-only scan.")
                 let exporter = exporter
                 let mixerOutcome = await Task.detached(priority: .userInitiated) { exporter.ensureMixerVisible() }.value
@@ -123,7 +125,7 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
             // Final filesystem resolution before assembling: re-resolve every asset against the confirmed current/audio directory
             // (resolveExportedFile) and re-validate with AVAudioFile, so actualExportedPath and status reflect the real files right now.
             let audioDir = await store.folderURL("audio")
-            let freshAssets = audioExtractor.extract(raw: raw, normalized: snapshot, audioDirectory: audioDir)
+            let freshAssets = await analyzedAssets(raw: raw, normalized: snapshot, audioDir: audioDir)
             audioAssets = freshAssets
             let markdown = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins); aiPackage = markdown
             let audioManifest = AudioManifest(assets: freshAssets); let packageManifest = PackageManifest(project: project, assets: freshAssets)
@@ -164,7 +166,7 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
                 try await store.resetForNewAnalysis()
                 raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""
                 planText = ""; validated = []; planStatus = ""
-                audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false
+                audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; metricsCache = [:]
                 packageFolderURL = nil; packageZipURL = nil
                 analyzerState = .ready; log = []; analysisSessionID = "unsaved_session"
                 stage = .connection; refreshConnection()
@@ -182,7 +184,7 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
         guard let raw, let normalized, let store else { audioStatus = "Run a full read-only analysis first."; return }
         Task {
             let audioDir = await store.folderURL("audio")
-            let assets = audioExtractor.extract(raw: raw, normalized: normalized, audioDirectory: audioDir)
+            let assets = await analyzedAssets(raw: raw, normalized: normalized, audioDir: audioDir)
             audioAssets = assets
             let manifest = AudioManifest(assets: assets); let s = manifest.summary
             do {
@@ -193,6 +195,18 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
             } catch { audioStatus = "Could not save audio manifest: \(error.localizedDescription)" }
             if !aiPackage.isEmpty { generateAIPackage() }
         }
+    }
+    /// Extraction plus local DSP metrics, both off the main thread (like scan()) so the UI stays responsive. Metrics
+    /// are facts about the FINAL files on disk: computed only for `exported` assets, served from the cache when the
+    /// file identity (path + size + modification date) is unchanged, honestly recomputed when it is not.
+    private func analyzedAssets(raw: RawSnapshot, normalized: NormalizedSnapshot, audioDir: URL) async -> [AudioAsset] {
+        let extractor = audioExtractor; let metricsAnalyzer = metricsAnalyzer; let cache = metricsCache
+        let (assets, refreshedCache) = await Task.detached(priority: .userInitiated) { () -> ([AudioAsset], [String: AudioMetrics]) in
+            let extracted = extractor.extract(raw: raw, normalized: normalized, audioDirectory: audioDir)
+            return metricsAnalyzer.attach(to: extracted, audioDirectory: audioDir, cache: cache)
+        }.value
+        metricsCache = refreshedCache
+        return assets
     }
     func copyAudioManifest() { guard !audioAssets.isEmpty else { audioStatus = "Prepare track export first."; return }; NSPasteboard.general.clearContents(); NSPasteboard.general.setString(AudioManifest(assets: audioAssets).markdown(), forType: .string); audioStatus = "Audio manifest copied (Markdown) — paste it to your LLM with the WAV files." }
 
@@ -261,8 +275,9 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
             previousSignature = signature
             if idleScans >= 40 { break } // a full minute with no new or growing files — Logic is not exporting (anymore)
         }
-        // Final authoritative rescan of the audio directory — `exported` and `actualExportedPath` come only from the files that really exist now.
-        let finalAssets = audioExtractor.extract(raw: raw, normalized: normalized, audioDirectory: audioDir)
+        // Final authoritative rescan of the audio directory — `exported` and `actualExportedPath` come only from the files that
+        // really exist now, and DSP metrics are computed here, from those final stable files, never from mid-write intermediates.
+        let finalAssets = await analyzedAssets(raw: raw, normalized: normalized, audioDir: audioDir)
         audioAssets = finalAssets
         let manifest = AudioManifest(assets: finalAssets); let summary = manifest.summary
         _ = try? await store.save(manifest, folder: "metadata", name: "audio_manifest.json")
