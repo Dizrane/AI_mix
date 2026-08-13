@@ -59,8 +59,17 @@ jobs:
         run: |
           PREV=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null || true)
           : > notes.md
-          if [ -n "$PREV" ] && git rev-parse -q --verify "refs/tags/$PREV" >/dev/null; then
+          # «Что нового» берётся из русского CHANGELOG.md (раздел "## <версия> — дата"); автоматический
+          # список коммитов остаётся только запасным вариантом, когда раздел для версии не написан.
+          SECTION=$(awk -v ver="$VERSION" '/^## /{p = ($2 == ver); next} p' CHANGELOG.md 2>/dev/null || true)
+          if [ -n "$(echo "$SECTION" | tr -d '[:space:]')" ]; then
+            if [ -n "$PREV" ]; then echo "## Что нового по сравнению с $PREV" >> notes.md; else echo "## Что нового" >> notes.md; fi
+            echo "$SECTION" >> notes.md
+            echo >> notes.md
+          elif [ -n "$PREV" ] && git rev-parse -q --verify "refs/tags/$PREV" >/dev/null; then
             echo "## Что нового по сравнению с $PREV" >> notes.md
+            echo >> notes.md
+            echo "_Раздел для $VERSION в CHANGELOG.md не заполнен — ниже автоматический список коммитов._" >> notes.md
             echo >> notes.md
             git log "$PREV"..HEAD --no-merges --pretty='- %s' >> notes.md
             echo >> notes.md
