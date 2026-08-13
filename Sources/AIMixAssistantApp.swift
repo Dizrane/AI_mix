@@ -223,7 +223,7 @@ struct AnalysisScreen: View {
         Screen(title: "Analysis", subtitle: "Read-only capture of the Logic project. Logic Pro is never modified.") {
             Card {
                 HStack { Label("READ-ONLY", systemImage: "eye").font(.caption2.weight(.bold)).padding(.horizontal, 8).padding(.vertical, 3).background(Capsule().fill(.green.opacity(0.15))).foregroundStyle(.green); Spacer() }
-                if scanning { HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Analyzing project (read-only)…").foregroundStyle(.secondary) } }
+                if scanning { HStack(spacing: 8) { ProgressView().controlSize(.small); Text(model.scanProgress > 0 ? "Analyzing project (read-only)… \(model.scanProgress) elements inspected" : "Analyzing project (read-only)…").foregroundStyle(.secondary); Spacer(); Button("Cancel", action: model.cancelScan) } }
                 else if let snapshot = model.normalized { checklist(snapshot) }
                 else { Text("No analysis yet. Start a read-only scan of the current Logic project.").foregroundStyle(.secondary) }
             }
