@@ -13,6 +13,9 @@ enum ExportOutcome: Sendable {
 /// Result of just launching Logic's native export (kept for compatibility / diagnostics).
 enum ExportTriggerResult: Sendable { case opened(item: String); case pressedNoDialog(item: String); case failed(step: String, detail: String) }
 
+/// Outcome of making Logic's Mixer visible before a scan. Purely UI navigation — it never touches project state.
+enum MixerEnsureOutcome: Sendable { case alreadyVisible, opened(item: String), failed(step: String, detail: String) }
+
 /// Write / automation layer that drives Logic's built-in "All Tracks as Audio Files…" export end to end.
 /// Every element is discovered at runtime from the live AX tree (verified against the real dialog: an
 /// `AXWindow`/`AXDialog` titled "Open" whose format popup already reads "WAVE", mode "One File per Track",
@@ -55,6 +58,26 @@ struct LogicExportAutomator: Sendable {
         guard let exportButton = firstDescendant(confirmed, { self.role($0) == "AXButton" && self.string($0, kAXTitleAttribute) == "Export" }) else { return .navigationFailed(step: "export_button", detail: "Export button not found on the dialog.") }
         guard press(exportButton) else { return .navigationFailed(step: "press_export", detail: "AXPress on the Export button did not succeed.") }
         return .exported(item: item, format: format)
+    }
+
+    /// Makes Logic's Mixer visible before analysis, because channel strips carry the richest AX facts. Reads the View menu:
+    /// "Hide Mixer" means it is already on screen (the opened menu is closed with Escape, nothing pressed); "Show Mixer" is
+    /// pressed via AXPress — the same documented menu mechanism the export automation uses, never a blind keystroke that
+    /// could land in a focused text field. It changes only which panes are on screen, never project state.
+    func ensureMixerVisible() -> MixerEnsureOutcome {
+        guard AXIsProcessTrusted() else { return .failed(step: "accessibility", detail: "Accessibility permission is not granted to AI Mix Assistant.") }
+        guard let app = runningLogic() else { return .failed(step: "logic_running", detail: "Logic Pro is not running.") }
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        app.activate(); usleep(400_000)
+        guard let menuBar = copyElement(appElement, kAXMenuBarAttribute) else { return .failed(step: "menu_bar", detail: "AXMenuBar attribute is unavailable.") }
+        guard let viewItem = childByTitle(menuBar, "View") else { return .failed(step: "view_menu", detail: "View menu not found. Menus: \(childTitles(menuBar))") }
+        _ = press(viewItem); usleep(400_000) // open View so Logic validates & populates the submenu
+        guard let viewMenu = firstMenu(of: viewItem), let mixerItem = childContaining(viewMenu, "mixer") else { postKey(53, []); return .failed(step: "mixer_item", detail: "No Mixer item found in the View menu.") }
+        let title = string(mixerItem, kAXTitleAttribute) ?? "Mixer"
+        if title.localizedCaseInsensitiveContains("hide") { postKey(53, []); usleep(250_000); return .alreadyVisible } // already visible; just close the menu
+        guard press(mixerItem) else { postKey(53, []); return .failed(step: "press", detail: "AXPress on \u{2018}\(title)\u{2019} did not succeed.") }
+        usleep(800_000) // give Logic a moment to lay the Mixer out before the read-only scan
+        return .opened(item: title)
     }
 
     /// Just launches the menu item (no dialog automation) — kept for diagnostics.
