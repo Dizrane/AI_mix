@@ -4,6 +4,18 @@ import AppKit
 enum AnalyzerVisualState: Equatable { case ready, scanning, waiting, error(String) }
 enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
 
+/// Launching another application, isolated away from the UI. AppKit calls `openApplication`'s completion handler on its own
+/// LaunchServices queue, so a handler written inside a `@MainActor` type is inferred main-actor-isolated and Swift 6's executor
+/// assertion kills the process the moment it runs off the main thread — the app "unexpectedly quit" on the very click that asked
+/// for the launch. The async overload has no such handler: it resumes on the caller's actor and reports the failure as a message.
+struct ApplicationLauncher: Sendable {
+    func launch(at url: URL, newInstance: Bool = false) async -> String? {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = newInstance
+        do { _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration); return nil } catch { return error.localizedDescription }
+    }
+}
+
 @MainActor final class AppModel: ObservableObject {
     @Published var connection = LogicConnection(found: false, localizedName: nil, pid: nil, bundleIdentifier: nil, isFinishedLaunching: nil, isTerminated: nil, accessibilityTrusted: false, diagnostics: [], message: "Not checked")
     @Published var stage: WorkflowStage = .connection
@@ -54,21 +66,22 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
         case .repaired(let originalApp):
             translocationStatus = "Quarantine removed. Relaunching from \(originalApp.deletingLastPathComponent().path)\u{2026}"
             log.append(translocationStatus)
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.createsNewApplicationInstance = true
-            NSWorkspace.shared.openApplication(at: originalApp, configuration: configuration) { [weak self] _, openError in
-                Task { @MainActor in
-                    if let openError {
-                        let message = "Quarantine removed, but relaunch failed: \(openError.localizedDescription). Quit and open AI Mix Assistant.app yourself — it will now start normally."
-                        self?.translocationStatus = message; self?.log.append(message)
-                    } else { exit(0) }
-                }
+            Task {
+                guard let failure = await ApplicationLauncher().launch(at: originalApp, newInstance: true) else { exit(0) }
+                let message = "Quarantine removed, but relaunch failed: \(failure). Quit and open AI Mix Assistant.app yourself — it will now start normally."
+                translocationStatus = message; log.append(message)
             }
         }
     }
     func refreshConnection() { connection = analyzer.connectionStatus(); log.append(connection.message) }
     func openAccessibilitySettings() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!) }
-    func launchLogic() { for id in ["com.apple.logic10", "com.apple.mobilelogic"] { if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) { NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { [weak self] _, _ in Task { @MainActor in self?.refreshConnection() } }; return } }; log.append("Logic Pro was not found on this Mac.") }
+    func launchLogic() {
+        guard let url = ["com.apple.logic10", "com.apple.mobilelogic"].lazy.compactMap({ NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) }).first else { log.append("Logic Pro was not found on this Mac."); return }
+        Task {
+            if let failure = await ApplicationLauncher().launch(at: url) { log.append("Could not launch Logic Pro: \(failure)") }
+            refreshConnection()
+        }
+    }
     func isAvailable(_ target: WorkflowStage) -> Bool { switch target { case .connection: true; case .analysis: connection.found && connection.accessibilityTrusted; case .audio, .aiPackage, .review: normalized != nil } }
     func go(to target: WorkflowStage) { if isAvailable(target) { stage = target } }
     @Published var scanProgress = 0

@@ -284,6 +284,16 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(md.contains("- Pan: known: -20")); #expect(md.contains("- Volume: known: -1.5 dB")) // …while known facts keep their own lines
 }
 
+// MARK: - Launching another application (Logic Pro, own relaunch)
+
+/// Runs on the main actor, exactly as the buttons do: AppKit delivers `openApplication`'s completion handler on a LaunchServices
+/// queue, so a main-actor-isolated handler traps the whole process there. Reaching an ordinary error return proves the launch path
+/// reports failures instead of killing the app.
+@MainActor @Test(.timeLimit(.minutes(1))) func launchingAMissingApplicationReportsInsteadOfCrashing() async {
+    let missing = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("\(UUID().uuidString).app")
+    #expect(await ApplicationLauncher().launch(at: missing) != nil)
+}
+
 // MARK: - Closed-shell storage rules
 
 @Test func sharedContainerDetectsCommonFolders() {

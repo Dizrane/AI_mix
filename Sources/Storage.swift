@@ -19,9 +19,11 @@ actor SessionStore {
     func saveText(_ value: String, folder: String, name: String) throws -> URL { let url = sessionURL.appendingPathComponent(folder).appendingPathComponent(name); try value.data(using: .utf8)?.write(to: url, options: .atomic); return url }
     /// URL of an app-owned working folder inside `current` (e.g. "audio", "metadata"). It does not create or delete anything.
     func folderURL(_ folder: String) -> URL { sessionURL.appendingPathComponent(folder, isDirectory: true) }
-    func reveal() { NSWorkspace.shared.activateFileViewerSelecting([sessionURL]) }
-    func reveal(folder: String) { NSWorkspace.shared.activateFileViewerSelecting([folderURL(folder)]) }
-    func reveal(url: URL) { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+    func reveal() { reveal(url: sessionURL) }
+    func reveal(folder: String) { reveal(url: folderURL(folder)) }
+    /// Revealing in Finder is AppKit UI work and belongs on the main actor: called straight from this actor it would run on a
+    /// background executor, the same off-main AppKit use that kills the process elsewhere. The store only decides which URL.
+    nonisolated func reveal(url: URL) { Task { @MainActor in NSWorkspace.shared.activateFileViewerSelecting([url]) } }
     /// Clears only audio files inside the app-owned current/audio working folder before a fresh export. Never touches other locations.
     func clearAudioFiles() { let dir = folderURL("audio"); let manager = FileManager.default; guard let files = try? manager.contentsOfDirectory(atPath: dir.path) else { return }; for file in files where ["wav", "aif", "aiff", "caf"].contains((file as NSString).pathExtension.lowercased()) { try? manager.removeItem(at: dir.appendingPathComponent(file)) } }
     /// Assembles current/package with the markdown, JSON snapshots and the REAL exported WAVs, then best-effort zips it. Never fabricates files.
