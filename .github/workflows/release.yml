@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: swift --version
+      - name: Run test suite
+        run: swift test
+
+  release:
+    name: Build and publish app
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal release binary
+        run: swift build -c release --arch arm64 --arch x86_64
+      - name: Assemble .app bundle
+        run: |
+          APP="AI Mix Assistant.app"
+          mkdir -p "$APP/Contents/MacOS"
+          cp AppInfo.plist "$APP/Contents/Info.plist"
+          cp ".build/apple/Products/Release/AI Mix Assistant" "$APP/Contents/MacOS/AI Mix Assistant"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --verbose "$APP"
+      - name: Zip app
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          ditto -c -k --sequesterRsrc --keepParent "AI Mix Assistant.app" "AI-Mix-Assistant-$VERSION-macos-universal.zip"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          ## Установка
+
+          1. Скачайте `AI-Mix-Assistant-*.zip` ниже и распакуйте.
+          2. Первый запуск: кликните по `AI Mix Assistant.app` правой кнопкой → «Открыть» → «Открыть» (приложение не нотаризовано Apple, поэтому обычный двойной клик macOS заблокирует; после первого раза запускается как обычно).
+          3. Выдайте приложению разрешение Accessibility, когда оно предложит (System Settings → Privacy & Security → Accessibility).
+
+          ## Требования
+
+          - macOS 14 или новее (Apple Silicon и Intel — бинарник универсальный).
+          - Logic Pro с английским интерфейсом (обнаружение треков и экспорт привязаны к английским названиям элементов).
+          EOF
+          gh release create "$VERSION" \
+            "AI-Mix-Assistant-$VERSION-macos-universal.zip" \
+            --title "AI Mix Assistant $VERSION" \
+            --notes-file notes.md

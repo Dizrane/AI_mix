@@ -2,6 +2,10 @@
 
 macOS SwiftUI application foundation for a safe, LLM-directed Logic Pro mixing workflow. It is deliberately not a mixing expert system: musical judgement belongs to an external LLM; the app captures facts, validates a plan and executes only verified adapters.
 
+## Install (prebuilt app)
+
+Download the latest `AI-Mix-Assistant-*.zip` from this repository's **Releases** page, unzip it, and on first launch right-click `AI Mix Assistant.app` → Open → Open (the app is ad-hoc signed, not notarized). Requires macOS 14+ and Logic Pro running with the English UI. Releases are built automatically by the `Release` GitHub Actions workflow (run it manually from the Actions tab, or push a `v*` tag).
+
 ## Build and run
 
 ```sh
