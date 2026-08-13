@@ -40,12 +40,18 @@ struct ApplicationInfo: Codable, Sendable { var name: String; var bundleIdentifi
 /// shared by the live Connection indicator and the normalizer's project name: `AXDocument` (the project file URL) is proof and
 /// supplies the name; with no document the window's own non-empty `AXTitle` is the next real evidence, published verbatim (an
 /// unsaved project has a title but no file yet). No such window, or a caption-less one, means no open project — never a guess.
+/// Logic's project chooser is the one window it shows precisely when NO project is open, so its caption ("Choose a Project")
+/// is evidence of absence, never a project name — English captions by design, like the whole menu-automation layer.
 struct ProjectPresence: Sendable, Equatable {
     var open: Bool; var name: String?; var source: String?
+    private static let chooserTitles: Set<String> = ["choose a project", "choose project"]
     static func evaluate(title: String?, document: String?, windowSource: String?) -> ProjectPresence {
         let window = windowSource ?? "AXWindow"
         if let document, let name = documentName(document) { return .init(open: true, name: name, source: "AXDocument of \(window)") }
-        if let title = title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty { return .init(open: true, name: title, source: "AXTitle of \(window)") }
+        if let title = title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
+            if chooserTitles.contains(title.localizedLowercase) { return .init(open: false, name: nil, source: nil) }
+            return .init(open: true, name: title, source: "AXTitle of \(window)")
+        }
         return .init(open: false, name: nil, source: nil)
     }
     private static func documentName(_ document: String) -> String? {
