@@ -92,6 +92,52 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
     #expect(first == second)
 }
 
+// MARK: - Project metadata honesty (caption match, never substring)
+
+private func projectSnapshot(_ nodes: [RawAccessibilityNode]) -> NormalizedSnapshot {
+    SnapshotNormalizer().normalize(RawSnapshot(application: .init(name: "Logic Pro", bundleIdentifier: "com.apple.logic10", pid: 1), root: ax("AXApplication", id: "application", nodes)))
+}
+
+@Test func projectFactsIgnoreSubstringLookalikes() {
+    // "play" inside "Display" and "key" inside "keyboard" once produced falsely `known` facts carrying another control's value.
+    let s = projectSnapshot([ax("AXStaticText", id: "lcd", title: "Display", value: "Beats & Project"), ax("AXGroup", id: "kb", desc: "keyboard", value: "C3")])
+    #expect(s.project.transportState.state == .unavailable)
+    #expect(s.project.keySignature.state == .unavailable)
+    #expect(s.project.name.state == .unavailable) // "Project" inside a value is not a caption either
+}
+@Test func projectFactsStayKnownFromRealCaptions() {
+    let s = projectSnapshot([ax("AXStaticText", id: "tempo", desc: "Tempo", value: "115"), ax("AXStaticText", id: "keysig", desc: "Key Signature", value: "D# minor")])
+    #expect(s.project.tempo.state == .known); #expect(s.project.tempo.value == 115)
+    #expect(s.project.keySignature.value == "D# minor")
+}
+
+// MARK: - Inspector mirror strips (phantom channel duplicates)
+
+@Test func linkF_inspectorMirrorsAreDroppedRealStripsKept() {
+    let root = ax("AXApplication", id: "application", [
+        ax("AXGroup", id: "th", desc: "Tracks header", [headerNode("h1", "Track 1 “Фон”"), headerNode("h2", "Track 2 “Beat”")]),
+        ax("AXLayoutArea", id: "application.0.6", desc: "Mixer", [stripNode("i1", "Фон"), stripNode("i2", "Stereo Out")]),
+        ax("AXLayoutArea", id: "application.0.8", desc: "Mixer", [stripNode("c1", "Фон"), stripNode("c2", "Beat"), stripNode("c3", "Aux 2")])
+    ])
+    let s = SnapshotNormalizer().normalize(RawSnapshot(application: .init(name: "Logic Pro", bundleIdentifier: "com.apple.logic10", pid: 1), root: root))
+    #expect(s.linking.channelCandidates == 4) // 3 real Mixer strips + the inspector-only "Stereo Out"
+    #expect(s.tracks.count == 4) // track_1, track_2, channel_aux_2, channel_stereo_out — no phantoms
+    let fon = s.tracks.filter { $0.name.value == "Фон" }
+    #expect(fon.count == 1); #expect(fon.first?.matchStatus == .confirmed) // selected track no longer sees 1 header + 2 channels
+    #expect(s.tracks.contains { $0.name.value == "Stereo Out" && $0.matchStatus == .unresolved }) // only-in-inspector object is a real object
+    #expect(!s.tracks.map(\.logicalTrackID).contains("channel_фон"))
+}
+@Test func linkG_sameNameStripsInsideMixerStayAmbiguous() {
+    let root = ax("AXApplication", id: "application", [
+        ax("AXGroup", id: "th", desc: "Tracks header", [headerNode("h1", "Track 1 “Dup”")]),
+        ax("AXLayoutArea", id: "insp", desc: "Mixer", [stripNode("i1", "Dup")]),
+        ax("AXLayoutArea", id: "mx", desc: "Mixer", [stripNode("c1", "Dup"), stripNode("c2", "Dup")])
+    ])
+    let s = SnapshotNormalizer().normalize(RawSnapshot(application: .init(name: "Logic Pro", bundleIdentifier: "com.apple.logic10", pid: 1), root: root))
+    #expect(s.tracks.count == 3) // both real same-named Mixer strips kept, only the inspector mirror dropped
+    #expect(s.tracks.allSatisfy { $0.matchStatus == .ambiguous })
+}
+
 // MARK: - Phase 2: audio asset extraction (provenance only)
 
 private func regionNode(_ id: String, _ name: String, x: Double, w: Double) -> RawAccessibilityNode {
@@ -186,6 +232,33 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(md.contains("audio_track_001"))
     #expect(md.contains("logicalTrackID: known: track_1"))
     #expect(!md.contains("Lead")); #expect(!md.contains("Double")) // no musical interpretation
+}
+
+// MARK: - AI package: delivery modes & rendering polish
+
+@Test func packageDeclaresDeliveryModes() {
+    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t")
+    #expect(md.contains("Package schema: `2.1`"))
+    #expect(md.contains("Delivery modes"))
+    #expect(md.contains("FULL PACKAGE")); #expect(md.contains("THIS DOCUMENT ONLY")); #expect(md.contains("NO AUDIO CAPABILITY"))
+    #expect(md.contains("NEVER pretend to have listened"))
+}
+@Test func packageRendersNumbersRounded() {
+    let asset = AudioAsset(audioID: "audio_track_001", logicalTrackID: "track_1", trackName: .known("Beat"), expectedExportPath: "audio/Beat.wav", actualExportedPath: .known("audio/Beat.wav"), sourceFile: .unavailable, status: .exported, statusReason: nil, regions: [], durationSeconds: .known(135.85066666666665), sampleRate: .known(44100), channels: .known(2), bitDepth: .known(16), format: .known("PCM"), trackAXPath: nil)
+    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", audio: [asset])
+    #expect(md.contains("Duration: known: 135.85 s")); #expect(!md.contains("135.85066"))
+    #expect(md.contains("Sample rate: known: 44100 Hz"))
+}
+@Test func linkEvidenceUsesRealPlurals() {
+    let s = normalize(headers: [headerNode("h1", "Track 1 “Dup”"), headerNode("h2", "Track 2 “Dup”")], strips: [stripNode("c1", "Dup")])
+    #expect(s.tracks.first?.linkEvidence.first?.contains("2 headers and 1 channel;") == true)
+    #expect(!s.tracks.flatMap(\.linkEvidence).joined().contains("header(s)"))
+}
+@Test func packageCompactsUnavailableTrackFields() {
+    let md = AIPackageGenerator().make(snapshot: normalize(headers: [headerNode("h", "Track 6 “Audio 5”")], strips: [stripNode("c", "Audio 5", plugin: "Pro-Q 4")]), sessionID: "t")
+    #expect(!md.contains("- Group: unavailable")); #expect(!md.contains("- Automation: unavailable")) // pure-unavailable noise compressed…
+    #expect(md.contains("- Unavailable: Automation, Group")); #expect(md.contains("- Unavailable: Output"))
+    #expect(md.contains("- Pan: known: -20")); #expect(md.contains("- Volume: known: -1.5 dB")) // …while known facts keep their own lines
 }
 
 // MARK: - Closed-shell storage rules

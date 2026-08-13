@@ -8,13 +8,18 @@ private struct ChannelModel: Sendable { var axPath: String; var name: String; va
 struct SnapshotNormalizer: Sendable {
     func normalize(_ raw: RawSnapshot, rawReference: String? = nil) -> NormalizedSnapshot {
         let all = flatten(raw.root) + raw.targets.flatMap { flatten($0.node) }
-        func namedFact(_ labels: [String]) -> Fact<String> { guard let node = all.first(where: { node in labels.contains { label in searchable(node).contains { text in text.localizedCaseInsensitiveContains(label) } } }), let value = node.value ?? node.title else { return .unavailable }; return .known(value, source: node.id) }
+        /// A project fact is trusted only when a node's own caption (title or description) IS the label — exactly, or as a whole-word prefix ("Key Signature" for "key"). Substring search anywhere used to sign another control's value as `known` ("play" inside "Display", "key" inside "keyboard"); no confident caption means `.unavailable`, never a guess.
+        func namedFact(_ labels: [String]) -> Fact<String> {
+            func captionMatches(_ caption: String, _ label: String) -> Bool { let text = caption.localizedLowercase; let prefix = label.localizedLowercase; guard text.hasPrefix(prefix) else { return false }; guard text.count > prefix.count else { return true }; let next = text[text.index(text.startIndex, offsetBy: prefix.count)]; return !next.isLetter && !next.isNumber }
+            guard let node = all.first(where: { node in labels.contains { label in [node.title, node.description].compactMap { $0 }.contains { captionMatches($0, label) } } }), let value = node.value ?? node.title else { return .unavailable }
+            return .known(value, source: node.id)
+        }
         let project = ProjectFacts(name: namedFact(["project"]), tempo: bpm(namedFact(["tempo", "bpm"])), timeSignature: namedFact(["time signature"]), keySignature: namedFact(["key signature", "key"]), sampleRate: decimal(namedFact(["sample rate"])), transportState: namedFact(["transport", "play", "stop"]))
 
         // Discover both AX representations from the application subtree only. `targets` re-inspect the same windows and would double every element under a different path id, so they are excluded here (identical names are still kept distinct as separate objects).
         let rootNodes = flatten(raw.root)
         let headerNodes = uniqueNodes(rootNodes.filter(isTrackHeaderCandidate))
-        let channelNodes = uniqueNodes(mixerStripNodes(raw.root).filter(isMixerStripCandidate))
+        let channelNodes = uniqueNodes(mixerStripNodes(raw.root))
         let headers = headerNodes.map { HeaderModel(axPath: $0.id, name: trackName($0.title ?? $0.description ?? $0.id), ordinal: parseOrdinal($0.title ?? $0.description), facts: makeHeaderFacts(from: $0)) }
         let channels = channelNodes.map { ChannelModel(axPath: $0.id, name: $0.description ?? $0.id, facts: makeChannelFacts(from: $0)) }
         let (tracks, linking) = linkTracks(headers: headers, channels: channels)
@@ -47,7 +52,7 @@ struct SnapshotNormalizer: Sendable {
                 built.append(makeTrack(header: header, channel: nil, status: .unresolved, evidence: ["Track header \"\(header.name)\" has no Mixer channel strip in this snapshot; channel facts unavailable"]))
                 unresolvedH += 1
             } else {
-                built.append(makeTrack(header: header, channel: nil, status: .ambiguous, evidence: ["Name \"\(header.name)\" is shared by \(sameHeaders.count) header(s) and \(sameChannels.count) channel(s); not merged to avoid guessing"]))
+                built.append(makeTrack(header: header, channel: nil, status: .ambiguous, evidence: ["Name \"\(header.name)\" is shared by \(plural(sameHeaders.count, "header")) and \(plural(sameChannels.count, "channel")); not merged to avoid guessing"]))
                 ambiguous += 1
             }
         }
@@ -135,7 +140,19 @@ struct SnapshotNormalizer: Sendable {
 
     private func isTrackHeaderCandidate(_ node: RawAccessibilityNode) -> Bool { guard node.role == "AXLayoutItem", let title = node.title ?? node.description, title.localizedCaseInsensitiveContains("Track ") else { return false }; let roles = Set(node.children.map(\.role)); return roles.contains("AXTextField") && (roles.contains("AXSlider") || roles.contains("AXCheckBox") || roles.contains("AXRadioButton")) }
     private func isMixerStripCandidate(_ node: RawAccessibilityNode) -> Bool { guard node.role == "AXLayoutItem", node.description?.isEmpty == false else { return false }; let fader = node.children.contains { (($0.title ?? $0.description) ?? "").localizedCaseInsensitiveContains("volume fader") && $0.role == "AXSlider" }; return fader }
-    private func mixerStripNodes(_ node: RawAccessibilityNode) -> [RawAccessibilityNode] { let own = node.role == "AXLayoutArea" && node.description?.localizedCaseInsensitiveContains("mixer") == true ? node.children : []; return own + node.children.flatMap(mixerStripNodes) }
+    /// Logic's main-window inspector also exposes a "mixer"-described AXLayoutArea, mirroring the SELECTED track's channel strip (and its output). Those mirrors are the same Logic objects seen twice, not new ones, so the area with the most strips is the real Mixer and a smaller area contributes only strips whose names the Mixer does not already show — a name found ONLY there is a real object and is kept. Same-named strips INSIDE one area are distinct objects and all stay (ambiguous by design).
+    private func mixerStripNodes(_ node: RawAccessibilityNode) -> [RawAccessibilityNode] {
+        var areas: [[RawAccessibilityNode]] = []
+        func visit(_ node: RawAccessibilityNode) { if node.role == "AXLayoutArea", node.description?.localizedCaseInsensitiveContains("mixer") == true { areas.append(node.children.filter(isMixerStripCandidate)) }; node.children.forEach(visit) }
+        visit(node)
+        guard let mainIndex = areas.indices.max(by: { areas[$0].count < areas[$1].count }) else { return [] }
+        var strips = areas[mainIndex]
+        var names = Set(strips.map { ($0.description ?? $0.id).localizedLowercase })
+        for (index, area) in areas.enumerated() where index != mainIndex {
+            for strip in area where names.insert((strip.description ?? strip.id).localizedLowercase).inserted { strips.append(strip) }
+        }
+        return strips
+    }
     private func candidate(_ node: RawAccessibilityNode, kind: String, validation: FactState, evidence: [String]) -> DiscoveryCandidate { .init(id: node.id, kind: kind, validation: validation, evidence: evidence, node: node) }
     private func uniqueNodes(_ nodes: [RawAccessibilityNode]) -> [RawAccessibilityNode] { var result: [RawAccessibilityNode] = []; var seen = Set<String>(); for node in nodes where seen.insert(node.id).inserted { result.append(node) }; return result.sorted { $0.id < $1.id } }
     private func dedupe(_ values: [DiscoveryCandidate]) -> [DiscoveryCandidate] { var result: [DiscoveryCandidate] = []; var seen = Set<String>(); for value in values where seen.insert(value.id).inserted { result.append(value) }; return result.sorted { $0.id < $1.id } }
@@ -147,6 +164,6 @@ struct SnapshotNormalizer: Sendable {
     private func decimal(_ fact: Fact<String>) -> Fact<Double> { guard let value = fact.value, let number = decimalValue(value) else { return .init(state: fact.value == nil ? fact.state : .unknown, value: nil, source: fact.source) }; return .known(number, source: fact.source) }
     private func decimalValue(_ value: String?) -> Double? { guard let value else { return nil }; return value.replacingOccurrences(of: ",", with: ".").split(whereSeparator: { !$0.isNumber && $0 != "." && $0 != "-" }).compactMap { Double($0) }.first }
     private func updatedDiagnostics(_ source: AXDiscoveryDiagnostics, candidates: [DiscoveryCandidate], tracks: Int, channels: Int) -> AXDiscoveryDiagnostics { var result = source; result.candidatesFound = candidates.count; result.validatedTracks = tracks; result.validatedChannels = channels; result.channelStripsFound = channels; return result }
-    private func searchable(_ node: RawAccessibilityNode) -> [String] { [node.title, node.description, node.value, node.role, node.subrole].compactMap { $0 } }
+    private func plural(_ count: Int, _ noun: String) -> String { "\(count) \(noun)\(count == 1 ? "" : "s")" }
     private func flatten(_ node: RawAccessibilityNode) -> [RawAccessibilityNode] { [node] + node.children.flatMap(flatten) }
 }
