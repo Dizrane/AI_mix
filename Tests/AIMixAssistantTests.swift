@@ -238,7 +238,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageDeclaresDeliveryModes() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t")
-    #expect(md.contains("Package schema: `2.1`"))
+    #expect(md.contains("Package schema: `2.2`"))
     #expect(md.contains("Delivery modes"))
     #expect(md.contains("FULL PACKAGE")); #expect(md.contains("THIS DOCUMENT ONLY")); #expect(md.contains("NO AUDIO CAPABILITY"))
     #expect(md.contains("NEVER pretend to have listened"))
@@ -281,4 +281,155 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(!TranslocationRepair.isActive)
     #expect(TranslocationRepair.originalBundleURL() == nil)
     if case .repaired = TranslocationRepair.dequarantineOriginal() { Issue.record("dequarantine must refuse when the app is not translocated") }
+}
+
+// MARK: - Local DSP audio metrics (facts about the WAV file, synthesized fixtures)
+
+/// Float32 WAV writer for metric fixtures: exact sample values, no quantization noise. The analyzer under test never writes; only fixtures do.
+private func writeFloatWAV(_ url: URL, sampleRate: Double = 48000, channels: [[Float]]) throws {
+    let settings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: sampleRate, AVNumberOfChannelsKey: channels.count, AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true, AVLinearPCMIsBigEndianKey: false]
+    let file = try AVAudioFile(forWriting: url, settings: settings)
+    let frames = channels.map(\.count).min() ?? 0
+    let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(frames))!
+    buffer.frameLength = AVAudioFrameCount(frames)
+    for (index, samples) in channels.enumerated() { samples.withUnsafeBufferPointer { buffer.floatChannelData![index].update(from: $0.baseAddress!, count: frames) } }
+    try file.write(from: buffer)
+}
+private func sineSamples(_ frequency: Double, amplitude: Double, seconds: Double, sampleRate: Double = 48000) -> [Float] {
+    (0..<Int(seconds * sampleRate)).map { Float(amplitude * sin(2 * .pi * frequency * Double($0) / sampleRate)) }
+}
+private func analyzeWAV(channels: [[Float]], sampleRate: Double = 48000) throws -> AudioMetrics {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let url = dir.appendingPathComponent("metrics.wav")
+    try writeFloatWAV(url, sampleRate: sampleRate, channels: channels)
+    let metrics = AudioMetricsAnalyzer().analyze(fileAt: url)
+    try? FileManager.default.removeItem(at: dir)
+    return try #require(metrics)
+}
+/// −18 dBFS RMS sine ⇒ peak amplitude −14.99 dBFS.
+private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
+
+@Test func metrics1_referenceSineMatchesTheory() throws {
+    let m = try analyzeWAV(channels: [sineSamples(1000, amplitude: minus18RMSAmplitude, seconds: 10)])
+    let rms = try #require(m.rmsDBFS.value); let crest = try #require(m.crestFactorDB.value)
+    let lufs = try #require(m.integratedLoudnessLUFS.value); let truePeak = try #require(m.truePeakDBTP.value)
+    let samplePeak = try #require(m.samplePeakDBFS.value); let bands = try #require(m.spectralBands.value)
+    let centroid = try #require(m.spectralCentroidHz.value)
+    #expect(abs(rms - -18.0) < 0.2)
+    #expect(abs(crest - 3.01) < 0.3)
+    #expect(abs(lufs - -18.0) < 1.0) // K-weighting ≈ 0 dB at 1 kHz
+    #expect(abs(truePeak - -14.99) < 0.5)
+    #expect(abs(samplePeak - -14.99) < 0.2)
+    #expect(bands.midPercent > 95) // a 1 kHz tone lives in the 500–2000 Hz band
+    #expect(abs(centroid - 1000) < 50)
+    #expect(m.silencePercent.value == 0)
+    #expect(m.clippedSampleCount.value == 0)
+    #expect(m.rmsDBFS.source?.hasSuffix("metrics.wav") == true) // facts point at the analyzed file
+}
+@Test func metrics2_digitalSilenceStaysHonest() throws {
+    // Digital silence has no finite dBFS/LUFS level: those facts are `unavailable`, and the silence map carries the evidence instead.
+    let m = try analyzeWAV(channels: [[Float](repeating: 0, count: 5 * 48000)])
+    #expect(m.rmsDBFS.state == .unavailable)
+    #expect(m.samplePeakDBFS.state == .unavailable)
+    #expect(m.truePeakDBTP.state == .unavailable)
+    #expect(m.integratedLoudnessLUFS.state == .unavailable)
+    #expect(m.crestFactorDB.state == .unavailable)
+    #expect(m.spectralBands.state == .unavailable)
+    #expect(m.spectralCentroidHz.state == .unavailable)
+    let silencePercent = try #require(m.silencePercent.value)
+    #expect(silencePercent > 99.5)
+    let intervals = try #require(m.silenceIntervals.value)
+    let interval = try #require(intervals.first)
+    #expect(intervals.count == 1)
+    #expect(abs(interval.start - 0) < 0.05)
+    #expect(abs(interval.end - 5) < 0.05)
+    #expect(m.dcOffsetMean.value == 0)
+    #expect(m.clippedSampleCount.value == 0)
+}
+@Test func metrics3_stereoCorrelationDetectsPhase() throws {
+    let left = sineSamples(440, amplitude: 0.5, seconds: 2)
+    let antiPhase = try analyzeWAV(channels: [left, left.map { -$0 }])
+    let antiCorrelation = try #require(antiPhase.stereoCorrelation.value)
+    #expect(abs(antiCorrelation - -1.0) < 0.05)
+    #expect(antiPhase.midSideRatioDB.state == .unavailable) // mid energy is exactly zero → no finite ratio
+    let inPhase = try analyzeWAV(channels: [left, left])
+    let inCorrelation = try #require(inPhase.stereoCorrelation.value)
+    #expect(abs(inCorrelation - 1.0) < 0.05)
+    #expect(inPhase.midSideRatioDB.state == .unavailable) // side energy is exactly zero → no finite ratio
+}
+@Test func metrics4_monoFileHasNoStereoFacts() throws {
+    let m = try analyzeWAV(channels: [sineSamples(440, amplitude: 0.5, seconds: 1)])
+    #expect(m.stereoCorrelation.state == .unavailable)
+    #expect(m.midSideRatioDB.state == .unavailable)
+}
+@Test func metrics5_silenceMapFindsLeadingAndTrailingSilence() throws {
+    let silence = [Float](repeating: 0, count: 48000)
+    let m = try analyzeWAV(channels: [silence + sineSamples(1000, amplitude: 0.1, seconds: 1) + silence])
+    let intervals = try #require(m.silenceIntervals.value)
+    #expect(intervals.count == 2)
+    #expect(abs(intervals[0].start - 0) < 0.2); #expect(abs(intervals[0].end - 1) < 0.2)
+    #expect(abs(intervals[1].start - 2) < 0.2); #expect(abs(intervals[1].end - 3) < 0.2)
+    let silencePercent = try #require(m.silencePercent.value)
+    #expect(abs(silencePercent - 66.7) < 5)
+}
+@Test func metrics6_clippingCounterCountsOnlyRealClipRuns() throws {
+    // A full-scale 30 Hz sine holds ≥ 3 consecutive samples at |x| ≥ 1 − 1e-4 around every peak; −6 dBFS never comes close.
+    let clipped = try analyzeWAV(channels: [sineSamples(30, amplitude: 1.0, seconds: 1)])
+    let clippedCount = try #require(clipped.clippedSampleCount.value)
+    #expect(clippedCount > 0)
+    let clean = try analyzeWAV(channels: [sineSamples(30, amplitude: pow(10.0, -6.0 / 20.0), seconds: 1)])
+    #expect(clean.clippedSampleCount.value == 0)
+}
+@Test func metrics7_dcOffsetIsMeasured() throws {
+    let m = try analyzeWAV(channels: [sineSamples(440, amplitude: 0.25, seconds: 1).map { $0 + 0.1 }])
+    let dc = try #require(m.dcOffsetMean.value)
+    #expect(abs(dc - 0.1) < 0.005)
+}
+@Test func metrics8_cacheServesUnchangedFilesAndInvalidatesChanged() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try writeFloatWAV(dir.appendingPathComponent("audio_track_001.wav"), channels: [sineSamples(1000, amplitude: 0.1, seconds: 1)])
+    let analyzer = AudioMetricsAnalyzer()
+    let (first, cache) = analyzer.attach(to: extractAudio(audioSnapshot(), dir: dir), audioDirectory: dir, cache: [:])
+    let metrics = try #require(first.first { $0.audioID == "audio_track_001" }?.metrics)
+    #expect(first.first { $0.audioID == "audio_track_002" }?.metrics == nil) // requires_user_export never carries metrics
+    // A poisoned cache entry with a matching file identity must be served verbatim — proof the file was NOT re-analyzed.
+    var poisoned = metrics; poisoned.clippedSampleCount = .known(424242, source: "cache-proof")
+    let key = try #require(cache.keys.first)
+    let (second, _) = analyzer.attach(to: extractAudio(audioSnapshot(), dir: dir), audioDirectory: dir, cache: [key: poisoned])
+    #expect(second.first { $0.audioID == "audio_track_001" }?.metrics?.clippedSampleCount.value == 424242)
+    // Changing the file breaks the size+date identity → honest recomputation replaces the stale entry.
+    try writeFloatWAV(dir.appendingPathComponent("audio_track_001.wav"), channels: [sineSamples(1000, amplitude: 0.1, seconds: 0.7)])
+    let (third, _) = analyzer.attach(to: extractAudio(audioSnapshot(), dir: dir), audioDirectory: dir, cache: [key: poisoned])
+    #expect(third.first { $0.audioID == "audio_track_001" }?.metrics?.clippedSampleCount.value == 0)
+}
+@Test func metrics9_packageRendersMetricsForExportedAssetsOnly() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try writeFloatWAV(dir.appendingPathComponent("audio_track_001.wav"), channels: [sineSamples(1000, amplitude: minus18RMSAmplitude, seconds: 2)])
+    let raw = audioSnapshot()
+    let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
+    let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
+    #expect(md.contains("Package schema: `2.2`"))
+    #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
+    #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
+    #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
+    #expect(md.contains("Stereo correlation L/R: unavailable")) // mono WAV — honest state, not a fabricated number
+    #expect(md.contains("measured facts about the audio files, not musical judgements")) // External AI Instructions updated
+}
+@Test func metrics10_manifestCarriesMetricsThroughJSON() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try writeFloatWAV(dir.appendingPathComponent("audio_track_001.wav"), channels: [sineSamples(1000, amplitude: 0.1, seconds: 1)])
+    let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(audioSnapshot(), dir: dir), audioDirectory: dir, cache: [:])
+    let manifest = AudioManifest(assets: assets)
+    let back = try JSONDecoder().decode(AudioManifest.self, from: JSONEncoder().encode(manifest))
+    let metrics = try #require(back.assets.first { $0.audioID == "audio_track_001" }?.metrics)
+    let rms = try #require(metrics.rmsDBFS.value)
+    #expect(abs(rms - -23.01) < 0.2) // amplitude 0.1 sine ⇒ RMS = 20·log10(0.1/√2)
+    #expect(back.assets.first { $0.audioID == "audio_track_002" }?.metrics == nil)
 }
