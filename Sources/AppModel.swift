@@ -19,8 +19,33 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
     /// Translocation runs the app from a quarantined read-only copy, that folder cannot be created — say so instead of a vague error.
     var storageUnavailableMessage: String {
         var message = "AI Mix Assistant data storage is unavailable" + (storeInitFailure.map { ": \($0)" } ?? ".")
-        if Bundle.main.bundleURL.path.contains("/AppTranslocation/") { message += " macOS launched the app from a quarantined read-only copy (App Translocation). Move AI Mix Assistant.app to another folder (for example Applications) with Finder and launch it again." }
+        if TranslocationRepair.isActive { message += " macOS launched the app from a quarantined read-only copy (App Translocation) — this happens on the first launch after downloading, wherever you put the folder. Click \u{201C}Fix and Relaunch\u{201D} to remove the quarantine from the app's own folder and restart it from its real location, or move AI Mix Assistant.app to another folder with Finder once and launch it again." }
         return message
+    }
+    // MARK: App Translocation repair
+    var storageReady: Bool { store != nil }
+    var isTranslocated: Bool { TranslocationRepair.isActive }
+    @Published var translocationStatus = ""
+    /// User-requested repair of App Translocation: dequarantine the app's own shell folder, then relaunch from the
+    /// real location and quit this read-only copy. Reports honestly at every step; nothing happens automatically.
+    func fixTranslocationAndRelaunch() {
+        switch TranslocationRepair.dequarantineOriginal() {
+        case .failed(let reason):
+            translocationStatus = reason; log.append(reason)
+        case .repaired(let originalApp):
+            translocationStatus = "Quarantine removed. Relaunching from \(originalApp.deletingLastPathComponent().path)\u{2026}"
+            log.append(translocationStatus)
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.createsNewApplicationInstance = true
+            NSWorkspace.shared.openApplication(at: originalApp, configuration: configuration) { [weak self] _, openError in
+                Task { @MainActor in
+                    if let openError {
+                        let message = "Quarantine removed, but relaunch failed: \(openError.localizedDescription). Quit and open AI Mix Assistant.app yourself — it will now start normally."
+                        self?.translocationStatus = message; self?.log.append(message)
+                    } else { exit(0) }
+                }
+            }
+        }
     }
     func refreshConnection() { connection = analyzer.connectionStatus(); log.append(connection.message) }
     func openAccessibilitySettings() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!) }
