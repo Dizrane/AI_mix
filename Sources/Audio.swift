@@ -21,6 +21,9 @@ struct AudioAsset: Codable, Identifiable, Sendable {
     var regions: [AudioRegionProvenance]
     var durationSeconds: Fact<Double>; var sampleRate: Fact<Double>; var channels: Fact<Int>; var bitDepth: Fact<Int>; var format: Fact<String>
     var trackAXPath: String?
+    /// Locally computed DSP facts about the exported WAV file. Present only for `exported` assets whose final file was
+    /// really analyzed (AppModel attaches them after the file set is confirmed stable); never fabricated for missing files.
+    var metrics: AudioMetrics? = nil
     var id: String { audioID }
     var regionCount: Int { regions.count }
     var regionIDs: [String] { regions.map(\.regionID) }
@@ -29,7 +32,7 @@ struct AudioAsset: Codable, Identifiable, Sendable {
 struct AudioExtractionSummary: Codable, Sendable { var logicTracks: Int; var audioRegions: Int; var assets: Int; var exported: Int; var requiresUserExport: Int; var failed: Int }
 
 struct AudioManifest: Codable, Sendable {
-    var schemaVersion = "1.0"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
+    var schemaVersion = "1.1"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
     init(assets: [AudioAsset]) {
         self.assets = assets
         self.summary = AudioExtractionSummary(logicTracks: assets.count, audioRegions: assets.reduce(0) { $0 + $1.regions.count }, assets: assets.count, exported: assets.filter { $0.status == .exported }.count, requiresUserExport: assets.filter { $0.status == .requiresUserExport }.count, failed: assets.filter { $0.status == .failed }.count)
