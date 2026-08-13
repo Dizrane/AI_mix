@@ -1,0 +1,17 @@
+# Swift Package Manager build artifacts
+.build/
+.swiftpm/
+
+# Xcode
+xcuserdata/
+DerivedData/
+*.xcworkspace/xcuserdata/
+
+# Compiled application bundles
+*.app/
+
+# macOS
+.DS_Store
+
+# App working data (created at runtime next to the bundle)
+Data/
