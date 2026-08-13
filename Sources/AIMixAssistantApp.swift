@@ -388,7 +388,11 @@ struct PackageScreen: View {
             }
             if !model.aiPackageStatus.isEmpty { Text(model.aiPackageStatus).font(.callout).foregroundStyle(.secondary) }
             if !model.aiPackage.isEmpty {
-                DisclosureGroup("Preview AI_MIX_ANALYSIS.md") { ScrollView { Text(model.aiPackage).font(.system(.caption2, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 320) }.font(.callout)
+                // This text is exactly what "Copy for AI" puts on the clipboard: the Markdown-only delivery, which states that no
+                // JSON or WAV files came with it. The saved package's own AI_MIX_ANALYSIS.md is the full-package delivery, so the
+                // preview must not claim to be that file.
+                DisclosureGroup("Preview the text \u{201C}Copy for AI\u{201D} sends (Markdown only, no files)") { ScrollView { Text(model.aiPackage).font(.system(.caption2, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 320) }.font(.callout)
+                if model.packageFolderURL != nil { Text("The saved package's own AI_MIX_ANALYSIS.md differs on purpose: it ships with the JSON files and WAVs, so it instructs the AI to read and listen to them. Open Package to read it.").font(.caption).foregroundStyle(.secondary) }
             }
             StageFooter(title: "Continue to Review", enabled: !model.aiPackage.isEmpty) { model.go(to: .review) }
         }
