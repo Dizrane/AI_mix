@@ -275,10 +275,11 @@ struct AnalysisScreen: View {
     }
     private func projectSummary(_ s: NormalizedSnapshot) -> String {
         var parts: [String] = []
+        if let name = s.project.name.value { parts.append(name) }
         if let t = s.project.tempo.value { parts.append("\(Int(t)) BPM") }
         if let k = s.project.keySignature.value { parts.append(k) }
         if let ts = s.project.timeSignature.value { parts.append(ts) }
-        return parts.isEmpty ? (s.project.name.value ?? "captured") : parts.joined(separator: " · ")
+        return parts.isEmpty ? "captured (Logic exposed no project metadata)" : parts.joined(separator: " · ")
     }
     @ViewBuilder private func diagnostics(_ s: NormalizedSnapshot) -> some View {
         DisclosureGroup("Diagnostics") {
@@ -371,7 +372,7 @@ struct PackageScreen: View {
             if !r.errors.isEmpty { Card { ForEach(r.errors, id: \.self) { Label($0, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.red) } } }
             if !r.missingAudio.isEmpty {
                 Card {
-                    Text("Audio analysis incomplete — \(r.missingAudio.count) WAV file(s) missing").font(.system(size: 13, weight: .semibold)).foregroundStyle(.orange)
+                    Text("Audio analysis incomplete — \(plural(r.missingAudio.count, "WAV file")) missing").font(.system(size: 13, weight: .semibold)).foregroundStyle(.orange)
                     ForEach(r.missingAudio, id: \.logicalTrackID) { m in Text("\(m.logicalTrackID) — \(m.name)").font(.caption).foregroundStyle(.secondary) }
                     Text("Export the missing tracks in Logic, then Refresh Export Status on the Audio screen for a complete analysis.").font(.caption).foregroundStyle(.secondary)
                 }

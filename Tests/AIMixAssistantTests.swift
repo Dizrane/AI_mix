@@ -94,8 +94,8 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
 
 // MARK: - Project metadata honesty (caption match, never substring)
 
-private func projectSnapshot(_ nodes: [RawAccessibilityNode]) -> NormalizedSnapshot {
-    SnapshotNormalizer().normalize(RawSnapshot(application: .init(name: "Logic Pro", bundleIdentifier: "com.apple.logic10", pid: 1), root: ax("AXApplication", id: "application", nodes)))
+private func projectSnapshot(_ nodes: [RawAccessibilityNode], windowTitle: String? = nil, document: String? = nil) -> NormalizedSnapshot {
+    SnapshotNormalizer().normalize(RawSnapshot(application: .init(name: "Logic Pro", bundleIdentifier: "com.apple.logic10", pid: 1, mainWindowTitle: windowTitle, mainWindowDocument: document), root: ax("AXApplication", id: "application", nodes)))
 }
 
 @Test func projectFactsIgnoreSubstringLookalikes() {
@@ -109,6 +109,24 @@ private func projectSnapshot(_ nodes: [RawAccessibilityNode]) -> NormalizedSnaps
     let s = projectSnapshot([ax("AXStaticText", id: "tempo", desc: "Tempo", value: "115"), ax("AXStaticText", id: "keysig", desc: "Key Signature", value: "D# minor")])
     #expect(s.project.tempo.state == .known); #expect(s.project.tempo.value == 115)
     #expect(s.project.keySignature.value == "D# minor")
+}
+@Test func captionedLabelIsNeverPublishedAsItsOwnValue() {
+    // Logic labels a field with one element and shows the value in another: the label carries no AXValue and must be skipped,
+    // never emitted as "Key Signature: known: Key Signature".
+    let s = projectSnapshot([ax("AXStaticText", id: "label", title: "Key Signature"), ax("AXStaticText", id: "field", desc: "Key Signature", value: "D# minor")])
+    #expect(s.project.keySignature.value == "D# minor"); #expect(s.project.keySignature.source == "field")
+    let labelOnly = projectSnapshot([ax("AXStaticText", id: "label", title: "Tempo")])
+    #expect(labelOnly.project.tempo.state == .unavailable)
+}
+@Test func projectNameComesFromTheMainWindowDocument() {
+    let s = projectSnapshot([], windowTitle: "fanlove — Tracks", document: "file:///Users/dizrane/Music/Logic/fanlove.logicx")
+    #expect(s.project.name.value == "fanlove") // the project file name wins over the window title, which carries the view name
+    #expect(s.project.name.source == "AXDocument of AXMainWindow")
+}
+@Test func projectNameFallsBackToTheWindowTitleVerbatim() {
+    let titleOnly = projectSnapshot([], windowTitle: "fanlove — Tracks")
+    #expect(titleOnly.project.name.value == "fanlove — Tracks"); #expect(titleOnly.project.name.source == "AXTitle of AXMainWindow")
+    #expect(projectSnapshot([]).project.name.state == .unavailable) // no open project: no name is invented
 }
 
 // MARK: - Inspector mirror strips (phantom channel duplicates)

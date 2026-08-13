@@ -9,12 +9,13 @@ struct SnapshotNormalizer: Sendable {
     func normalize(_ raw: RawSnapshot, rawReference: String? = nil) -> NormalizedSnapshot {
         let all = flatten(raw.root) + raw.targets.flatMap { flatten($0.node) }
         /// A project fact is trusted only when a node's own caption (title or description) IS the label — exactly, or as a whole-word prefix ("Key Signature" for "key"). Substring search anywhere used to sign another control's value as `known` ("play" inside "Display", "key" inside "keyboard"); no confident caption means `.unavailable`, never a guess.
+        /// The value must come from the control's own `AXValue`: a caption is a label, never its own value ("Key Signature: known: Key Signature"), so a matching node that carries no value is skipped in favour of the next one — Logic labels a field with one element and shows the value in another.
         func namedFact(_ labels: [String]) -> Fact<String> {
             func captionMatches(_ caption: String, _ label: String) -> Bool { let text = caption.localizedLowercase; let prefix = label.localizedLowercase; guard text.hasPrefix(prefix) else { return false }; guard text.count > prefix.count else { return true }; let next = text[text.index(text.startIndex, offsetBy: prefix.count)]; return !next.isLetter && !next.isNumber }
-            guard let node = all.first(where: { node in labels.contains { label in [node.title, node.description].compactMap { $0 }.contains { captionMatches($0, label) } } }), let value = node.value ?? node.title else { return .unavailable }
+            guard let node = all.first(where: { node in node.value?.isEmpty == false && labels.contains { label in [node.title, node.description].compactMap { $0 }.contains { captionMatches($0, label) } } }), let value = node.value else { return .unavailable }
             return .known(value, source: node.id)
         }
-        let project = ProjectFacts(name: namedFact(["project"]), tempo: bpm(namedFact(["tempo", "bpm"])), timeSignature: namedFact(["time signature"]), keySignature: namedFact(["key signature", "key"]), sampleRate: decimal(namedFact(["sample rate"])), transportState: namedFact(["transport", "play", "stop"]))
+        let project = ProjectFacts(name: projectName(raw.application), tempo: bpm(namedFact(["tempo", "bpm"])), timeSignature: namedFact(["time signature"]), keySignature: namedFact(["key signature", "key"]), sampleRate: decimal(namedFact(["sample rate"])), transportState: namedFact(["transport", "play", "stop"]))
 
         // Discover both AX representations from the application subtree only. `targets` re-inspect the same windows and would double every element under a different path id, so they are excluded here (identical names are still kept distinct as separate objects).
         let rootNodes = flatten(raw.root)
@@ -153,6 +154,20 @@ struct SnapshotNormalizer: Sendable {
         }
         return strips
     }
+    /// The project name comes from the main window, because no Logic control is captioned "project" and a caption search can therefore
+    /// only ever produce a false positive. `AXDocument` is the exact project file URL, so its file name (without the `.logicx` extension)
+    /// is the project name; when Logic exposes no document, the window's own title is the next real evidence and is published verbatim,
+    /// never parsed for a view suffix. With neither attribute — Logic running without an open project — the name stays `unavailable`.
+    private func projectName(_ application: ApplicationInfo) -> Fact<String> {
+        if let document = application.mainWindowDocument, let name = documentName(document) { return .known(name, source: "AXDocument of AXMainWindow") }
+        if let title = application.mainWindowTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty { return .known(title, source: "AXTitle of AXMainWindow") }
+        return .unavailable
+    }
+    private func documentName(_ document: String) -> String? {
+        let url = URL(string: document).flatMap { $0.isFileURL ? $0 : nil } ?? URL(fileURLWithPath: document)
+        let name = url.deletingPathExtension().lastPathComponent
+        return name.isEmpty ? nil : name
+    }
     private func candidate(_ node: RawAccessibilityNode, kind: String, validation: FactState, evidence: [String]) -> DiscoveryCandidate { .init(id: node.id, kind: kind, validation: validation, evidence: evidence, node: node) }
     private func uniqueNodes(_ nodes: [RawAccessibilityNode]) -> [RawAccessibilityNode] { var result: [RawAccessibilityNode] = []; var seen = Set<String>(); for node in nodes where seen.insert(node.id).inserted { result.append(node) }; return result.sorted { $0.id < $1.id } }
     private func dedupe(_ values: [DiscoveryCandidate]) -> [DiscoveryCandidate] { var result: [DiscoveryCandidate] = []; var seen = Set<String>(); for value in values where seen.insert(value.id).inserted { result.append(value) }; return result.sorted { $0.id < $1.id } }
@@ -164,6 +179,5 @@ struct SnapshotNormalizer: Sendable {
     private func decimal(_ fact: Fact<String>) -> Fact<Double> { guard let value = fact.value, let number = decimalValue(value) else { return .init(state: fact.value == nil ? fact.state : .unknown, value: nil, source: fact.source) }; return .known(number, source: fact.source) }
     private func decimalValue(_ value: String?) -> Double? { guard let value else { return nil }; return value.replacingOccurrences(of: ",", with: ".").split(whereSeparator: { !$0.isNumber && $0 != "." && $0 != "-" }).compactMap { Double($0) }.first }
     private func updatedDiagnostics(_ source: AXDiscoveryDiagnostics, candidates: [DiscoveryCandidate], tracks: Int, channels: Int) -> AXDiscoveryDiagnostics { var result = source; result.candidatesFound = candidates.count; result.validatedTracks = tracks; result.validatedChannels = channels; result.channelStripsFound = channels; return result }
-    private func plural(_ count: Int, _ noun: String) -> String { "\(count) \(noun)\(count == 1 ? "" : "s")" }
     private func flatten(_ node: RawAccessibilityNode) -> [RawAccessibilityNode] { [node] + node.children.flatMap(flatten) }
 }
