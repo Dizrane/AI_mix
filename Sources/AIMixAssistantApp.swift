@@ -292,16 +292,25 @@ struct AnalysisScreen: View {
     }
     @ViewBuilder private func checklist(_ s: NormalizedSnapshot) -> some View {
         let channels = s.tracks.compactMap(\.channel)
-        let outputs = channels.filter { $0.output.state == .known }.count, inputs = channels.filter { $0.input.state == .known }.count
+        let outputs = channels.map(\.output), inputs = channels.map(\.input)
         let sends = channels.reduce(0) { $0 + $1.sends.count }, unclassified = channels.reduce(0) { $0 + $1.routingButtons.count }
         VStack(alignment: .leading, spacing: 8) {
             CheckRow(title: "Logic connection", detail: model.connection.localizedName ?? "Logic Pro")
             CheckRow(title: "Project discovery", detail: projectSummary(s))
             CheckRow(title: "Track discovery", detail: "\(s.linking.logicalTracks) logical tracks")
             CheckRow(title: "Channel discovery", detail: "\(s.linking.channelCandidates) mixer channels")
-            CheckRow(title: "Routing", detail: "\(plural(outputs, "output")), \(plural(inputs, "input")), \(plural(sends, "send"))" + (unclassified == 0 ? "" : " · \(plural(unclassified, "button")) unclassified"))
+            CheckRow(title: "Routing", detail: "\(routingSummary(outputs, noun: "output")), \(routingSummary(inputs, noun: "input")), \(plural(sends, "send"))" + (unclassified == 0 ? "" : " · \(plural(unclassified, "button")) unclassified"))
             CheckRow(title: "Snapshot generation", detail: "saved to Data/current")
         }
+    }
+    /// "5 outputs (4 Stereo Out · 1 Bus)": known routing facts counted per destination kind, so a stereo-bus output and a
+    /// send-bus output are not one anonymous number. A destination whose caption the kind grammar does not know counts as "other".
+    private func routingSummary(_ facts: [Fact<String>], noun: String) -> String {
+        let kinds = facts.compactMap { $0.state == .known ? $0.value : nil }.map { RoutingDestinationKind.classify($0)?.label ?? "other" }
+        guard !kinds.isEmpty else { return plural(0, noun) }
+        let counts = Dictionary(grouping: kinds, by: { $0 }).mapValues(\.count)
+        let breakdown = counts.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }.map { "\($0.value) \($0.key)" }.joined(separator: " · ")
+        return "\(plural(kinds.count, noun)) (\(breakdown))"
     }
     private func projectSummary(_ s: NormalizedSnapshot) -> String {
         var parts: [String] = []

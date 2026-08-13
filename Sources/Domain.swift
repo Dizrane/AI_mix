@@ -86,6 +86,25 @@ struct LinkingDiagnostics: Codable, Sendable {
 }
 struct PluginFacts: Codable, Identifiable, Sendable { var id: String; var slot: Int; var name: Fact<String>; var manufacturer: Fact<String>; var bypass: Fact<Bool>; var parameters: [PluginParameter] }
 struct PluginParameter: Codable, Identifiable, Sendable { var id: String; var name: String; var value: Fact<Double>; var range: ClosedRange<Double>?; var unit: String? }
+/// The KIND of a routing destination, derived from the caption grammar Logic itself uses for routing slots — the same
+/// patterns the routing classifier accepts as destinations. "Bus N" is an internal bus; "St Out" / "Stereo Out(put)" the
+/// project's stereo output; "Output" / "Output N(-M)" a hardware output (pair); "Input N(-M)" a hardware input;
+/// "No Output" / "No Input" an explicitly disconnected slot. A caption matching no pattern returns nil — never a guess.
+enum RoutingDestinationKind: String, Codable, Sendable {
+    case bus, stereoOutput = "stereo_output", hardwareOutput = "hardware_output", hardwareInput = "hardware_input", notConnected = "not_connected"
+    static func classify(_ destination: String) -> RoutingDestinationKind? {
+        func matches(_ pattern: String) -> Bool { destination.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil }
+        if matches("^Bus \\d+$") { return .bus }
+        if matches("^St(ereo)? Out(put)?$") { return .stereoOutput }
+        if matches("^Output( \\d+(-\\d+)?)?$") { return .hardwareOutput }
+        if matches("^Input \\d+(-\\d+)?$") { return .hardwareInput }
+        if matches("^No (Output|Input)$") { return .notConnected }
+        return nil
+    }
+    /// Short human label for UI summaries; the raw value is the machine-readable form used in the AI package.
+    var label: String { switch self { case .bus: "Bus"; case .stereoOutput: "Stereo Out"; case .hardwareOutput: "hardware out"; case .hardwareInput: "hardware in"; case .notConnected: "none" } }
+}
+
 /// A mixer-strip AXButton naming a routing destination ("Bus 1", "St Out") whose slot could NOT be proven. An EMPTY send
 /// slot, the output slot and an aux's input slot share the same anonymous button shape over AX, so a destination button is
 /// classified only by structural evidence (its documented neighbour in the strip); a button with no such evidence keeps
