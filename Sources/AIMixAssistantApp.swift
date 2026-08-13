@@ -193,9 +193,7 @@ struct Sidebar: View {
         @EnvironmentObject var model: AppModel
         private var isCurrent: Bool { model.stage == stage }
         private var available: Bool { model.isAvailable(stage) }
-        private var done: Bool {
-            switch stage { case .connection: model.connection.found && model.connection.accessibilityTrusted && model.connection.projectOpen == true; case .analysis: model.normalized != nil; case .audio: !model.audioAssets.isEmpty; case .aiPackage: !model.aiPackage.isEmpty; case .review: !model.validated.isEmpty }
-        }
+        private var done: Bool { model.isComplete(stage) }
         var body: some View {
             Button { model.go(to: stage) } label: {
                 HStack(spacing: 10) {
@@ -239,7 +237,7 @@ struct StorageRepairCard: View {
 
 struct ConnectionScreen: View {
     @EnvironmentObject var model: AppModel
-    private var ready: Bool { model.connection.found && model.connection.accessibilityTrusted && model.connection.projectOpen == true }
+    private var ready: Bool { model.isComplete(.connection) }
     /// The three prerequisites in their real order: Accessibility is granted first, then Logic Pro runs, then a project is open
     /// inside it. The project row only claims something once the check could actually run (Logic found + Accessibility granted).
     private var project: (detail: String, state: IndicatorState) {
@@ -287,7 +285,7 @@ struct AnalysisScreen: View {
                 if !model.storageReady && model.isTranslocated { StorageRepairCard(showMessage: false) }
             }
             if let snapshot = model.normalized { diagnostics(snapshot) }
-            StageFooter(title: "Continue to Audio", enabled: model.normalized != nil) { model.go(to: .audio) }
+            StageFooter(title: "Continue to Audio", enabled: model.isAvailable(.audio)) { model.go(to: .audio) }
         }
     }
     @ViewBuilder private func checklist(_ s: NormalizedSnapshot) -> some View {
@@ -371,7 +369,7 @@ struct AudioScreen: View {
                 } }
             }
             Text("Export Tracks from Logic launches Logic's own File \u{25B8} Export \u{25B8} All Tracks as Audio Files\u{2026} (one WAV per track, regions kept in place). AI Mix Assistant only triggers the export and never changes mix settings; it then detects the real WAVs and matches them to logicalTrackID.").font(.caption).foregroundStyle(.secondary)
-            StageFooter(title: "Continue to AI Package", enabled: model.normalized != nil) { model.go(to: .aiPackage) }
+            StageFooter(title: "Continue to AI Package", enabled: model.isAvailable(.aiPackage)) { model.go(to: .aiPackage) }
         }
         .onAppear { if model.normalized != nil && model.audioAssets.isEmpty { model.prepareAudioExport() } }
         .confirmationDialog("Export audio tracks from Logic Pro?", isPresented: $model.showExportConfirm, titleVisibility: .visible) {
@@ -433,7 +431,7 @@ struct PackageScreen: View {
                 DisclosureGroup("Preview the text \u{201C}Copy for AI\u{201D} sends (Markdown only, no files)") { ScrollView { Text(model.aiPackage).font(.system(.caption2, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 320) }.font(.callout)
                 if model.packageFolderURL != nil { Text("The saved package's own AI_MIX_ANALYSIS.md differs on purpose: it ships with the JSON files and WAVs, so it instructs the AI to read and listen to them. Open Package to read it.").font(.caption).foregroundStyle(.secondary) }
             }
-            StageFooter(title: "Continue to Review", enabled: !model.aiPackage.isEmpty) { model.go(to: .review) }
+            StageFooter(title: "Continue to Review", enabled: model.isAvailable(.review)) { model.go(to: .review) }
         }
         .onAppear { model.ensurePluginInventory() }
     }
