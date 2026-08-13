@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#252b3f"/>
+      <stop offset="0.55" stop-color="#151a2b"/>
+      <stop offset="1" stop-color="#0b0d18"/>
+    </linearGradient>
+    <linearGradient id="cap" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5eead4"/>
+      <stop offset="1" stop-color="#3b82f6"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38bdf8" stop-opacity="0"/>
+      <stop offset="0.25" stop-color="#38bdf8" stop-opacity="0.55"/>
+      <stop offset="0.5" stop-color="#60a5fa" stop-opacity="0.8"/>
+      <stop offset="0.75" stop-color="#8b5cf6" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="toplight" cx="0.5" cy="0" r="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.13"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="16" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="softglow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="8" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- macOS squircle plate -->
+  <rect x="100" y="100" width="824" height="824" rx="184" fill="url(#bg)"/>
+  <rect x="100" y="100" width="824" height="824" rx="184" fill="url(#toplight)"/>
+  <rect x="103" y="103" width="818" height="818" rx="181" fill="none" stroke="#ffffff" stroke-opacity="0.06" stroke-width="6"/>
+
+  <!-- waveform behind the faders -->
+  <path d="M168 618 C 250 548, 316 706, 398 636 S 540 470, 622 556 S 764 708, 856 574"
+        stroke="url(#wave)" stroke-width="16" fill="none" stroke-linecap="round" filter="url(#softglow)"/>
+
+  <!-- fader tracks -->
+  <g fill="#2c3349">
+    <rect x="338" y="272" width="26" height="500" rx="13"/>
+    <rect x="498" y="272" width="26" height="500" rx="13"/>
+    <rect x="658" y="272" width="26" height="500" rx="13"/>
+  </g>
+  <!-- track fill below caps (active part) -->
+  <g fill="#3d4a6b">
+    <rect x="338" y="596" width="26" height="176" rx="13"/>
+    <rect x="498" y="386" width="26" height="386" rx="13"/>
+    <rect x="658" y="518" width="26" height="254" rx="13"/>
+  </g>
+
+  <!-- fader caps -->
+  <g filter="url(#glow)">
+    <rect x="299" y="568" width="104" height="58" rx="18" fill="url(#cap)"/>
+    <rect x="459" y="358" width="104" height="58" rx="18" fill="url(#cap)"/>
+    <rect x="619" y="490" width="104" height="58" rx="18" fill="url(#cap)"/>
+  </g>
+  <!-- cap notches -->
+  <g fill="#0c1120" fill-opacity="0.55">
+    <rect x="311" y="593" width="80" height="8" rx="4"/>
+    <rect x="471" y="383" width="80" height="8" rx="4"/>
+    <rect x="631" y="515" width="80" height="8" rx="4"/>
+  </g>
+
+  <!-- AI sparkle -->
+  <g filter="url(#glow)">
+    <path d="M762 196 C 769 243 783 257 830 264 C 783 271 769 285 762 332 C 755 285 741 271 694 264 C 741 257 755 243 762 196 Z" fill="#eef7ff"/>
+    <path d="M846 330 C 849.5 351 856 357.5 877 361 C 856 364.5 849.5 371 846 392 C 842.5 371 836 364.5 815 361 C 836 357.5 842.5 351 846 330 Z" fill="#bfe3ff"/>
+  </g>
+</svg>
