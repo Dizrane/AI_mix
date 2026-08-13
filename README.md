@@ -15,7 +15,7 @@ swift run
 
 Open the package in Xcode on a Mac with full Xcode installed to Archive/sign a distributable `.app`. The current environment provides Command Line Tools only, so an Archive cannot be produced here.
 
-The included test target uses XCTest. If `swift test` reports that XCTest is unavailable, select a full Xcode developer directory (`sudo xcode-select -s /Applications/Xcode.app`) and run it again; this is an incomplete local developer-tool installation, not an application dependency.
+The test target uses Swift Testing (`import Testing`), which ships with the Swift 6 toolchain. Running `swift test` still requires a full Xcode developer directory (`sudo xcode-select -s /Applications/Xcode.app`); with Command Line Tools alone the platform test runner is unavailable. The same suite also runs in CI on every pull request.
 
 ## Safety contract
 

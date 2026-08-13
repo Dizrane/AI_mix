@@ -10,13 +10,57 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
     @Published var raw: RawSnapshot?; @Published var normalized: NormalizedSnapshot?; @Published var aiPackage = ""; @Published var aiPackageURL: URL?; @Published var aiPackageStatus = ""; @Published var planText = ""; @Published var validated: [ValidatedCommand] = []; @Published var analyzerState: AnalyzerVisualState = .ready; @Published var log: [String] = []; @Published var audioAssets: [AudioAsset] = []; @Published var audioStatus = ""; @Published var exportPhase: AudioExportPhase = .idle; @Published var showExportConfirm = false; private var analysisSessionID = "unsaved_session"
     @Published var availablePlugins: [PluginInventoryItem] = []
     let analyzer: any DAWAnalyzer = LogicAccessibilityAnalyzer(); let normalizer = SnapshotNormalizer(); let validator = CommandValidator(); let audioExtractor = AudioAssetExtractor(); let exporter = LogicExportAutomator(); let pluginInventory = PluginInventory(); private var store: SessionStore?
-    init() { store = try? SessionStore(); refreshConnection() }
+    private let storeInitFailure: String?
+    init() {
+        do { store = try SessionStore(); storeInitFailure = nil } catch { store = nil; storeInitFailure = error.localizedDescription }
+        refreshConnection()
+    }
+    /// Honest storage diagnostics. Data lives in `Data/` next to the .app by design (one self-contained folder); when macOS App
+    /// Translocation runs the app from a quarantined read-only copy, that folder cannot be created — say so instead of a vague error.
+    var storageUnavailableMessage: String {
+        var message = "AI Mix Assistant data storage is unavailable" + (storeInitFailure.map { ": \($0)" } ?? ".")
+        if Bundle.main.bundleURL.path.contains("/AppTranslocation/") { message += " macOS launched the app from a quarantined read-only copy (App Translocation). Move AI Mix Assistant.app to another folder (for example Applications) with Finder and launch it again." }
+        return message
+    }
     func refreshConnection() { connection = analyzer.connectionStatus(); log.append(connection.message) }
     func openAccessibilitySettings() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!) }
     func launchLogic() { for id in ["com.apple.logic10", "com.apple.mobilelogic"] { if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) { NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { [weak self] _, _ in Task { @MainActor in self?.refreshConnection() } }; return } }; log.append("Logic Pro was not found on this Mac.") }
     func isAvailable(_ target: WorkflowStage) -> Bool { switch target { case .connection: true; case .analysis: connection.found && connection.accessibilityTrusted; case .audio, .aiPackage, .review: normalized != nil } }
     func go(to target: WorkflowStage) { if isAvailable(target) { stage = target } }
-    func scan() { guard let store else { analyzerState = .error("Storage unavailable"); log.append("Could not initialize AI Mix Assistant data storage."); return }; analyzerState = .scanning; Task { do { try await store.resetForNewAnalysis(); analysisSessionID = "analysis_\(ISO8601DateFormatter().string(from: Date()))"; raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil; log.append("Previous AI Mix Assistant analysis data removed. Starting a clean read-only scan."); let capture = try analyzer.fullScan(); raw = capture; let normalizedCapture = normalizer.normalize(capture, rawReference: "raw/accessibility_snapshot.json"); normalized = normalizedCapture; _ = try await store.save(capture, folder: "raw", name: "accessibility_snapshot.json"); _ = try await store.save(normalizedCapture, folder: "normalized", name: "normalized_project.json"); analyzerState = .ready; log.append("Read-only snapshot captured.") } catch { analyzerState = .error(error.localizedDescription); log.append(error.localizedDescription) } } }
+    @Published var scanProgress = 0
+    private var scanWork: Task<RawSnapshot, Error>?
+    /// The AX scan and normalization run off the main thread so the UI stays responsive; progress streams back and Cancel aborts cooperatively.
+    func scan() {
+        guard let store else { analyzerState = .error(storageUnavailableMessage); log.append(storageUnavailableMessage); return }
+        analyzerState = .scanning; scanProgress = 0
+        Task {
+            do {
+                try await store.resetForNewAnalysis()
+                analysisSessionID = "analysis_\(ISO8601DateFormatter().string(from: Date()))"
+                raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil
+                log.append("Previous AI Mix Assistant analysis data removed. Starting a clean read-only scan.")
+                let analyzer = analyzer
+                let onProgress: @Sendable (Int) -> Void = { [weak self] count in Task { @MainActor in self?.scanProgress = count } }
+                let work = Task.detached(priority: .userInitiated) { try analyzer.fullScan(progress: onProgress) }
+                scanWork = work
+                let capture = try await work.value
+                raw = capture
+                let normalizer = normalizer
+                let normalizedCapture = await Task.detached(priority: .userInitiated) { normalizer.normalize(capture, rawReference: "raw/accessibility_snapshot.json") }.value
+                normalized = normalizedCapture
+                _ = try await store.save(capture, folder: "raw", name: "accessibility_snapshot.json")
+                _ = try await store.save(normalizedCapture, folder: "normalized", name: "normalized_project.json")
+                analyzerState = .ready
+                log.append("Read-only snapshot captured.")
+            } catch is CancellationError {
+                analyzerState = .ready; log.append("Scan cancelled — no snapshot was recorded.")
+            } catch {
+                analyzerState = .error(error.localizedDescription); log.append(error.localizedDescription)
+            }
+            scanWork = nil
+        }
+    }
+    func cancelScan() { scanWork?.cancel() }
     @Published var packageFolderURL: URL?; @Published var packageZipURL: URL?
     var packageReadiness: PackageReadiness { PackageReadiness.evaluate(snapshot: normalized, assets: audioAssets) }
     func ensurePluginInventory() { if availablePlugins.isEmpty { availablePlugins = pluginInventory.discoverAvailable() } }
@@ -64,7 +108,7 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
     @Published var clearStatus = ""
     /// Wipes the app's own working directory (current/) back to a clean first-run state and resets the UI. Uses the existing SessionStore; touches nothing outside AI Mix Assistant.
     func clearProjectData() {
-        guard let store else { clearStatus = "Storage unavailable."; return }
+        guard let store else { clearStatus = storageUnavailableMessage; return }
         Task {
             do {
                 try await store.resetForNewAnalysis()
@@ -119,7 +163,8 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
         Task {
             let audioDir = await store.folderURL("audio")
             await store.clearAudioFiles() // clean our own working folder so the result is one unambiguous WAV per track
-            let outcome = exporter.exportAllTracks(destination: audioDir)
+            let exporter = exporter
+            let outcome = await Task.detached(priority: .userInitiated) { exporter.exportAllTracks(destination: audioDir) }.value
             switch outcome {
             case .triggerFailed(let step, let detail):
                 exportPhase = .failed(step)
