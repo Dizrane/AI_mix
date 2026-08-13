@@ -31,9 +31,10 @@ struct RawDiscoveryTarget: Codable, Identifiable, Sendable { var id: String; var
 struct RawSnapshot: Codable, Sendable {
     var schemaVersion = "1.1"; var capturedAt = Date(); var application: ApplicationInfo; var root: RawAccessibilityNode; var targets: [RawDiscoveryTarget] = []; var diagnostics: AXDiscoveryDiagnostics = .empty
 }
-/// The scanned application plus the documented identity of its main window: `mainWindowDocument` is the project file URL exposed by
-/// `AXDocument`, `mainWindowTitle` the window's own caption. Both are raw evidence for the project name; nil when Logic exposes neither.
-struct ApplicationInfo: Codable, Sendable { var name: String; var bundleIdentifier: String; var pid: Int32; var mainWindowTitle: String? = nil; var mainWindowDocument: String? = nil }
+/// The scanned application plus the documented identity of the window that holds the project: `projectWindowDocument` is the project file
+/// URL exposed by `AXDocument`, `projectWindowTitle` the window's own caption, and `projectWindowSource` names the attribute the window
+/// itself came from, so a published project fact can cite the exact read path. All nil when Logic exposes no such window.
+struct ApplicationInfo: Codable, Sendable { var name: String; var bundleIdentifier: String; var pid: Int32; var projectWindowTitle: String? = nil; var projectWindowDocument: String? = nil; var projectWindowSource: String? = nil }
 
 struct NormalizedSnapshot: Codable, Sendable {
     var schemaVersion = "1.2"; var capturedAt = Date(); var application: ApplicationInfo

@@ -154,13 +154,15 @@ struct SnapshotNormalizer: Sendable {
         }
         return strips
     }
-    /// The project name comes from the main window, because no Logic control is captioned "project" and a caption search can therefore
+    /// The project name comes from the project window, because no Logic control is captioned "project" and a caption search can therefore
     /// only ever produce a false positive. `AXDocument` is the exact project file URL, so its file name (without the `.logicx` extension)
     /// is the project name; when Logic exposes no document, the window's own title is the next real evidence and is published verbatim,
-    /// never parsed for a view suffix. With neither attribute — Logic running without an open project — the name stays `unavailable`.
+    /// never parsed for a view suffix. The source names both attributes the value really came from — the window attribute the analyzer
+    /// read and the attribute on it. With neither — Logic running without an open project — the name stays `unavailable`.
     private func projectName(_ application: ApplicationInfo) -> Fact<String> {
-        if let document = application.mainWindowDocument, let name = documentName(document) { return .known(name, source: "AXDocument of AXMainWindow") }
-        if let title = application.mainWindowTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty { return .known(title, source: "AXTitle of AXMainWindow") }
+        let window = application.projectWindowSource ?? "AXWindow"
+        if let document = application.projectWindowDocument, let name = documentName(document) { return .known(name, source: "AXDocument of \(window)") }
+        if let title = application.projectWindowTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty { return .known(title, source: "AXTitle of \(window)") }
         return .unavailable
     }
     private func documentName(_ document: String) -> String? {

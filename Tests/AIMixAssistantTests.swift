@@ -94,8 +94,8 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
 
 // MARK: - Project metadata honesty (caption match, never substring)
 
-private func projectSnapshot(_ nodes: [RawAccessibilityNode], windowTitle: String? = nil, document: String? = nil) -> NormalizedSnapshot {
-    SnapshotNormalizer().normalize(RawSnapshot(application: .init(name: "Logic Pro", bundleIdentifier: "com.apple.logic10", pid: 1, mainWindowTitle: windowTitle, mainWindowDocument: document), root: ax("AXApplication", id: "application", nodes)))
+private func projectSnapshot(_ nodes: [RawAccessibilityNode], windowTitle: String? = nil, document: String? = nil, windowSource: String? = "AXMainWindow") -> NormalizedSnapshot {
+    SnapshotNormalizer().normalize(RawSnapshot(application: .init(name: "Logic Pro", bundleIdentifier: "com.apple.logic10", pid: 1, projectWindowTitle: windowTitle, projectWindowDocument: document, projectWindowSource: windowSource), root: ax("AXApplication", id: "application", nodes)))
 }
 
 @Test func projectFactsIgnoreSubstringLookalikes() {
@@ -127,6 +127,11 @@ private func projectSnapshot(_ nodes: [RawAccessibilityNode], windowTitle: Strin
     let titleOnly = projectSnapshot([], windowTitle: "fanlove — Tracks")
     #expect(titleOnly.project.name.value == "fanlove — Tracks"); #expect(titleOnly.project.name.source == "AXTitle of AXMainWindow")
     #expect(projectSnapshot([]).project.name.state == .unavailable) // no open project: no name is invented
+}
+@Test func projectNameCitesTheWindowAttributeItWasReadFrom() {
+    // The analyzer falls back to AXFocusedWindow when Logic exposes no main window; the published source must say so, not claim AXMainWindow.
+    let focused = projectSnapshot([], document: "file:///Users/dizrane/Music/Logic/fanlove.logicx", windowSource: "AXFocusedWindow")
+    #expect(focused.project.name.source == "AXDocument of AXFocusedWindow")
 }
 
 // MARK: - Inspector mirror strips (phantom channel duplicates)
