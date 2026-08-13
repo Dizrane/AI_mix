@@ -193,11 +193,32 @@ struct Sidebar: View {
 
 // MARK: - Screens
 
+/// Shown whenever the closed-shell storage could not initialize. For App Translocation it offers the one-click
+/// repair (dequarantine the app's own folder, relaunch from the real location); other causes show the diagnostic only.
+struct StorageRepairCard: View {
+    @EnvironmentObject var model: AppModel
+    var showMessage = true
+    var body: some View {
+        Card {
+            Label("Data storage unavailable", systemImage: "exclamationmark.triangle").font(.headline).foregroundStyle(.red)
+            if showMessage { Text(model.storageUnavailableMessage).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+            if model.isTranslocated {
+                HStack(spacing: 10) {
+                    Button("Fix and Relaunch", action: model.fixTranslocationAndRelaunch).buttonStyle(.borderedProminent)
+                    if !model.translocationStatus.isEmpty { Text(model.translocationStatus).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+                }
+                Text("Removes macOS's quarantine attribute from the AI Mix Assistant folder only, then restarts the app from where you placed it. Nothing else is modified.").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
 struct ConnectionScreen: View {
     @EnvironmentObject var model: AppModel
     private var ready: Bool { model.connection.found && model.connection.accessibilityTrusted }
     var body: some View {
         Screen(title: "Connection", subtitle: "Connect to Logic Pro and confirm read-only access.") {
+            if !model.storageReady { StorageRepairCard() }
             Card {
                 StatusRow("Logic Pro", model.connection.found ? (model.connection.localizedName ?? "Connected") : "Not found", model.connection.found ? .ok : .error)
                 Divider()
@@ -228,7 +249,10 @@ struct AnalysisScreen: View {
                 else { Text("No analysis yet. Start a read-only scan of the current Logic project.").foregroundStyle(.secondary) }
             }
             Button(model.normalized == nil ? "Start Analysis" : "Re-run Analysis", action: model.scan).buttonStyle(.borderedProminent).disabled(!model.isAvailable(.analysis) || scanning)
-            if case .error(let message) = model.analyzerState { Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.red).font(.callout) }
+            if case .error(let message) = model.analyzerState {
+                Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.red).font(.callout)
+                if !model.storageReady && model.isTranslocated { StorageRepairCard(showMessage: false) }
+            }
             if let snapshot = model.normalized { diagnostics(snapshot) }
             StageFooter(title: "Continue to Audio", enabled: model.normalized != nil) { model.go(to: .audio) }
         }

@@ -201,3 +201,11 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(SessionStore.sharedContainerName(home.appendingPathComponent("Downloads/AI_Mix_v1")) == nil)
     #expect(SessionStore.sharedContainerName(URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("AI_Mix")) == nil)
 }
+
+// MARK: - App Translocation repair
+
+@Test func translocationRepairRefusesOutsideTranslocatedLaunch() {
+    #expect(!TranslocationRepair.isActive)
+    #expect(TranslocationRepair.originalBundleURL() == nil)
+    if case .repaired = TranslocationRepair.dequarantineOriginal() { Issue.record("dequarantine must refuse when the app is not translocated") }
+}
