@@ -632,6 +632,18 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let json = #"{"tag_name":"v0.2.7","assets":[{"name":"notes.txt","browser_download_url":"https://example.com/n.txt"}]}"#
     #expect(throws: (any Error).self) { try AppUpdater.update(fromReleaseJSON: Data(json.utf8)) }
 }
+@Test func updaterReadsTheLatestTagFromTheReleasesPageRedirect() {
+    // github.com/<repo>/releases/latest redirects to releases/tag/<tag> — no anonymous API rate limit on that path.
+    let update = AppUpdater.update(fromLatestReleasePage: URL(string: "https://github.com/Dizrane/AI_mix/releases/tag/v0.2.9")!)
+    #expect(update?.tag == "v0.2.9")
+    #expect(update?.assetName == "AI-Mix-Assistant-v0.2.9-macos-universal.zip") // the Release workflow's fixed naming scheme
+    #expect(update?.assetURL.absoluteString == "https://github.com/Dizrane/AI_mix/releases/download/v0.2.9/AI-Mix-Assistant-v0.2.9-macos-universal.zip")
+}
+@Test func updaterRejectsRedirectsThatAreNotAVersionTagPage() {
+    // A repo without releases lands elsewhere, and a non-numeric tag is not a version: neither may produce an update offer.
+    #expect(AppUpdater.update(fromLatestReleasePage: URL(string: "https://github.com/Dizrane/AI_mix/releases")!) == nil)
+    #expect(AppUpdater.update(fromLatestReleasePage: URL(string: "https://github.com/Dizrane/AI_mix/releases/tag/garbage")!) == nil)
+}
 @Test func updaterValidatesTheDownloadedBundleAgainstTheReleaseTag() throws {
     let temp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: temp) }
