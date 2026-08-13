@@ -4,7 +4,14 @@ import AppKit
 /// Stores exactly one current analysis inside Data/current next to the application bundle.
 actor SessionStore {
     let root: URL; let sessionURL: URL
-    init(root: URL? = nil) throws { let base = root ?? Self.dataRoot(); self.root = base; self.sessionURL = base.appendingPathComponent("current", isDirectory: true); try Self.createStructure(at: sessionURL) }
+    init(root: URL? = nil) throws {
+        let base: URL
+        if let root { base = root } else {
+            if Bundle.main.bundleURL.pathExtension == "app", let shared = Self.sharedContainerName(Bundle.main.bundleURL.deletingLastPathComponent()) { throw StorageError.appInSharedLocation(shared) }
+            base = Self.dataRoot()
+        }
+        self.root = base; self.sessionURL = base.appendingPathComponent("current", isDirectory: true); try Self.createStructure(at: sessionURL)
+    }
     /// Deletes only the app-owned `current` working directory and recreates it before a new read-only scan.
     func resetForNewAnalysis() throws { let manager = FileManager.default; if manager.fileExists(atPath: sessionURL.path) { try manager.removeItem(at: sessionURL) }; try Self.createStructure(at: sessionURL) }
     func save<T: Encodable>(_ value: T, folder: String, name: String) throws -> URL { let url = sessionURL.appendingPathComponent(folder).appendingPathComponent(name); try JSONEncoder.pretty.encode(value).write(to: url, options: .atomic); return url }
@@ -71,6 +78,25 @@ actor SessionStore {
         let bundleURL = Bundle.main.bundleURL
         guard bundleURL.pathExtension == "app" else { return nil }
         return bundleURL.deletingLastPathComponent().standardizedFileURL
+    }
+    /// Closed-shell rule: the folder around the .app is app-owned (it receives `Data/` and is what uninstall deletes), so it
+    /// must never be a folder that owns the user's other files. Returns a display name when `folder` is such a shared location.
+    static func sharedContainerName(_ folder: URL) -> String? {
+        let resolved = folder.resolvingSymlinksInPath().standardizedFileURL
+        let home = FileManager.default.homeDirectoryForCurrentUser.resolvingSymlinksInPath().standardizedFileURL
+        if resolved == home { return "the home folder" }
+        if resolved.path == "/Applications" { return "/Applications" }
+        let sharedNames: Set<String> = ["Downloads", "Desktop", "Documents", "Applications", "Music", "Movies", "Pictures", "Public", "Library"]
+        if resolved.deletingLastPathComponent() == home, sharedNames.contains(resolved.lastPathComponent) { return "~/\(resolved.lastPathComponent)" }
+        return nil
+    }
+}
+enum StorageError: LocalizedError {
+    case appInSharedLocation(String)
+    var errorDescription: String? {
+        switch self {
+        case .appInSharedLocation(let name): "AI Mix Assistant.app sits directly in \(name). The app keeps everything inside the folder around it, so move the .app into its own dedicated folder (for example AI_Mix_v1) with Finder and launch it again — deleting that folder will then remove the whole program with all its data."
+        }
     }
 }
 extension JSONEncoder { static var pretty: JSONEncoder { let e = JSONEncoder(); e.outputFormatting = [.prettyPrinted, .sortedKeys]; e.dateEncodingStrategy = .iso8601; return e } }

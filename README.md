@@ -4,7 +4,7 @@ macOS SwiftUI application foundation for a safe, LLM-directed Logic Pro mixing w
 
 ## Install (prebuilt app)
 
-Download the latest `AI-Mix-Assistant-*.zip` from this repository's **Releases** page, unzip it, and on first launch right-click `AI Mix Assistant.app` → Open → Open (the app is ad-hoc signed, not notarized). Requires macOS 14+ and Logic Pro running with the English UI. Releases are built automatically by the `Release` GitHub Actions workflow (run it manually from the Actions tab, or push a `v*` tag).
+Download the latest `AI-Mix-Assistant-*.zip` from this repository's **Releases** page and unzip it: you get one folder `AI_Mix_<version>` with the app inside. Move the whole folder anywhere and always run the app from inside it — the folder is the program's closed shell: every piece of data the app creates (`Data/`) lives next to the `.app`, and deleting the folder removes the program completely. The app refuses to start its storage when the `.app` is dropped directly into a shared folder like Downloads or Desktop, so it never scatters files. On first launch right-click `AI Mix Assistant.app` → Open → Open (the app is ad-hoc signed, not notarized). Requires macOS 14+ and Logic Pro running with the English UI. Releases are built automatically by the `Release` GitHub Actions workflow (run it manually from the Actions tab, or push a `v*` tag).
 
 ## Build and run
 

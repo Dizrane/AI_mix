@@ -40,10 +40,13 @@ jobs:
           cp ".build/apple/Products/Release/AI Mix Assistant" "$APP/Contents/MacOS/AI Mix Assistant"
           codesign --force --deep --sign - "$APP"
           codesign --verify --verbose "$APP"
-      - name: Zip app
+      - name: Zip app inside its closed-shell folder
         run: |
           VERSION="${{ github.event.inputs.version || github.ref_name }}"
-          ditto -c -k --sequesterRsrc --keepParent "AI Mix Assistant.app" "AI-Mix-Assistant-$VERSION-macos-universal.zip"
+          FOLDER="AI_Mix_$VERSION"
+          mkdir "$FOLDER"
+          mv "AI Mix Assistant.app" "$FOLDER/"
+          ditto -c -k --sequesterRsrc --keepParent "$FOLDER" "AI-Mix-Assistant-$VERSION-macos-universal.zip"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
       - name: Create GitHub release
         env:
@@ -52,9 +55,10 @@ jobs:
           cat > notes.md <<'EOF'
           ## Установка
 
-          1. Скачайте `AI-Mix-Assistant-*.zip` ниже и распакуйте.
-          2. Первый запуск: кликните по `AI Mix Assistant.app` правой кнопкой → «Открыть» → «Открыть» (приложение не нотаризовано Apple, поэтому обычный двойной клик macOS заблокирует; после первого раза запускается как обычно).
-          3. Выдайте приложению разрешение Accessibility, когда оно предложит (System Settings → Privacy & Security → Accessibility).
+          1. Скачайте `AI-Mix-Assistant-*.zip` ниже и распакуйте — получится папка `AI_Mix_<версия>` с приложением внутри.
+          2. Перенесите **всю папку** куда угодно (например в `~/Applications`) и запускайте приложение только изнутри неё: программа хранит все свои данные рядом с собой в этой папке, и удаление папки удаляет программу целиком со всеми данными.
+          3. Первый запуск: кликните по `AI Mix Assistant.app` правой кнопкой → «Открыть» → «Открыть» (приложение не нотаризовано Apple, поэтому обычный двойной клик macOS заблокирует; после первого раза запускается как обычно).
+          4. Выдайте приложению разрешение Accessibility, когда оно предложит (System Settings → Privacy & Security → Accessibility).
 
           ## Требования
 

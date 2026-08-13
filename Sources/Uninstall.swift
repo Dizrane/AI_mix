@@ -9,8 +9,9 @@ enum UninstallResult: Sendable {
 }
 
 /// Full self-removal: "ONE APP ROOT → ONE DELETE". Deletes the single, known AI Mix Assistant root directory
-/// (the folder holding the .app and its Data) recursively, after strict safety checks. It NEVER searches the
-/// filesystem for leftovers, never touches ~/Library, system locations, Logic, or anything outside that one root.
+/// (the folder holding the .app and its Data) recursively, after strict safety checks, then the handful of
+/// ~/Library files macOS itself created for this exact bundle identifier. It NEVER searches the filesystem
+/// for leftovers and never touches system locations, Logic, or anything not provably owned by this app.
 struct AppUninstaller: Sendable {
     /// The exact directory that would be deleted, or nil if it cannot be unambiguously determined.
     func targetRoot() -> URL? { SessionStore.applicationRootURL() }
@@ -23,11 +24,30 @@ struct AppUninstaller: Sendable {
             try manager.removeItem(at: root)
         } catch {
             // Honest result: report success only if the directory is actually gone.
-            if !manager.fileExists(atPath: root.path) { return .deleted(path: root.path) }
+            if !manager.fileExists(atPath: root.path) { removeSystemSideArtifacts(); return .deleted(path: root.path) }
             let bundleGone = !manager.fileExists(atPath: root.appendingPathComponent(Bundle.main.bundleURL.lastPathComponent).path)
             return bundleGone ? .partiallyRemoved(reason: "Some files under \(root.path) could not be removed: \(error.localizedDescription)") : .failed(reason: error.localizedDescription)
         }
-        return manager.fileExists(atPath: root.path) ? .partiallyRemoved(reason: "Some files under \(root.path) could not be removed.") : .deleted(path: root.path)
+        if manager.fileExists(atPath: root.path) { return .partiallyRemoved(reason: "Some files under \(root.path) could not be removed.") }
+        removeSystemSideArtifacts()
+        return .deleted(path: root.path)
+    }
+
+    /// Removes the few side files macOS itself creates for the app in ~/Library, each addressed ONLY by this app's exact bundle
+    /// identifier (preferences, saved window state, caches): no search, no patterns, nothing that is not provably ours. The one
+    /// trace that cannot be removed programmatically is the Accessibility permission entry in System Settings — macOS owns it.
+    private func removeSystemSideArtifacts() {
+        guard let bundleID = Bundle.main.bundleIdentifier, !bundleID.isEmpty else { return }
+        UserDefaults.standard.removePersistentDomain(forName: bundleID)
+        let manager = FileManager.default
+        let library = manager.homeDirectoryForCurrentUser.appendingPathComponent("Library")
+        let artifacts = [
+            library.appendingPathComponent("Preferences/\(bundleID).plist"),
+            library.appendingPathComponent("Saved Application State/\(bundleID).savedState"),
+            library.appendingPathComponent("Caches/\(bundleID)"),
+            library.appendingPathComponent("HTTPStorages/\(bundleID)")
+        ]
+        for url in artifacts where manager.fileExists(atPath: url.path) { try? manager.removeItem(at: url) }
     }
 
     /// Returns a human-readable reason if deleting `root` would be unsafe, else nil. No filesystem scanning — only checks on this one path.
@@ -41,6 +61,7 @@ struct AppUninstaller: Sendable {
         if resolved.pathComponents.count < 3 { return "The path \(path) is too shallow to be the AI Mix Assistant directory." }
         let forbidden: Set<String> = ["/", "/System", "/Library", "/Applications", "/Users", "/private", "/private/var", "/private/tmp", "/tmp", "/bin", "/usr", "/opt", "/Volumes", home]
         if forbidden.contains(path) { return "Refusing to delete a protected location (\(path))." }
+        if let shared = SessionStore.sharedContainerName(resolved) { return "The app sits directly in \(shared), which contains your other files. Move AI Mix Assistant.app into its own dedicated folder first; only that folder is ever deleted." }
         if path.hasPrefix("/private/var/folders") || path.hasPrefix("/private/tmp/AppTranslocation") { return "The app appears to be running from a temporary/translocated location; the real directory cannot be safely determined. Nothing was deleted." }
         // Characteristic structure: the root must actually contain THIS .app bundle and the Data directory.
         var isDir: ObjCBool = false

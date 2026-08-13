@@ -120,7 +120,7 @@ struct SettingsView: View {
         .alert("Are you absolutely sure?", isPresented: $deleteStage2) {
             Button("Cancel", role: .cancel) {}
             Button("Delete Permanently", role: .destructive) { model.deleteApplication() }
-        } message: { Text("The entire AI Mix Assistant directory will be permanently deleted. Nothing outside this directory will be searched for or deleted.\n\nDirectory to delete:\n\(model.uninstallTargetPath)\n\nThis is permanent and cannot be undone.") }
+        } message: { Text("The entire AI Mix Assistant directory will be permanently deleted, along with the app's own preferences and window-state files macOS keeps in ~/Library. Nothing else will be searched for or deleted.\n\nDirectory to delete:\n\(model.uninstallTargetPath)\n\nThe only remaining trace is the Accessibility permission entry, which macOS owns — remove it in System Settings → Privacy & Security → Accessibility if you wish.\n\nThis is permanent and cannot be undone.") }
     }
 }
 
