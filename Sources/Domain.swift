@@ -36,6 +36,25 @@ struct RawSnapshot: Codable, Sendable {
 /// itself came from, so a published project fact can cite the exact read path. All nil when Logic exposes no such window.
 struct ApplicationInfo: Codable, Sendable { var name: String; var bundleIdentifier: String; var pid: Int32; var projectWindowTitle: String? = nil; var projectWindowDocument: String? = nil; var projectWindowSource: String? = nil }
 
+/// Whether Logic currently shows an open project, decided from the documented identity of its main/focused window. One rule
+/// shared by the live Connection indicator and the normalizer's project name: `AXDocument` (the project file URL) is proof and
+/// supplies the name; with no document the window's own non-empty `AXTitle` is the next real evidence, published verbatim (an
+/// unsaved project has a title but no file yet). No such window, or a caption-less one, means no open project — never a guess.
+struct ProjectPresence: Sendable, Equatable {
+    var open: Bool; var name: String?; var source: String?
+    static func evaluate(title: String?, document: String?, windowSource: String?) -> ProjectPresence {
+        let window = windowSource ?? "AXWindow"
+        if let document, let name = documentName(document) { return .init(open: true, name: name, source: "AXDocument of \(window)") }
+        if let title = title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty { return .init(open: true, name: title, source: "AXTitle of \(window)") }
+        return .init(open: false, name: nil, source: nil)
+    }
+    private static func documentName(_ document: String) -> String? {
+        let url = URL(string: document).flatMap { $0.isFileURL ? $0 : nil } ?? URL(fileURLWithPath: document)
+        let name = url.deletingPathExtension().lastPathComponent
+        return name.isEmpty ? nil : name
+    }
+}
+
 struct NormalizedSnapshot: Codable, Sendable {
     var schemaVersion = "1.2"; var capturedAt = Date(); var application: ApplicationInfo
     var completeness: Fact<String>; var project: ProjectFacts; var tracksStatus: Fact<String> = .init(state: .requiresProbe, value: nil, source: nil); var tracks: [TrackFacts]; var linking: LinkingDiagnostics = .empty; var candidates: [DiscoveryCandidate] = []; var audio: AudioFacts = .unavailable; var arrangement: ArrangementFacts = .unavailable; var probes: [ProbeSummary] = []; var diagnostics: AXDiscoveryDiagnostics = .empty; var limitations: [String] = []; var rawSnapshotReference: String?

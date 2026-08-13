@@ -193,15 +193,9 @@ struct SnapshotNormalizer: Sendable {
     /// never parsed for a view suffix. The source names both attributes the value really came from — the window attribute the analyzer
     /// read and the attribute on it. With neither — Logic running without an open project — the name stays `unavailable`.
     private func projectName(_ application: ApplicationInfo) -> Fact<String> {
-        let window = application.projectWindowSource ?? "AXWindow"
-        if let document = application.projectWindowDocument, let name = documentName(document) { return .known(name, source: "AXDocument of \(window)") }
-        if let title = application.projectWindowTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty { return .known(title, source: "AXTitle of \(window)") }
-        return .unavailable
-    }
-    private func documentName(_ document: String) -> String? {
-        let url = URL(string: document).flatMap { $0.isFileURL ? $0 : nil } ?? URL(fileURLWithPath: document)
-        let name = url.deletingPathExtension().lastPathComponent
-        return name.isEmpty ? nil : name
+        let presence = ProjectPresence.evaluate(title: application.projectWindowTitle, document: application.projectWindowDocument, windowSource: application.projectWindowSource)
+        guard presence.open, let name = presence.name else { return .unavailable }
+        return .known(name, source: presence.source)
     }
     private func candidate(_ node: RawAccessibilityNode, kind: String, validation: FactState, evidence: [String]) -> DiscoveryCandidate { .init(id: node.id, kind: kind, validation: validation, evidence: evidence, node: node) }
     private func uniqueNodes(_ nodes: [RawAccessibilityNode]) -> [RawAccessibilityNode] { var result: [RawAccessibilityNode] = []; var seen = Set<String>(); for node in nodes where seen.insert(node.id).inserted { result.append(node) }; return result.sorted { $0.id < $1.id } }

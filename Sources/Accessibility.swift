@@ -5,7 +5,9 @@ import AppKit
 protocol DAWAnalyzer: Sendable { func connectionStatus() -> LogicConnection; func fullScan(progress: @escaping @Sendable (Int) -> Void) throws -> RawSnapshot; func runProbe(_ request: ProbeRequest) throws -> ProbeResult }
 extension DAWAnalyzer { func fullScan() throws -> RawSnapshot { try fullScan(progress: { _ in }) } }
 struct RunningApplicationDiagnostic: Identifiable, Sendable { var id: Int32 { processIdentifier }; var localizedName: String; var bundleIdentifier: String; var processIdentifier: Int32; var isFinishedLaunching: Bool; var isTerminated: Bool }
-struct LogicConnection: Sendable { var found: Bool; var localizedName: String?; var pid: Int32?; var bundleIdentifier: String?; var isFinishedLaunching: Bool?; var isTerminated: Bool?; var accessibilityTrusted: Bool; var diagnostics: [RunningApplicationDiagnostic]; var message: String }
+/// `projectOpen` is nil when the check could not run at all (Logic not running, or Accessibility not granted — the window
+/// cannot be read); true/false is the real evaluated `ProjectPresence` of Logic's main/focused window at this moment.
+struct LogicConnection: Sendable { var found: Bool; var localizedName: String?; var pid: Int32?; var bundleIdentifier: String?; var isFinishedLaunching: Bool?; var isTerminated: Bool?; var accessibilityTrusted: Bool; var projectOpen: Bool?; var projectName: String?; var diagnostics: [RunningApplicationDiagnostic]; var message: String }
 
 /// Read-only AX inspector. It never calls AXUIElementPerformAction or any AX setter.
 struct LogicAccessibilityAnalyzer: DAWAnalyzer {
@@ -14,7 +16,18 @@ struct LogicAccessibilityAnalyzer: DAWAnalyzer {
         let applications = NSWorkspace.shared.runningApplications
         let app = applications.first { !$0.isTerminated && ($0.bundleIdentifier.map(supportedBundleIDs.contains) == true || $0.localizedName == "Logic Pro") }
         let trusted = AXIsProcessTrusted()
-        return .init(found: app != nil, localizedName: app?.localizedName, pid: app?.processIdentifier, bundleIdentifier: app?.bundleIdentifier, isFinishedLaunching: app?.isFinishedLaunching, isTerminated: app?.isTerminated, accessibilityTrusted: trusted, diagnostics: app == nil ? applications.map(diagnostic(for:)) : [], message: app == nil ? "Logic Pro is not present in NSWorkspace.runningApplications." : (trusted ? "Connected read-only." : "Logic Pro found; Accessibility permission is required."))
+        // The project check needs a readable window, so it only runs once Logic is found AND Accessibility is granted;
+        // before that the answer is honestly nil (not checked), never a guessed false.
+        var project: ProjectPresence? = nil
+        if let app, trusted {
+            let identity = projectIdentity(of: AXUIElementCreateApplication(app.processIdentifier))
+            project = ProjectPresence.evaluate(title: identity.title, document: identity.document, windowSource: identity.source)
+        }
+        let message: String = if app == nil { "Logic Pro is not present in NSWorkspace.runningApplications." }
+        else if !trusted { "Logic Pro found; Accessibility permission is required." }
+        else if let project, project.open { "Connected read-only. Project \u{201C}\(project.name ?? "unknown")\u{201D} is open." }
+        else { "Connected read-only, but Logic Pro exposes no open project window — open a project." }
+        return .init(found: app != nil, localizedName: app?.localizedName, pid: app?.processIdentifier, bundleIdentifier: app?.bundleIdentifier, isFinishedLaunching: app?.isFinishedLaunching, isTerminated: app?.isTerminated, accessibilityTrusted: trusted, projectOpen: project?.open, projectName: project?.name, diagnostics: app == nil ? applications.map(diagnostic(for:)) : [], message: message)
     }
     /// One traversal of the application element captures everything: its AX children already include every window, so windows are
     /// referenced from the captured tree instead of being inspected a second time. `progress` receives the running element count;

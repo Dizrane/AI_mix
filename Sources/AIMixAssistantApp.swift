@@ -164,8 +164,9 @@ struct Sidebar: View {
             ForEach(WorkflowStage.allCases) { stage in StepRow(stage: stage) }
             Spacer()
             VStack(alignment: .leading, spacing: 8) {
-                StatusRow("Logic Pro", model.connection.found ? "Connected" : "Not found", model.connection.found ? .ok : .error)
                 StatusRow("Accessibility", model.connection.accessibilityTrusted ? "Granted" : "Required", model.connection.accessibilityTrusted ? .ok : .warn)
+                StatusRow("Logic Pro", model.connection.found ? "Connected" : "Not found", model.connection.found ? .ok : .error)
+                StatusRow("Project", model.connection.projectOpen == true ? (model.connection.projectName ?? "Open") : (model.connection.projectOpen == false ? "Not open" : "Not checked"), model.connection.projectOpen == true ? .ok : (model.connection.projectOpen == false ? .warn : .idle))
             }.font(.caption)
             if let update = model.updateAvailable {
                 VStack(alignment: .leading, spacing: 6) {
@@ -193,7 +194,7 @@ struct Sidebar: View {
         private var isCurrent: Bool { model.stage == stage }
         private var available: Bool { model.isAvailable(stage) }
         private var done: Bool {
-            switch stage { case .connection: model.connection.found && model.connection.accessibilityTrusted; case .analysis: model.normalized != nil; case .audio: !model.audioAssets.isEmpty; case .aiPackage: !model.aiPackage.isEmpty; case .review: !model.validated.isEmpty }
+            switch stage { case .connection: model.connection.found && model.connection.accessibilityTrusted && model.connection.projectOpen == true; case .analysis: model.normalized != nil; case .audio: !model.audioAssets.isEmpty; case .aiPackage: !model.aiPackage.isEmpty; case .review: !model.validated.isEmpty }
         }
         var body: some View {
             Button { model.go(to: stage) } label: {
@@ -238,24 +239,32 @@ struct StorageRepairCard: View {
 
 struct ConnectionScreen: View {
     @EnvironmentObject var model: AppModel
-    private var ready: Bool { model.connection.found && model.connection.accessibilityTrusted }
+    private var ready: Bool { model.connection.found && model.connection.accessibilityTrusted && model.connection.projectOpen == true }
+    /// The three prerequisites in their real order: Accessibility is granted first, then Logic Pro runs, then a project is open
+    /// inside it. The project row only claims something once the check could actually run (Logic found + Accessibility granted).
+    private var project: (detail: String, state: IndicatorState) {
+        guard model.connection.accessibilityTrusted else { return ("Waiting for Accessibility", .idle) }
+        guard model.connection.found else { return ("Waiting for Logic Pro", .idle) }
+        guard model.connection.projectOpen == true else { return ("No project open", .warn) }
+        return (model.connection.projectName ?? "Open", .ok)
+    }
     var body: some View {
-        Screen(title: "Connection", subtitle: "Connect to Logic Pro and confirm read-only access.") {
+        Screen(title: "Connection", subtitle: "Grant read-only access, launch Logic Pro and open your project.") {
             if !model.storageReady { StorageRepairCard() }
             Card {
-                StatusRow("Logic Pro", model.connection.found ? (model.connection.localizedName ?? "Connected") : "Not found", model.connection.found ? .ok : .error)
-                Divider()
                 StatusRow("Accessibility", model.connection.accessibilityTrusted ? "Granted" : "Permission required", model.connection.accessibilityTrusted ? .ok : .warn)
                 Divider()
-                StatusRow("Project", model.normalized != nil ? "Detected" : (model.connection.found ? "Ready to analyze" : "Not detected"), model.normalized != nil ? .ok : (model.connection.found ? .warn : .idle))
+                StatusRow("Logic Pro", model.connection.found ? (model.connection.localizedName ?? "Connected") : "Not found", model.connection.found ? .ok : .error)
+                Divider()
+                StatusRow("Project", project.detail, project.state)
             }
             HStack(spacing: 10) {
                 Button("Refresh", action: model.refreshConnection)
-                if !model.connection.found { Button("Launch Logic Pro", action: model.launchLogic) }
                 if !model.connection.accessibilityTrusted { Button("Open Accessibility Settings", action: model.openAccessibilitySettings) }
+                if !model.connection.found { Button("Launch Logic Pro", action: model.launchLogic) }
             }
             if ready { Text("System ready. Logic Pro is analyzed read-only.").font(.callout).foregroundStyle(.secondary) }
-            else { Text("Status refreshes automatically — launch Logic Pro or grant Accessibility and this screen updates on its own.").font(.caption).foregroundStyle(.secondary) }
+            else { Text("Status refreshes automatically — grant Accessibility, launch Logic Pro and open a project; this screen updates on its own.").font(.caption).foregroundStyle(.secondary) }
             StageFooter(title: "Continue to Analysis", enabled: ready) { model.go(to: .analysis) }
         }
     }

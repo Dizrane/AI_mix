@@ -17,7 +17,7 @@ struct ApplicationLauncher: Sendable {
 }
 
 @MainActor final class AppModel: ObservableObject {
-    @Published var connection = LogicConnection(found: false, localizedName: nil, pid: nil, bundleIdentifier: nil, isFinishedLaunching: nil, isTerminated: nil, accessibilityTrusted: false, diagnostics: [], message: "Not checked")
+    @Published var connection = LogicConnection(found: false, localizedName: nil, pid: nil, bundleIdentifier: nil, isFinishedLaunching: nil, isTerminated: nil, accessibilityTrusted: false, projectOpen: nil, projectName: nil, diagnostics: [], message: "Not checked")
     @Published var stage: WorkflowStage = .connection
     @Published var raw: RawSnapshot?; @Published var normalized: NormalizedSnapshot?; @Published var aiPackage = ""; @Published var aiPackageURL: URL?; @Published var aiPackageStatus = ""; @Published var planText = ""; @Published var validated: [ValidatedCommand] = []; @Published var analyzerState: AnalyzerVisualState = .ready; @Published var log: [String] = []; @Published var audioAssets: [AudioAsset] = []; @Published var audioStatus = ""; @Published var exportPhase: AudioExportPhase = .idle; @Published var showExportConfirm = false; private var analysisSessionID = "unsaved_session"
     @Published var availablePlugins: [PluginInventoryItem] = []
@@ -41,7 +41,7 @@ struct ApplicationLauncher: Sendable {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self else { return }
                 let fresh = self.analyzer.connectionStatus()
-                if fresh.found != self.connection.found || fresh.accessibilityTrusted != self.connection.accessibilityTrusted || fresh.pid != self.connection.pid {
+                if fresh.found != self.connection.found || fresh.accessibilityTrusted != self.connection.accessibilityTrusted || fresh.pid != self.connection.pid || fresh.projectOpen != self.connection.projectOpen || fresh.projectName != self.connection.projectName {
                     self.connection = fresh
                     self.log.append(fresh.message)
                 }
@@ -142,7 +142,7 @@ struct ApplicationLauncher: Sendable {
             refreshConnection()
         }
     }
-    func isAvailable(_ target: WorkflowStage) -> Bool { switch target { case .connection: true; case .analysis: connection.found && connection.accessibilityTrusted; case .audio, .aiPackage, .review: normalized != nil } }
+    func isAvailable(_ target: WorkflowStage) -> Bool { switch target { case .connection: true; case .analysis: connection.found && connection.accessibilityTrusted && connection.projectOpen == true; case .audio, .aiPackage, .review: normalized != nil } }
     func go(to target: WorkflowStage) { if isAvailable(target) { stage = target } }
     @Published var scanProgress = 0
     private var scanWork: Task<RawSnapshot, Error>?
