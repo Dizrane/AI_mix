@@ -8,7 +8,7 @@ enum PackageDelivery: Sendable { case markdownOnly, fullPackage }
 
 /// Provider-neutral export of normalized, evidence-based DAW facts for any external LLM.
 struct AIPackageGenerator: Sendable {
-    static let schemaVersion = "2.8"
+    static let schemaVersion = "2.9"
     func make(snapshot: NormalizedSnapshot, sessionID: String, audio: [AudioAsset] = [], plugins: [PluginInventoryItem] = [], probes: [ProbeType] = ProbeType.allCases, delivery: PackageDelivery = .fullPackage) -> String {
         let readiness = PackageReadiness.evaluate(snapshot: snapshot, assets: audio)
         var out: [String] = []
@@ -19,6 +19,7 @@ struct AIPackageGenerator: Sendable {
         out += ["", "## Project metadata", "", fact("Project name", snapshot.project.name), fact("Tempo", snapshot.project.tempo, unit: " BPM"), fact("Time signature", snapshot.project.timeSignature), fact("Key signature", snapshot.project.keySignature), fact("Sample rate", snapshot.project.sampleRate, unit: " Hz"), fact("Transport", snapshot.project.transportState), fact("Snapshot completeness", snapshot.completeness)]
         out += readinessSection(readiness)
         out += trackLinkingSection(snapshot)
+        out += signalFlowSection(snapshot)
         out += audioAssetsSection(audio, delivery: delivery)
         out += provenanceSection(audio)
         out += missingAudioSection(audio)
@@ -109,6 +110,23 @@ struct AIPackageGenerator: Sendable {
         let unresolved = snapshot.tracks.filter { $0.matchStatus != .confirmed }
         out += ["", "## Unresolved / unlinked objects", ""]
         out += unresolved.isEmpty ? ["- None. Every logical track has a confirmed header↔channel link."] : unresolved.map { "- `\($0.logicalTrackID)` (\($0.name.value ?? "unnamed")) — \($0.matchStatus.rawValue): \(($0.axPaths.header == nil ? "channel-only" : "header-only"))" }
+        return out
+    }
+    /// The project's bus wiring, DERIVED: every edge is the pure join of two facts already proven in Logical tracks
+    /// above — the feeder's known bus output or send destination, and the receiver's known bus input on the same
+    /// caption — and cites both sources. Incomplete buses stay incomplete: the one known end is published, never
+    /// completed by a guess, so the model can ask for the missing end instead of inventing it.
+    private func signalFlowSection(_ snapshot: NormalizedSnapshot) -> [String] {
+        let graph = SignalFlowGraph.build(tracks: snapshot.tracks)
+        let names = Dictionary(snapshot.tracks.map { ($0.logicalTrackID, $0.name.value ?? $0.logicalTrackID) }, uniquingKeysWith: { first, _ in first })
+        func label(_ id: String) -> String { "`\(id)` \u{201C}\(names[id] ?? id)\u{201D}" }
+        var out = ["", "## Signal flow (derived)", "", "Bus edges derived by this application from the routing facts above — no new Logic data and no interpretation. An edge exists only where two `known` facts name the same internal bus (captions compared case-insensitively): the feeder's output slot or occupied send, and the receiver's input slot; each edge cites both facts' sources. A bus fans out legitimately, so one bus feeding several inputs yields one edge per receiver. Nothing is derived from `requires_probe` routing buttons, and an output to the stereo output is a terminal, not an edge."]
+        if let terminal = graph.terminal { out += ["", "- Terminal node: \(label(terminal.trackID)) — the project's stereo output."] }
+        out += ["", "### Bus edges", ""]
+        if graph.edges.isEmpty { out += ["- none: no bus has both a proven feeder and a proven receiver in this snapshot."] }
+        else { out += graph.edges.flatMap { edge in ["- \(label(edge.from)) → (\(edge.kind.rawValue), \(edge.viaBus)) → \(label(edge.to))", "  - Derived from: \(edge.kind.rawValue) fact at \(edge.fromSource ?? "unknown source") + input fact at \(edge.toSource ?? "unknown source")"] } }
+        out += ["", "### Unresolved buses (one known end only — published, never guessed)", ""]
+        out += graph.unresolvedBuses.isEmpty ? ["- none: every proven bus fact has both ends in this snapshot."] : graph.unresolvedBuses.map { "- \($0)" }
         return out
     }
     /// Exact provenance mapping audioID → logicalTrackID → Logic track/regions. The program does not interpret the audio; roles (lead/double/backing/beat/…) are for the LLM and user to decide by listening.

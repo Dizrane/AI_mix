@@ -145,6 +145,57 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
     #expect(md.contains("Slot kind (send / output / aux input): requires_probe"))
 }
 
+// MARK: - Signal flow graph (pure derivation from proven routing facts)
+
+private func flowTracks(_ strips: [RawAccessibilityNode]) -> [TrackFacts] { normalize(headers: [], strips: strips).tracks }
+
+@Test func flow1_busOutputPlusMatchingAuxInputBecomeOneOutputEdge() {
+    // "Audio 3" outputs into Bus 1; "Aux 1" has input Bus 1 (compared case-insensitively) — two proven facts join into
+    // exactly one edge. The hardware input "Input 1" and the stereo output "Stereo Output" contribute nothing.
+    let graph = SignalFlowGraph.build(tracks: flowTracks([realStrip("c1", "Audio 3", output: "Bus 1", afterChannelMode: "Input 1"), realStrip("c2", "Aux 1", output: "Stereo Output", afterChannelMode: "BUS 1")]))
+    #expect(graph.edges.count == 1)
+    let edge = graph.edges[0]
+    #expect(edge.from == "channel_audio_3"); #expect(edge.to == "channel_aux_1"); #expect(edge.viaBus == "Bus 1"); #expect(edge.kind == .output)
+    #expect(edge.fromSource?.isEmpty == false); #expect(edge.toSource?.isEmpty == false) // every edge cites the two facts it joins
+    #expect(graph.unresolvedBuses.isEmpty)
+}
+@Test func flow2_provenSendBecomesASendEdge() {
+    let graph = SignalFlowGraph.build(tracks: flowTracks([realStrip("c1", "Vocal", output: "Stereo Output", sends: [("Bus 3", "0")], emptySendSlots: 1), realStrip("c2", "Aux 1", output: "Stereo Output", afterChannelMode: "Bus 3")]))
+    #expect(graph.edges.count == 1)
+    #expect(graph.edges[0].kind == .send); #expect(graph.edges[0].from == "channel_vocal"); #expect(graph.edges[0].to == "channel_aux_1"); #expect(graph.edges[0].viaBus == "Bus 3")
+}
+@Test func flow3_oneBusIntoTwoReceiversIsTwoEdgesNotAnAmbiguity() {
+    let graph = SignalFlowGraph.build(tracks: flowTracks([realStrip("c1", "Audio 3", output: "Bus 2"), realStrip("c2", "Aux 1", output: "Stereo Output", afterChannelMode: "Bus 2"), realStrip("c3", "Aux 2", output: "Stereo Output", afterChannelMode: "Bus 2")]))
+    #expect(graph.edges.count == 2)
+    #expect(Set(graph.edges.map(\.to)) == ["channel_aux_1", "channel_aux_2"])
+    #expect(graph.edges.allSatisfy { $0.from == "channel_audio_3" && $0.viaBus == "Bus 2" && $0.kind == .output })
+    #expect(graph.unresolvedBuses.isEmpty) // a bus fans out legitimately — this is routing, not ambiguity
+}
+@Test func flow4_aBusWithOneKnownEndIsPublishedUnresolvedNeverGuessed() {
+    // Bus 5 has a feeder but no receiver; Bus 2 is an input with no feeder. Neither becomes an edge and neither is dropped.
+    let graph = SignalFlowGraph.build(tracks: flowTracks([realStrip("c1", "Audio 3", output: "Bus 5"), realStrip("c2", "Aux 1", output: "Stereo Output", afterChannelMode: "Bus 2")]))
+    #expect(graph.edges.isEmpty)
+    #expect(graph.unresolvedBuses == ["Bus 2: input of channel_aux_1, no channel routed into this bus in the snapshot", "Bus 5: fed by channel_audio_3 (output), no channel with this input in the snapshot"])
+}
+@Test func flow5_stereoOutputAndUnprovenButtonsProduceNoEdges() {
+    // stripNode's "Bus 1"/"St Out" buttons stay requires_probe (slot unproven) and must feed nothing, even though an aux
+    // input on the same bus exists; a proven "St Out" output is a terminal, not an edge. The stereo output channel itself
+    // is named as the terminal node.
+    let graph = SignalFlowGraph.build(tracks: flowTracks([stripNode("c1", "Audio 5"), realStrip("c2", "Aux 1", output: "St Out", afterChannelMode: "Bus 1"), realStrip("c3", "Stereo Out", output: nil)]))
+    #expect(graph.edges.isEmpty)
+    #expect(graph.unresolvedBuses == ["Bus 1: input of channel_aux_1, no channel routed into this bus in the snapshot"])
+    #expect(graph.terminal == SignalFlowGraph.Terminal(trackID: "channel_stereo_out", name: "Stereo Out"))
+}
+@Test func flow6_packageRendersTheDerivedSignalFlowSection() {
+    let s = normalize(headers: [], strips: [realStrip("c1", "Audio 3", output: "Bus 1", afterChannelMode: "Input 1"), realStrip("c2", "Aux 1", output: "Bus 9", afterChannelMode: "Bus 1"), realStrip("c3", "Stereo Out", output: nil)])
+    let md = AIPackageGenerator().make(snapshot: s, sessionID: "t")
+    #expect(md.contains("## Signal flow (derived)"))
+    #expect(md.contains("- `channel_audio_3` “Audio 3” → (output, Bus 1) → `channel_aux_1` “Aux 1”"))
+    #expect(md.contains("  - Derived from: output fact at ")) // each edge cites the sources of both joined facts
+    #expect(md.contains("- Terminal node: `channel_stereo_out` “Stereo Out” — the project's stereo output."))
+    #expect(md.contains("- Bus 9: fed by channel_aux_1 (output), no channel with this input in the snapshot"))
+}
+
 // MARK: - Track ↔ Channel linking (regression scenarios A–E)
 
 @Test func linkA_headerPlusChannelBecomeOneConfirmedTrack() {
@@ -383,7 +434,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.8`"))
+    #expect(md.contains("Package schema: `2.9`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -601,7 +652,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.8`"))
+    #expect(md.contains("Package schema: `2.9`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))

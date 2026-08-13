@@ -292,12 +292,13 @@ struct AnalysisScreen: View {
         let channels = s.tracks.compactMap(\.channel)
         let outputs = channels.map(\.output), inputs = channels.map(\.input)
         let sends = channels.reduce(0) { $0 + $1.sends.count }, unclassified = channels.reduce(0) { $0 + $1.routingButtons.count }
+        let graph = SignalFlowGraph.build(tracks: s.tracks)
         VStack(alignment: .leading, spacing: 8) {
             CheckRow(title: "Logic connection", detail: model.connection.localizedName ?? "Logic Pro")
             CheckRow(title: "Project discovery", detail: projectSummary(s))
             CheckRow(title: "Track discovery", detail: "\(s.linking.logicalTracks) logical tracks")
             CheckRow(title: "Channel discovery", detail: "\(s.linking.channelCandidates) mixer channels")
-            CheckRow(title: "Routing", detail: "\(routingSummary(outputs, noun: "output")), \(routingSummary(inputs, noun: "input")), \(plural(sends, "send"))" + (unclassified == 0 ? "" : " · \(plural(unclassified, "button")) unclassified"))
+            CheckRow(title: "Routing", detail: "\(routingSummary(outputs, noun: "output")), \(routingSummary(inputs, noun: "input")), \(plural(sends, "send"))" + (unclassified == 0 ? "" : " · \(plural(unclassified, "button")) unclassified") + " · \(plural(graph.edges.count, "bus link")) resolved" + (graph.unresolvedBuses.isEmpty ? "" : " · \(graph.unresolvedBuses.count) \(graph.unresolvedBuses.count == 1 ? "bus" : "buses") unresolved"))
             CheckRow(title: "Snapshot generation", detail: "saved to Data/current")
         }
     }
