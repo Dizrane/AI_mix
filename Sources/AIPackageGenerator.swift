@@ -33,7 +33,7 @@ struct AIPackageGenerator: Sendable {
     private func readinessSection(_ r: PackageReadiness) -> [String] {
         func flag(_ ok: Bool) -> String { ok ? "READY" : "INCOMPLETE" }
         var out = ["", "## Package readiness", "", "- Logic analysis: \(flag(r.logicAnalysis))", "- Track discovery: \(flag(r.trackDiscovery))", "- Audio assets: \(r.audioTotal == 0 ? "INCOMPLETE (none prepared)" : "\(r.audioExported)/\(r.audioTotal) exported")", "- Provenance: \(flag(r.provenanceOK))", "- AI Package: \(r.overall.rawValue.uppercased())", "", "Audio readiness counts ONLY Logic audio tracks that are audio export assets. When the package is ready, every Logic audio track represented in Audio Assets has a real, readable WAV; Aux / Bus / Master / Output channel-only objects are not audio assets and never block readiness."]
-        if r.audioTotal > 0 && r.audioExported < r.audioTotal { let missing = r.audioTotal - r.audioExported; out += ["", "Audio analysis incomplete — \(missing) WAV \(missing == 1 ? "file" : "files") missing. Export the missing tracks and Refresh Export Status for a complete analysis."] }
+        if r.audioTotal > 0 && r.audioExported < r.audioTotal { out += ["", "Audio analysis incomplete — \(plural(r.audioTotal - r.audioExported, "WAV file")) missing. Export the missing tracks and Refresh Export Status for a complete analysis."] }
         if !r.errors.isEmpty { out += ["", "Integrity errors (do not rely on this package until fixed):"] + r.errors.map { "- \($0)" } }
         return out
     }

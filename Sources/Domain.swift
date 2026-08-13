@@ -1,5 +1,8 @@
 import Foundation
 
+/// "1 header" / "2 headers": counts are reported with a real plural everywhere they reach the user, in facts and in the UI alike.
+func plural(_ count: Int, _ noun: String) -> String { "\(count) \(noun)\(count == 1 ? "" : "s")" }
+
 enum FactState: String, Codable, Sendable { case known, unknown, unavailable, requiresProbe = "requires_probe" }
 
 struct Fact<Value: Codable & Sendable>: Codable, Sendable {
@@ -28,7 +31,10 @@ struct RawDiscoveryTarget: Codable, Identifiable, Sendable { var id: String; var
 struct RawSnapshot: Codable, Sendable {
     var schemaVersion = "1.1"; var capturedAt = Date(); var application: ApplicationInfo; var root: RawAccessibilityNode; var targets: [RawDiscoveryTarget] = []; var diagnostics: AXDiscoveryDiagnostics = .empty
 }
-struct ApplicationInfo: Codable, Sendable { var name: String; var bundleIdentifier: String; var pid: Int32 }
+/// The scanned application plus the documented identity of the window that holds the project: `projectWindowDocument` is the project file
+/// URL exposed by `AXDocument`, `projectWindowTitle` the window's own caption, and `projectWindowSource` names the attribute the window
+/// itself came from, so a published project fact can cite the exact read path. All nil when Logic exposes no such window.
+struct ApplicationInfo: Codable, Sendable { var name: String; var bundleIdentifier: String; var pid: Int32; var projectWindowTitle: String? = nil; var projectWindowDocument: String? = nil; var projectWindowSource: String? = nil }
 
 struct NormalizedSnapshot: Codable, Sendable {
     var schemaVersion = "1.2"; var capturedAt = Date(); var application: ApplicationInfo

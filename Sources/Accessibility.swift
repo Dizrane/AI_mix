@@ -29,7 +29,20 @@ struct LogicAccessibilityAnalyzer: DAWAnalyzer {
         let targeted = targetedNodes(in: windowTargets)
         let all = flatten(root)
         let diagnostics = makeDiagnostics(all: all, windows: windowNodes.count, probes: defaultProbes(all: all))
-        return .init(application: .init(name: status.localizedName ?? "Logic Pro", bundleIdentifier: status.bundleIdentifier ?? "unavailable", pid: pid), root: root, targets: windowTargets + targeted, diagnostics: diagnostics)
+        let identity = projectIdentity(of: appElement)
+        return .init(application: .init(name: status.localizedName ?? "Logic Pro", bundleIdentifier: status.bundleIdentifier ?? "unavailable", pid: pid, projectWindowTitle: identity.title, projectWindowDocument: identity.document, projectWindowSource: identity.source), root: root, targets: windowTargets + targeted, diagnostics: diagnostics)
+    }
+    /// The two documented attributes that identify the open project: a window's `AXDocument` (the `.logicx` file URL) and its `AXTitle`.
+    /// The window itself is `AXMainWindow`, or `AXFocusedWindow` when Logic exposes no main window, so none has to be guessed — and the
+    /// attribute that supplied it is returned alongside, because a fact must cite the path it was actually read from. All nil when the
+    /// application exposes no such window, as it does with no open project.
+    private func projectIdentity(of application: AXUIElement) -> (title: String?, document: String?, source: String?) {
+        for key in [kAXMainWindowAttribute, kAXFocusedWindowAttribute] {
+            guard let window = attribute(application, key), CFGetTypeID(window) == AXUIElementGetTypeID() else { continue }
+            let element = window as! AXUIElement
+            return (string(element, kAXTitleAttribute), string(element, kAXDocumentAttribute), key)
+        }
+        return (nil, nil, nil)
     }
     func runProbe(_ request: ProbeRequest) throws -> ProbeResult {
         let snapshot = try fullScan()
