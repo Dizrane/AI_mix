@@ -30,7 +30,7 @@ struct SnapshotNormalizer: Sendable {
         let candidates = dedupe(trackCandidates + mixerCandidates)
         let diagnostics = updatedDiagnostics(raw.diagnostics, candidates: candidates, tracks: headers.count, channels: channels.count)
         let status: Fact<String> = tracks.isEmpty ? .init(state: .requiresProbe, value: nil, source: "structural discovery") : .known("\(linking.logicalTracks) logical tracks: \(linking.confirmedLinks) confirmed, \(linking.unresolvedHeaders) header-only, \(linking.unresolvedChannels) channel-only, \(linking.ambiguous) ambiguous", source: "structural linking")
-        let limitations = ["Header↔channel links are confirmed only by a unique 1:1 name correspondence; shared names stay unmerged (ambiguous). No shared Logic identifier is exposed by AX, so links are never guessed.", "Only values exposed by matching AX controls are emitted; unavailable fields are never inferred.", "Logic exposes send, output and aux-input slots as identically shaped buttons that only name a destination, so per-strip routing buttons carry a destination but no slot kind: none of them is a confirmed send, and a strip's output stays unavailable until a targeted probe classifies its buttons."]
+        let limitations = ["Header↔channel links are confirmed only by a unique 1:1 name correspondence; shared names stay unmerged (ambiguous). No shared Logic identifier is exposed by AX, so links are never guessed.", "Only values exposed by matching AX controls are emitted; unavailable fields are never inferred.", "Routing slots are classified only by documented structure: an occupied send is the destination-captioned AXGroup with a bypass checkbox, the output slot directly follows the group pop-up, and the input slot directly follows the channel-mode button. A destination button matching none of these rules keeps slotKind = requires_probe and is never read as a send. Send level and pan are not readable (the send knob is unitless, no pan control is exposed) and stay requires_probe."]
         return .init(application: raw.application, completeness: .known("read-only AX structural discovery with track↔channel linking", source: "normalizer"), project: project, tracksStatus: status, tracks: tracks, linking: linking, candidates: candidates, audio: .unavailable, arrangement: .unavailable, probes: raw.diagnostics.probes, diagnostics: diagnostics, limitations: limitations, rawSnapshotReference: rawReference)
     }
 
@@ -113,25 +113,54 @@ struct SnapshotNormalizer: Sendable {
         let mute = control(["mute"]).flatMap { boolValue($0.value) }.map { Fact.known($0, source: node.id) } ?? .unavailable
         let solo = control(["solo"]).flatMap { boolValue($0.value) }.map { Fact.known($0, source: node.id) } ?? .unavailable
         let automation = node.children.first(where: { ($0.description ?? "").localizedCaseInsensitiveContains("automation") }).map { Fact.known($0.description!, source: node.id) } ?? .unavailable
-        let input = node.children.first(where: { let text = $0.description ?? ""; return text.localizedCaseInsensitiveContains("input ") && !text.localizedCaseInsensitiveContains("monitoring") }).map { Fact.known($0.description!, source: node.id) } ?? .unavailable
+        let routing = classifyRouting(in: node)
+        let input = routing.input ?? node.children.first(where: { let text = $0.description ?? ""; return text.localizedCaseInsensitiveContains("input ") && !text.localizedCaseInsensitiveContains("monitoring") }).map { Fact.known($0.description!, source: node.id) } ?? .unavailable
         let record = control(["record"]).flatMap { boolValue($0.value) }.map { Fact.known($0, source: node.id) } ?? .unavailable
         let monitoring = control(["monitoring"]).flatMap { boolValue($0.value) }.map { Fact.known($0, source: node.id) } ?? .unavailable
         let channelMode = exactControl("channel mode").flatMap { $0.value }.map { Fact.known($0, source: node.id) } ?? .unavailable
         let eqEnabled = exactControl("EQ").flatMap { boolValue($0.value) }.map { Fact.known($0, source: node.id) } ?? .unavailable
         let group = control(["group"]).flatMap { $0.value }.map { Fact.known($0, source: node.id) } ?? .unavailable
         let inputGain = exactControl("input gain").flatMap { decimalValue($0.value) }.map { Fact.known($0, source: node.id) } ?? .unavailable
-        return ChannelFacts(volumeDB: volume, pan: pan, mute: mute, solo: solo, automation: automation, input: input, output: .unavailable, record: record, monitoring: monitoring, channelMode: channelMode, eqEnabled: eqEnabled, group: group, inputGain: inputGain, routingButtons: routingButtonSlots(in: node), plugins: pluginSlots(in: node))
+        return ChannelFacts(volumeDB: volume, pan: pan, mute: mute, solo: solo, automation: automation, input: input, output: routing.output, record: record, monitoring: monitoring, channelMode: channelMode, eqEnabled: eqEnabled, group: group, inputGain: inputGain, sends: routing.sends, routingButtons: routing.unclassified, plugins: pluginSlots(in: node))
     }
-    /// Routing buttons are AXButtons labelled with a destination ("Bus 1", "St Out", "Output 1-2"). Logic exposes its send
-    /// slots, the output slot and an aux's input slot as the same anonymous button, so the slot kind is not readable and
-    /// publishing these as sends invented routing that did not exist: a track whose OUTPUT is "Bus 1" was reported as
-    /// sending to Bus 1, and an aux's INPUT bus became its "send". Only the named destination is a fact; the slot kind
-    /// stays requires_probe until a targeted probe classifies the button.
-    private func routingButtonSlots(in node: RawAccessibilityNode) -> [RoutingButtonFacts] {
-        node.children.enumerated().compactMap { index, child in
-            guard child.role == "AXButton", let desc = child.description, desc.range(of: "^(Bus |St(ereo)? Out$|Output\\b)", options: [.regularExpression, .caseInsensitive]) != nil else { return nil }
-            return RoutingButtonFacts(id: "\(node.id).routing.\(index)", destination: .known(desc, source: child.id), slotKind: .init(state: .requiresProbe, value: nil, source: child.id))
+
+    // MARK: Routing classification
+
+    private struct RoutingClassification: Sendable { var output: Fact<String> = .unavailable; var input: Fact<String>? = nil; var sends: [SendFacts] = []; var unclassified: [RoutingButtonFacts] = [] }
+    /// Logic exposes an EMPTY send slot, the output slot and an aux's input slot as identically shaped destination-named
+    /// AXButtons, so a button's own attributes never say which slot it is — the old code that read every "Bus …" button as a
+    /// send invented routing that did not exist. What DOES distinguish them, verified against a full mixer dump with a known
+    /// ground truth, is structure:
+    /// - An OCCUPIED send is not a button at all: it is an AXGroup captioned with the destination that holds a "bypass"
+    ///   checkbox (no other strip control has that shape; the automation group's checkbox is captioned "automation").
+    /// - The output slot is the destination button that directly follows the "group" AXPopUpButton in the strip's children.
+    /// - The input slot (an aux's source bus, or an audio track's "Input N") directly follows the "channel mode" button.
+    /// Every rule requires both the documented neighbour and a destination-shaped caption, so an unrelated button next to an
+    /// anchor (Stereo Out's "mastering assistant" follows "channel mode") is never promoted. A destination button matching no
+    /// rule is published unclassified with slotKind = requires_probe, exactly as before.
+    private func classifyRouting(in node: RawAccessibilityNode) -> RoutingClassification {
+        func isDestination(_ text: String) -> Bool { text.range(of: "^(Bus \\d+|St(ereo)? Out(put)?|Output( \\d+(-\\d+)?)?|Input \\d+(-\\d+)?|No (Output|Input))$", options: [.regularExpression, .caseInsensitive]) != nil }
+        func caption(_ child: RawAccessibilityNode?, is name: String, role: String) -> Bool { guard let child, child.role == role else { return false }; return (child.description ?? "").localizedCaseInsensitiveCompare(name) == .orderedSame }
+        var result = RoutingClassification()
+        for (index, child) in node.children.enumerated() {
+            if child.role == "AXGroup", let destination = child.description, !destination.isEmpty,
+               let bypass = child.children.first(where: { $0.role == "AXCheckBox" && ($0.description ?? "").localizedCaseInsensitiveCompare("bypass") == .orderedSame }) {
+                let knob = node.children.indices.contains(index + 1) ? node.children[index + 1] : nil
+                let knobID = caption(knob, is: "send knob", role: "AXSlider") ? knob?.id : nil
+                result.sends.append(SendFacts(id: "\(node.id).send.\(result.sends.count)", destination: .known(destination, source: "\(child.id): AXGroup captioned with the destination and holding a bypass checkbox — the shape only an occupied send slot has"), bypass: boolValue(bypass.value).map { Fact.known($0, source: bypass.id) } ?? .init(state: .unknown, value: nil, source: bypass.id), level: .init(state: .requiresProbe, value: nil, source: knobID), pan: .init(state: .requiresProbe, value: nil, source: nil)))
+                continue
+            }
+            guard child.role == "AXButton", let destination = child.description, isDestination(destination) else { continue }
+            let previous = index > 0 ? node.children[index - 1] : nil
+            if caption(previous, is: "group", role: "AXPopUpButton"), result.output.state != .known {
+                result.output = .known(destination, source: "\(child.id): the destination button directly after the group pop-up is the strip's output slot")
+            } else if caption(previous, is: "channel mode", role: "AXButton"), result.input == nil {
+                result.input = .known(destination, source: "\(child.id): the destination button directly after the channel-mode button is the strip's input slot")
+            } else {
+                result.unclassified.append(RoutingButtonFacts(id: "\(node.id).routing.\(index)", destination: .known(destination, source: child.id), slotKind: .init(state: .requiresProbe, value: nil, source: child.id)))
+            }
         }
+        return result
     }
     /// Insert slots are AXButtons described "audio plug-in". Only loaded slots (a non-empty name) are emitted; bypass and parameters require a targeted probe.
     private func pluginSlots(in node: RawAccessibilityNode) -> [PluginFacts] {

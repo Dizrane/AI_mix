@@ -24,6 +24,21 @@ private func stripNode(_ id: String, _ name: String, routing: Bool = true, plugi
     kids.append(ax("AXButton", desc: "audio plug-in"))
     return ax("AXLayoutItem", id: id, desc: name, kids)
 }
+/// Mirrors the real AX shape of a mixer strip captured from a Logic Pro raw dump (fanlove.logicx, 2026-08-14): children in the
+/// documented order — name, mute, solo, volume fader (+ level text), peak meter, pan, automation group, group pop-up, output
+/// button, send slots (empty "send button" AXButtons; an occupied send is an AXGroup with a bypass checkbox plus a "send knob"
+/// slider), audio plug-in, channel mode, input button, EQ, gain-reduction meter, setting.
+private func realStrip(_ id: String, _ name: String, output: String?, sends: [(destination: String, bypass: String)] = [], emptySendSlots: Int = 2, afterChannelMode: String? = nil) -> RawAccessibilityNode {
+    var kids: [RawAccessibilityNode] = [ax("AXTextField", desc: "name", value: name), ax("AXButton", desc: "mute", value: "off"), ax("AXButton", desc: "solo", value: "off"), ax("AXSlider", desc: "volume fader", value: "173"), ax("AXTextField", desc: "volume fader level", title: "volume fader level, 0,0 dB"), ax("AXButton", desc: "peak level meter", title: "peak level meter", value: "signal clipping off"), ax("AXSlider", desc: "pan", value: "0"), ax("AXGroup", desc: "Read, automation enabled", [ax("AXCheckBox", desc: "automation", value: "1"), ax("AXButton", desc: "list")]), ax("AXPopUpButton", desc: "group", title: "group")]
+    if let output { kids.append(ax("AXButton", desc: output)) }
+    kids += Array(repeating: ax("AXButton", desc: "send button"), count: emptySendSlots)
+    for send in sends { kids.append(ax("AXGroup", desc: send.destination, [ax("AXCheckBox", desc: "bypass", value: send.bypass), ax("AXButton", desc: "list")])); kids.append(ax("AXSlider", desc: "send knob", value: "0")) }
+    kids.append(ax("AXButton", desc: "audio plug-in"))
+    kids.append(ax("AXButton", desc: "channel mode", value: "Stereo"))
+    if let afterChannelMode { kids.append(ax("AXButton", desc: afterChannelMode)) }
+    kids += [ax("AXButton", desc: "EQ", value: "off"), ax("AXButton", desc: "gain reduction meter", value: "off"), ax("AXButton", desc: "setting")]
+    return ax("AXLayoutItem", id: id, desc: name, kids)
+}
 private func snapshot(headers: [RawAccessibilityNode], strips: [RawAccessibilityNode]) -> RawSnapshot {
     let root = ax("AXApplication", id: "application", [ax("AXGroup", id: "th", desc: "Tracks header", headers), ax("AXLayoutArea", id: "mx", desc: "Mixer", strips)])
     return RawSnapshot(application: .init(name: "Logic Pro", bundleIdentifier: "com.apple.logic10", pid: 1), root: root)
@@ -57,6 +72,52 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
 @Test func normalizerEmitsLoadedPluginAndIgnoresEmptySlots() {
     let c = normalize(headers: [headerNode("h", "Track 6 “Audio 5”")], strips: [stripNode("c", "Audio 5", plugin: "Pro-Q 4")]).tracks.first?.channel
     #expect(c?.plugins.count == 1); #expect(c?.plugins.first?.name.value == "Pro-Q 4"); #expect(c?.plugins.first?.slot == 0); #expect(c?.plugins.first?.bypass.state == .requiresProbe)
+}
+
+// MARK: - Routing classification (structures verified against a real mixer dump)
+
+@Test func classifierProvesOutputSendAndAuxInputFromRealStripStructure() {
+    // Aux 1 from the reference dump: output "Stereo Output" after the group pop-up, one occupied send to Bus 3
+    // (AXGroup with bypass checkbox + send knob), input bus "Bus 1" directly after the channel-mode button.
+    let c = normalize(headers: [], strips: [realStrip("c1", "Aux 1", output: "Stereo Output", sends: [("Bus 3", "0")], emptySendSlots: 1, afterChannelMode: "Bus 1")]).tracks.first?.channel
+    #expect(c?.output.state == .known); #expect(c?.output.value == "Stereo Output")
+    #expect(c?.input.state == .known); #expect(c?.input.value == "Bus 1")
+    #expect(c?.sends.count == 1)
+    #expect(c?.sends.first?.destination.value == "Bus 3")
+    #expect(c?.sends.first?.bypass.value == false)
+    #expect(c?.sends.first?.level.state == .requiresProbe) // the send knob's raw value has no readable unit
+    #expect(c?.sends.first?.pan.state == .requiresProbe) // no send pan control is exposed at all
+    #expect(c?.routingButtons.isEmpty == true) // every destination on this strip is classified
+}
+@Test func outputButtonAndAuxInputAreNeverSends() {
+    // Audio 3 and Aux 2 from the reference dump carry destination buttons ("Bus 1" output, "Bus 2" aux input) but no
+    // occupied send slot: the package once described eight sends in this send-free project. Empty "send button" slots and
+    // the automation AXGroup (its checkbox is "automation", not "bypass") must contribute nothing either.
+    let s = normalize(headers: [], strips: [realStrip("c1", "Audio 3", output: "Bus 1", afterChannelMode: "Input 1"), realStrip("c2", "Aux 2", output: "Stereo Output", afterChannelMode: "Bus 2")])
+    let audio = s.tracks.first { $0.name.value == "Audio 3" }?.channel, aux = s.tracks.first { $0.name.value == "Aux 2" }?.channel
+    #expect(audio?.sends.isEmpty == true); #expect(aux?.sends.isEmpty == true)
+    #expect(audio?.output.value == "Bus 1"); #expect(audio?.input.value == "Input 1")
+    #expect(aux?.output.value == "Stereo Output"); #expect(aux?.input.value == "Bus 2")
+    #expect(audio?.routingButtons.isEmpty == true); #expect(aux?.routingButtons.isEmpty == true)
+}
+@Test func nonDestinationNeighboursAreNeverRoutingFacts() {
+    // Stereo Out from the reference dump: the group pop-up is followed by "audio plug-in" (no output button at all) and the
+    // channel-mode button by "mastering assistant" — structural position alone must not turn either into a routing fact.
+    let strip = ax("AXLayoutItem", id: "c1", desc: "Stereo Out", [ax("AXTextField", desc: "name", value: "Stereo Out"), ax("AXButton", desc: "mute", value: "off"), ax("AXSlider", desc: "volume fader", value: "173"), ax("AXTextField", desc: "volume fader level", title: "volume fader level, 0,0 dB"), ax("AXGroup", desc: "Read, automation enabled", [ax("AXCheckBox", desc: "automation", value: "1"), ax("AXButton", desc: "list")]), ax("AXPopUpButton", desc: "group", title: "group"), ax("AXButton", desc: "audio plug-in"), ax("AXButton", desc: "channel mode", value: "Stereo"), ax("AXButton", desc: "mastering assistant"), ax("AXButton", desc: "EQ", value: "off")])
+    let c = normalize(headers: [], strips: [strip]).tracks.first?.channel
+    #expect(c?.output.state == .unavailable); #expect(c?.input.state == .unavailable)
+    #expect(c?.sends.isEmpty == true); #expect(c?.routingButtons.isEmpty == true)
+}
+@Test func packageRendersProvenSendsAndClassifiedRouting() {
+    let s = normalize(headers: [], strips: [realStrip("c1", "Aux 1", output: "Stereo Output", sends: [("Bus 3", "0")], emptySendSlots: 1, afterChannelMode: "Bus 1")])
+    let md = AIPackageGenerator().make(snapshot: s, sessionID: "t")
+    #expect(md.contains("- Output: known: Stereo Output"))
+    #expect(md.contains("- Input: known: Bus 1"))
+    #expect(md.contains("- Destination: known: Bus 3"))
+    #expect(md.contains("- Bypass: known: false"))
+    #expect(md.contains("- Level: requires_probe"))
+    #expect(md.contains("- none: no destination button on this strip is left unclassified"))
+    #expect(!md.contains("no confirmed send facts"))
 }
 
 // MARK: - Track ↔ Channel linking (regression scenarios A–E)
@@ -271,7 +332,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.6`"))
+    #expect(md.contains("Package schema: `2.7`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -489,7 +550,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.6`"))
+    #expect(md.contains("Package schema: `2.7`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))

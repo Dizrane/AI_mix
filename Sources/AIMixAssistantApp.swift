@@ -282,13 +282,15 @@ struct AnalysisScreen: View {
         }
     }
     @ViewBuilder private func checklist(_ s: NormalizedSnapshot) -> some View {
-        let routing = s.tracks.reduce(0) { $0 + ($1.channel?.routingButtons.count ?? 0) }
+        let channels = s.tracks.compactMap(\.channel)
+        let outputs = channels.filter { $0.output.state == .known }.count, inputs = channels.filter { $0.input.state == .known }.count
+        let sends = channels.reduce(0) { $0 + $1.sends.count }, unclassified = channels.reduce(0) { $0 + $1.routingButtons.count }
         VStack(alignment: .leading, spacing: 8) {
             CheckRow(title: "Logic connection", detail: model.connection.localizedName ?? "Logic Pro")
             CheckRow(title: "Project discovery", detail: projectSummary(s))
             CheckRow(title: "Track discovery", detail: "\(s.linking.logicalTracks) logical tracks")
             CheckRow(title: "Channel discovery", detail: "\(s.linking.channelCandidates) mixer channels")
-            CheckRow(title: "Routing buttons", detail: routing == 0 ? "none" : "\(routing) unclassified (send / output / aux input)")
+            CheckRow(title: "Routing", detail: "\(plural(outputs, "output")), \(plural(inputs, "input")), \(plural(sends, "send"))" + (unclassified == 0 ? "" : " · \(plural(unclassified, "button")) unclassified"))
             CheckRow(title: "Snapshot generation", detail: "saved to Data/current")
         }
     }
