@@ -205,6 +205,23 @@ private func projectSnapshot(_ nodes: [RawAccessibilityNode], windowTitle: Strin
     #expect(focused.project.name.source == "AXDocument of AXFocusedWindow")
 }
 
+// MARK: - Project presence (the Connection-stage check shares one rule with the normalizer's project name)
+
+@Test func projectPresenceIsProvenByTheWindowDocument() {
+    let p = ProjectPresence.evaluate(title: "fanlove — Tracks", document: "file:///Users/dizrane/Music/Logic/fanlove.logicx", windowSource: "AXMainWindow")
+    #expect(p.open); #expect(p.name == "fanlove"); #expect(p.source == "AXDocument of AXMainWindow")
+}
+@Test func projectPresenceFallsBackToTheWindowTitle() {
+    // An unsaved project has a window title but no document yet; the title is evidence and is published verbatim.
+    let p = ProjectPresence.evaluate(title: "Untitled", document: nil, windowSource: "AXFocusedWindow")
+    #expect(p.open); #expect(p.name == "Untitled"); #expect(p.source == "AXTitle of AXFocusedWindow")
+}
+@Test func projectPresenceWithoutWindowEvidenceIsClosed() {
+    // Logic running with no open project exposes no captioned main/focused window: no project is claimed, no name invented.
+    #expect(ProjectPresence.evaluate(title: nil, document: nil, windowSource: nil) == ProjectPresence(open: false, name: nil, source: nil))
+    #expect(ProjectPresence.evaluate(title: "   ", document: nil, windowSource: "AXMainWindow").open == false)
+}
+
 // MARK: - Inspector mirror strips (phantom channel duplicates)
 
 @Test func linkF_inspectorMirrorsAreDroppedRealStripsKept() {
