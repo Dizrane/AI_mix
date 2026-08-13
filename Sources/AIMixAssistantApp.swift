@@ -263,13 +263,13 @@ struct AnalysisScreen: View {
         }
     }
     @ViewBuilder private func checklist(_ s: NormalizedSnapshot) -> some View {
-        let sends = s.tracks.reduce(0) { $0 + ($1.channel?.sends.count ?? 0) }
+        let routing = s.tracks.reduce(0) { $0 + ($1.channel?.routingButtons.count ?? 0) }
         VStack(alignment: .leading, spacing: 8) {
             CheckRow(title: "Logic connection", detail: model.connection.localizedName ?? "Logic Pro")
             CheckRow(title: "Project discovery", detail: projectSummary(s))
             CheckRow(title: "Track discovery", detail: "\(s.linking.logicalTracks) logical tracks")
             CheckRow(title: "Channel discovery", detail: "\(s.linking.channelCandidates) mixer channels")
-            CheckRow(title: "Routing & sends", detail: sends == 0 ? "none" : "\(sends) sends")
+            CheckRow(title: "Routing buttons", detail: routing == 0 ? "none" : "\(routing) unclassified (send / output / aux input)")
             CheckRow(title: "Snapshot generation", detail: "saved to Data/current")
         }
     }

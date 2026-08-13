@@ -17,9 +17,9 @@ private func ax(_ role: String, id: String = "x", desc: String? = nil, title: St
 private func headerNode(_ id: String, _ desc: String) -> RawAccessibilityNode {
     ax("AXLayoutItem", id: id, desc: desc, [ax("AXCheckBox", desc: "Mute", value: "0"), ax("AXCheckBox", desc: "Solo", value: "0"), ax("AXCheckBox", desc: "Record Enable", value: "0"), ax("AXCheckBox", desc: "Input Monitoring", value: "0"), ax("AXSlider", desc: "Volume", value: "173"), ax("AXTextField", desc: "name", value: "x"), ax("AXRadioButton", desc: "Has Focus", value: "0")])
 }
-private func stripNode(_ id: String, _ name: String, send: Bool = true, plugin: String? = nil) -> RawAccessibilityNode {
+private func stripNode(_ id: String, _ name: String, routing: Bool = true, plugin: String? = nil) -> RawAccessibilityNode {
     var kids: [RawAccessibilityNode] = [ax("AXTextField", desc: "name", value: name), ax("AXButton", desc: "mute", value: "off"), ax("AXButton", desc: "solo", value: "off"), ax("AXButton", desc: "record", value: "off"), ax("AXButton", desc: "monitoring", value: "off"), ax("AXSlider", desc: "volume fader", value: "160"), ax("AXTextField", desc: "volume fader level", title: "volume fader level, -1,5 dB"), ax("AXSlider", desc: "pan", value: "-20"), ax("AXButton", desc: "channel mode", value: "Mono"), ax("AXButton", desc: "Input 1"), ax("AXButton", desc: "EQ", value: "off"), ax("AXSlider", desc: "input gain", value: "7")]
-    if send { kids.append(ax("AXButton", desc: "Bus 1")); kids.append(ax("AXButton", desc: "send button")) }
+    if routing { kids.append(ax("AXButton", desc: "Bus 1")); kids.append(ax("AXButton", desc: "St Out")); kids.append(ax("AXButton", desc: "send button")) }
     kids.append(ax("AXButton", desc: "audio plug-in", title: plugin))
     kids.append(ax("AXButton", desc: "audio plug-in"))
     return ax("AXLayoutItem", id: id, desc: name, kids)
@@ -47,9 +47,12 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
     #expect(c?.volumeDB.value == -1.5); #expect(c?.pan.value == -20); #expect(c?.channelMode.value == "Mono")
     #expect(c?.eqEnabled.value == false); #expect(c?.inputGain.value == 7); #expect(c?.record.value == false); #expect(c?.monitoring.value == false)
 }
-@Test func normalizerExtractsSend() {
+@Test func normalizerNeverClassifiesRoutingButtonsAsSends() {
     let c = normalize(headers: [headerNode("h", "Track 6 “Audio 5”")], strips: [stripNode("c", "Audio 5")]).tracks.first?.channel
-    #expect(c?.sends.count == 1); #expect(c?.sends.first?.destination.value == "Bus 1"); #expect(c?.sends.first?.levelDB.state == .requiresProbe)
+    #expect(c?.routingButtons.count == 2) // "Bus 1" and "St Out"; the empty "send button" slot is ignored
+    #expect(c?.routingButtons.map(\.destination.value) == ["Bus 1", "St Out"])
+    #expect(c?.routingButtons.allSatisfy { $0.slotKind.state == .requiresProbe } == true)
+    #expect(c?.output.state == .unavailable) // a "Bus 1"/"St Out" button is never promoted to a confirmed output either
 }
 @Test func normalizerEmitsLoadedPluginAndIgnoresEmptySlots() {
     let c = normalize(headers: [headerNode("h", "Track 6 “Audio 5”")], strips: [stripNode("c", "Audio 5", plugin: "Pro-Q 4")]).tracks.first?.channel
@@ -64,7 +67,7 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
     let t = s.tracks.first
     #expect(t?.matchStatus == .confirmed); #expect(t?.header != nil); #expect(t?.channel != nil)
     #expect(t?.header?.ordinal.value == 1); #expect(t?.logicalTrackID == "track_1")
-    #expect(t?.channel?.sends.count == 1) // channel facts not lost after merge
+    #expect(t?.channel?.routingButtons.count == 2) // channel facts not lost after merge
     #expect(s.linking.confirmedLinks == 1); #expect(s.linking.logicalTracks == 1)
 }
 @Test func linkB_headerWithoutChannelKeepsChannelUnavailable() {
@@ -74,7 +77,7 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
     #expect(s.linking.unresolvedHeaders == 1)
 }
 @Test func linkC_channelWithoutHeaderStaysUnresolvedChannel() {
-    let s = normalize(headers: [], strips: [stripNode("c1", "Aux 1", send: false)])
+    let s = normalize(headers: [], strips: [stripNode("c1", "Aux 1", routing: false)])
     #expect(s.tracks.count == 1)
     #expect(s.tracks.first?.matchStatus == .unresolved); #expect(s.tracks.first?.header == nil); #expect(s.tracks.first?.channel != nil)
     #expect(s.tracks.first?.logicalTrackID == "channel_aux_1"); #expect(s.linking.unresolvedChannels == 1)
@@ -268,7 +271,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.5`"))
+    #expect(md.contains("Package schema: `2.6`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -486,7 +489,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.5`"))
+    #expect(md.contains("Package schema: `2.6`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))

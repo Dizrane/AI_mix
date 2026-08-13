@@ -60,14 +60,18 @@ struct HeaderFacts: Codable, Sendable {
     var ordinal: Fact<Int>; var mute: Fact<Bool>; var solo: Fact<Bool>; var record: Fact<Bool>; var monitoring: Fact<Bool>; var volumeRaw: Fact<Double>; var selected: Fact<Bool>
     static let unavailable = HeaderFacts(ordinal: .unavailable, mute: .unavailable, solo: .unavailable, record: .unavailable, monitoring: .unavailable, volumeRaw: .unavailable, selected: .unavailable)
 }
-struct ChannelFacts: Codable, Sendable { var volumeDB: Fact<Double>; var pan: Fact<Double>; var mute: Fact<Bool>; var solo: Fact<Bool>; var automation: Fact<String>; var input: Fact<String>; var output: Fact<String>; var record: Fact<Bool> = .unavailable; var monitoring: Fact<Bool> = .unavailable; var channelMode: Fact<String> = .unavailable; var eqEnabled: Fact<Bool> = .unavailable; var group: Fact<String> = .unavailable; var inputGain: Fact<Double> = .unavailable; var sends: [SendFacts] = []; var plugins: [PluginFacts] = [] }
+struct ChannelFacts: Codable, Sendable { var volumeDB: Fact<Double>; var pan: Fact<Double>; var mute: Fact<Bool>; var solo: Fact<Bool>; var automation: Fact<String>; var input: Fact<String>; var output: Fact<String>; var record: Fact<Bool> = .unavailable; var monitoring: Fact<Bool> = .unavailable; var channelMode: Fact<String> = .unavailable; var eqEnabled: Fact<Bool> = .unavailable; var group: Fact<String> = .unavailable; var inputGain: Fact<Double> = .unavailable; var routingButtons: [RoutingButtonFacts] = []; var plugins: [PluginFacts] = [] }
 struct LinkingDiagnostics: Codable, Sendable {
     var trackHeaderCandidates: Int; var channelCandidates: Int; var confirmedLinks: Int; var unresolvedHeaders: Int; var unresolvedChannels: Int; var ambiguous: Int; var logicalTracks: Int
     static let empty = LinkingDiagnostics(trackHeaderCandidates: 0, channelCandidates: 0, confirmedLinks: 0, unresolvedHeaders: 0, unresolvedChannels: 0, ambiguous: 0, logicalTracks: 0)
 }
 struct PluginFacts: Codable, Identifiable, Sendable { var id: String; var slot: Int; var name: Fact<String>; var manufacturer: Fact<String>; var bypass: Fact<Bool>; var parameters: [PluginParameter] }
 struct PluginParameter: Codable, Identifiable, Sendable { var id: String; var name: String; var value: Fact<Double>; var range: ClosedRange<Double>?; var unit: String? }
-struct SendFacts: Codable, Identifiable, Sendable { var id: String; var destination: Fact<String>; var levelDB: Fact<Double>; var pan: Fact<Double> }
+/// A mixer-strip AXButton naming a routing destination ("Bus 1", "St Out"). Logic gives its send slots, the output slot
+/// and an aux's input slot the same anonymous button shape over AX, so which slot the button occupies cannot be read —
+/// only the destination it names. The destination is a fact; the slot kind stays `requires_probe` and the button must
+/// never be published as a send.
+struct RoutingButtonFacts: Codable, Identifiable, Sendable { var id: String; var destination: Fact<String>; var slotKind: Fact<String> }
 
 enum ProbeType: String, Codable, CaseIterable, Sendable { case inspectTrack = "inspect_track", inspectPlugin = "inspect_plugin", inspectPluginParameters = "inspect_plugin_parameters", inspectChannelStrip = "inspect_channel_strip", inspectTrackRegions = "inspect_track_regions", inspectMixer = "inspect_mixer", inspectSelectedTrack = "inspect_selected_track", inspectAudioMeter = "inspect_audio_meter" }
 struct ProbeRequest: Codable, Sendable { var type: ProbeType; var trackID: String?; var trackName: String?; var pluginName: String? }
