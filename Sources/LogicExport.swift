@@ -25,6 +25,8 @@ enum MixerEnsureOutcome: Sendable { case alreadyVisible, opened(item: String), f
 /// project/export settings (format, bit depth, normalize are left at Logic's defaults).
 struct LogicExportAutomator: Sendable {
     private let supportedBundleIDs: Set<String> = ["com.apple.logic10", "com.apple.mobilelogic"]
+    /// Shown when a top-level menu title does not match: the automation relies on English menu names by design.
+    private let englishUIHint = "If these titles are not English, run Logic Pro with the English UI (System Settings \u{25B8} General \u{25B8} Language & Region \u{25B8} Applications \u{25B8} add Logic Pro \u{25B8} English) — menu automation relies on English names."
 
     /// Full one-click export to `destination`. Returns .exported only after the Export button was pressed on a dialog confirmed to point at `destination`.
     func exportAllTracks(destination: URL) -> ExportOutcome {
@@ -44,6 +46,9 @@ struct LogicExportAutomator: Sendable {
         let format = firstDescendant(dialog) { self.role($0) == "AXPopUpButton" && (self.string($0, kAXValueAttribute) ?? "").uppercased().contains("WAV") }.flatMap { self.string($0, kAXValueAttribute) } ?? "unknown"
 
         // Destination via the standard Go-to-Folder field (AX-set is ignored by the panel, so paste real text).
+        // The user's text clipboard is saved first and restored on every exit path — the automation must not eat what they had copied.
+        let savedClipboard = NSPasteboard.general.string(forType: .string)
+        defer { if let savedClipboard { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(savedClipboard, forType: .string) } }
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(destination.path, forType: .string)
         postKey(5, [.maskCommand, .maskShift]); usleep(700_000) // ⌘⇧G
         guard let sheet = firstDescendant(dialog, { self.role($0) == "AXSheet" }), let field = firstDescendant(sheet, { ["AXComboBox", "AXTextField"].contains(self.role($0)) }) else { return .navigationFailed(step: "goto_sheet", detail: "Go-to-folder field not found after ⌘⇧G.") }
@@ -70,7 +75,7 @@ struct LogicExportAutomator: Sendable {
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
         app.activate(); usleep(400_000)
         guard let menuBar = copyElement(appElement, kAXMenuBarAttribute) else { return .failed(step: "menu_bar", detail: "AXMenuBar attribute is unavailable.") }
-        guard let viewItem = childByTitle(menuBar, "View") else { return .failed(step: "view_menu", detail: "View menu not found. Menus: \(childTitles(menuBar))") }
+        guard let viewItem = childByTitle(menuBar, "View") else { return .failed(step: "view_menu", detail: "View menu not found. Menus: \(childTitles(menuBar)). \(englishUIHint)") }
         _ = press(viewItem); usleep(400_000) // open View so Logic validates & populates the submenu
         guard let viewMenu = firstMenu(of: viewItem), let mixerItem = childContaining(viewMenu, "mixer") else { postKey(53, []); return .failed(step: "mixer_item", detail: "No Mixer item found in the View menu.") }
         let title = string(mixerItem, kAXTitleAttribute) ?? "Mixer"
@@ -95,7 +100,7 @@ struct LogicExportAutomator: Sendable {
     private enum MenuPress { case pressed(String); case failed(String, String) }
     private func pressAllTracksMenu(_ appElement: AXUIElement) -> MenuPress {
         guard let menuBar = copyElement(appElement, kAXMenuBarAttribute) else { return .failed("menu_bar", "AXMenuBar attribute is unavailable.") }
-        guard let fileItem = childByTitle(menuBar, "File") else { return .failed("file_menu", "File menu not found. Menus: \(childTitles(menuBar))") }
+        guard let fileItem = childByTitle(menuBar, "File") else { return .failed("file_menu", "File menu not found. Menus: \(childTitles(menuBar)). \(englishUIHint)") }
         _ = press(fileItem); usleep(400_000) // open File so Logic validates & populates the submenu
         guard let fileMenu = firstMenu(of: fileItem), let exportItem = childByTitle(fileMenu, "Export") else { return .failed("export_item", "‘Export’ not found in File.") }
         _ = press(exportItem); usleep(400_000)

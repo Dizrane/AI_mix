@@ -14,6 +14,23 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
     init() {
         do { store = try SessionStore(); storeInitFailure = nil } catch { store = nil; storeInitFailure = error.localizedDescription }
         refreshConnection()
+        startConnectionMonitor()
+    }
+    private var connectionMonitor: Task<Void, Never>?
+    /// Keeps the connection indicators live: Logic launching/quitting and the Accessibility grant are picked up on their
+    /// own within a couple of seconds, no manual Refresh needed. Only a real change updates state and the log stays quiet.
+    private func startConnectionMonitor() {
+        connectionMonitor = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self else { return }
+                let fresh = self.analyzer.connectionStatus()
+                if fresh.found != self.connection.found || fresh.accessibilityTrusted != self.connection.accessibilityTrusted || fresh.pid != self.connection.pid {
+                    self.connection = fresh
+                    self.log.append(fresh.message)
+                }
+            }
+        }
     }
     /// Honest storage diagnostics. Data lives in `Data/` next to the .app by design (one self-contained folder); when macOS App
     /// Translocation runs the app from a quarantined read-only copy, that folder cannot be created — say so instead of a vague error.
@@ -90,6 +107,7 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
                 analyzerState = .error(error.localizedDescription); log.append(error.localizedDescription)
             }
             scanWork = nil
+            NSApp.activate() // the mixer step activated Logic; bring the user back to the results
         }
     }
     func cancelScan() { scanWork?.cancel() }
@@ -197,6 +215,7 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
             await store.clearAudioFiles() // clean our own working folder so the result is one unambiguous WAV per track
             let exporter = exporter
             let outcome = await Task.detached(priority: .userInitiated) { exporter.exportAllTracks(destination: audioDir) }.value
+            NSApp.activate() // Logic keeps exporting on its own; bring the user back to the detection progress
             switch outcome {
             case .triggerFailed(let step, let detail):
                 exportPhase = .failed(step)
@@ -229,7 +248,8 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
             }.sorted()
         }
         var previousSignature: [String]? = nil
-        for _ in 0..<80 { // up to ~2 minutes at 1.5s
+        var idleScans = 0
+        for _ in 0..<400 { // hard cap ~10 minutes; large projects keep the wait alive as long as files keep arriving
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             let assets = audioExtractor.extract(raw: raw, normalized: normalized, audioDirectory: audioDir)
             audioAssets = assets
@@ -237,7 +257,9 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
             audioStatus = "Detecting exported WAV… \(summary.exported)/\(summary.assets) ready."
             let signature = fileSignature(assets)
             if summary.assets > 0, summary.exported == summary.assets, signature == previousSignature { break } // stable final state
+            idleScans = signature == previousSignature ? idleScans + 1 : 0
             previousSignature = signature
+            if idleScans >= 40 { break } // a full minute with no new or growing files — Logic is not exporting (anymore)
         }
         // Final authoritative rescan of the audio directory — `exported` and `actualExportedPath` come only from the files that really exist now.
         let finalAssets = audioExtractor.extract(raw: raw, normalized: normalized, audioDirectory: audioDir)

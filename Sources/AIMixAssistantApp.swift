@@ -157,13 +157,17 @@ struct Sidebar: View {
                 StatusRow("Accessibility", model.connection.accessibilityTrusted ? "Granted" : "Required", model.connection.accessibilityTrusted ? .ok : .warn)
             }.font(.caption)
             Divider().padding(.vertical, 8)
-            Button { showSettings = true } label: {
-                HStack(spacing: 8) { Image(systemName: "gearshape").font(.system(size: 13)); Text("Settings").font(.system(size: 13)); Spacer() }
-                    .padding(.horizontal, 8).padding(.vertical, 6).contentShape(Rectangle())
-            }.buttonStyle(.plain).foregroundStyle(.secondary)
+            HStack {
+                Button { showSettings = true } label: {
+                    HStack(spacing: 8) { Image(systemName: "gearshape").font(.system(size: 13)); Text("Settings").font(.system(size: 13)); Spacer() }
+                        .padding(.horizontal, 8).padding(.vertical, 6).contentShape(Rectangle())
+                }.buttonStyle(.plain).foregroundStyle(.secondary)
+                Text(Self.versionLabel).font(.caption2).foregroundStyle(.tertiary)
+            }
         }
         .padding(14).frame(minWidth: 236)
     }
+    static let versionLabel = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String).map { "v\($0)" } ?? "dev"
     struct StepRow: View {
         let stage: WorkflowStage
         @EnvironmentObject var model: AppModel
@@ -232,6 +236,7 @@ struct ConnectionScreen: View {
                 if !model.connection.accessibilityTrusted { Button("Open Accessibility Settings", action: model.openAccessibilitySettings) }
             }
             if ready { Text("System ready. Logic Pro is analyzed read-only.").font(.callout).foregroundStyle(.secondary) }
+            else { Text("Status refreshes automatically — launch Logic Pro or grant Accessibility and this screen updates on its own.").font(.caption).foregroundStyle(.secondary) }
             StageFooter(title: "Continue to Analysis", enabled: ready) { model.go(to: .analysis) }
         }
     }
@@ -332,7 +337,7 @@ struct AudioScreen: View {
         .confirmationDialog("Export audio tracks from Logic Pro?", isPresented: $model.showExportConfirm, titleVisibility: .visible) {
             Button("Export") { model.confirmExport() }
             Button("Cancel", role: .cancel) {}
-        } message: { Text("Logic Pro will export the audio tracks of the current project. The destination folder just opened and its path is on the clipboard — in Logic's export dialog press \u{2318}\u{21E7}G, paste it, and choose WAV. No mix settings are changed.") }
+        } message: { Text("Logic Pro will export every track of the current project as one WAV file per track, using its own File \u{25B8} Export \u{25B8} All Tracks as Audio Files\u{2026} dialog. AI Mix Assistant drives that dialog into its audio folder automatically — don't touch Logic until the export starts. No mix settings are changed, and your clipboard is restored afterwards.") }
     }
     private var exportIndicator: (IndicatorState, String) {
         switch model.exportPhase { case .idle: return (.idle, "Ready"); case .exporting: return (.warn, "Exporting\u{2026}"); case .done: return (.ok, "Exported"); case .failed(let step): return (.error, "Failed: \(step)") }
