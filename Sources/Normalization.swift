@@ -30,7 +30,7 @@ struct SnapshotNormalizer: Sendable {
         let candidates = dedupe(trackCandidates + mixerCandidates)
         let diagnostics = updatedDiagnostics(raw.diagnostics, candidates: candidates, tracks: headers.count, channels: channels.count)
         let status: Fact<String> = tracks.isEmpty ? .init(state: .requiresProbe, value: nil, source: "structural discovery") : .known("\(linking.logicalTracks) logical tracks: \(linking.confirmedLinks) confirmed, \(linking.unresolvedHeaders) header-only, \(linking.unresolvedChannels) channel-only, \(linking.ambiguous) ambiguous", source: "structural linking")
-        let limitations = ["Header↔channel links are confirmed only by a unique 1:1 name correspondence; shared names stay unmerged (ambiguous). No shared Logic identifier is exposed by AX, so links are never guessed.", "Only values exposed by matching AX controls are emitted; unavailable fields are never inferred."]
+        let limitations = ["Header↔channel links are confirmed only by a unique 1:1 name correspondence; shared names stay unmerged (ambiguous). No shared Logic identifier is exposed by AX, so links are never guessed.", "Only values exposed by matching AX controls are emitted; unavailable fields are never inferred.", "Logic exposes send, output and aux-input slots as identically shaped buttons that only name a destination, so per-strip routing buttons carry a destination but no slot kind: none of them is a confirmed send, and a strip's output stays unavailable until a targeted probe classifies its buttons."]
         return .init(application: raw.application, completeness: .known("read-only AX structural discovery with track↔channel linking", source: "normalizer"), project: project, tracksStatus: status, tracks: tracks, linking: linking, candidates: candidates, audio: .unavailable, arrangement: .unavailable, probes: raw.diagnostics.probes, diagnostics: diagnostics, limitations: limitations, rawSnapshotReference: rawReference)
     }
 
@@ -120,13 +120,17 @@ struct SnapshotNormalizer: Sendable {
         let eqEnabled = exactControl("EQ").flatMap { boolValue($0.value) }.map { Fact.known($0, source: node.id) } ?? .unavailable
         let group = control(["group"]).flatMap { $0.value }.map { Fact.known($0, source: node.id) } ?? .unavailable
         let inputGain = exactControl("input gain").flatMap { decimalValue($0.value) }.map { Fact.known($0, source: node.id) } ?? .unavailable
-        return ChannelFacts(volumeDB: volume, pan: pan, mute: mute, solo: solo, automation: automation, input: input, output: .unavailable, record: record, monitoring: monitoring, channelMode: channelMode, eqEnabled: eqEnabled, group: group, inputGain: inputGain, sends: sendSlots(in: node), plugins: pluginSlots(in: node))
+        return ChannelFacts(volumeDB: volume, pan: pan, mute: mute, solo: solo, automation: automation, input: input, output: .unavailable, record: record, monitoring: monitoring, channelMode: channelMode, eqEnabled: eqEnabled, group: group, inputGain: inputGain, routingButtons: routingButtonSlots(in: node), plugins: pluginSlots(in: node))
     }
-    /// Sends are AXButtons labelled with a routing destination (e.g. "Bus 1"). Empty "send button" slots are ignored. Level/pan are not exposed on the button and remain requires_probe.
-    private func sendSlots(in node: RawAccessibilityNode) -> [SendFacts] {
+    /// Routing buttons are AXButtons labelled with a destination ("Bus 1", "St Out", "Output 1-2"). Logic exposes its send
+    /// slots, the output slot and an aux's input slot as the same anonymous button, so the slot kind is not readable and
+    /// publishing these as sends invented routing that did not exist: a track whose OUTPUT is "Bus 1" was reported as
+    /// sending to Bus 1, and an aux's INPUT bus became its "send". Only the named destination is a fact; the slot kind
+    /// stays requires_probe until a targeted probe classifies the button.
+    private func routingButtonSlots(in node: RawAccessibilityNode) -> [RoutingButtonFacts] {
         node.children.enumerated().compactMap { index, child in
-            guard child.role == "AXButton", let desc = child.description, desc.range(of: "^Bus ", options: [.regularExpression, .caseInsensitive]) != nil else { return nil }
-            return SendFacts(id: "\(node.id).send.\(index)", destination: .known(desc, source: child.id), levelDB: .init(state: .requiresProbe, value: nil, source: child.id), pan: .init(state: .requiresProbe, value: nil, source: child.id))
+            guard child.role == "AXButton", let desc = child.description, desc.range(of: "^(Bus |St(ereo)? Out$|Output\\b)", options: [.regularExpression, .caseInsensitive]) != nil else { return nil }
+            return RoutingButtonFacts(id: "\(node.id).routing.\(index)", destination: .known(desc, source: child.id), slotKind: .init(state: .requiresProbe, value: nil, source: child.id))
         }
     }
     /// Insert slots are AXButtons described "audio plug-in". Only loaded slots (a non-empty name) are emitted; bypass and parameters require a targeted probe.
