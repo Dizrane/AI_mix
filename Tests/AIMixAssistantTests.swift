@@ -241,6 +241,15 @@ private func projectSnapshot(_ nodes: [RawAccessibilityNode], windowTitle: Strin
     let p = ProjectPresence.evaluate(title: "Untitled", document: nil, windowSource: "AXFocusedWindow")
     #expect(p.open); #expect(p.name == "Untitled"); #expect(p.source == "AXTitle of AXFocusedWindow")
 }
+@Test func projectChooserWindowIsNotAnOpenProject() {
+    // Logic shows the chooser precisely when no project is open, so its caption is evidence of absence: the Connection
+    // stage must warn and stay locked, and the normalizer must not publish "Choose a Project" as a project name.
+    #expect(ProjectPresence.evaluate(title: "Choose a Project", document: nil, windowSource: "AXMainWindow").open == false)
+    #expect(ProjectPresence.evaluate(title: "choose project", document: nil, windowSource: "AXFocusedWindow").open == false)
+    #expect(projectSnapshot([], windowTitle: "Choose a Project").project.name.state == .unavailable)
+    // A document always wins: a real project honestly saved as "Choose a Project.logicx" is still an open project.
+    #expect(ProjectPresence.evaluate(title: "Choose a Project — Tracks", document: "file:///Users/dizrane/Choose%20a%20Project.logicx", windowSource: "AXMainWindow").open == true)
+}
 @Test func projectPresenceWithoutWindowEvidenceIsClosed() {
     // Logic running with no open project exposes no captioned main/focused window: no project is claimed, no name invented.
     #expect(ProjectPresence.evaluate(title: nil, document: nil, windowSource: nil) == ProjectPresence(open: false, name: nil, source: nil))
