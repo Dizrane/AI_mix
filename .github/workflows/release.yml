@@ -30,6 +30,10 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the changelog against the previous release tag can be generated
+      - name: Resolve version
+        run: echo "VERSION=${{ github.event.inputs.version || github.ref_name }}" >> "$GITHUB_ENV"
       - name: Build universal release binary
         run: swift build -c release --arch arm64 --arch x86_64
       - name: Assemble .app bundle
@@ -37,24 +41,36 @@ jobs:
           APP="AI Mix Assistant.app"
           mkdir -p "$APP/Contents/MacOS"
           cp AppInfo.plist "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION#v}" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" "$APP/Contents/Info.plist"
           cp ".build/apple/Products/Release/AI Mix Assistant" "$APP/Contents/MacOS/AI Mix Assistant"
           codesign --force --deep --sign - "$APP"
           codesign --verify --verbose "$APP"
-      - name: Zip app
+      - name: Zip app inside its closed-shell folder
         run: |
-          VERSION="${{ github.event.inputs.version || github.ref_name }}"
-          ditto -c -k --sequesterRsrc --keepParent "AI Mix Assistant.app" "AI-Mix-Assistant-$VERSION-macos-universal.zip"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          FOLDER="AI_Mix_$VERSION"
+          mkdir "$FOLDER"
+          mv "AI Mix Assistant.app" "$FOLDER/"
+          ditto -c -k --sequesterRsrc --keepParent "$FOLDER" "AI-Mix-Assistant-$VERSION-macos-universal.zip"
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cat > notes.md <<'EOF'
+          PREV=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null || true)
+          : > notes.md
+          if [ -n "$PREV" ] && git rev-parse -q --verify "refs/tags/$PREV" >/dev/null; then
+            echo "## Что нового по сравнению с $PREV" >> notes.md
+            echo >> notes.md
+            git log "$PREV"..HEAD --no-merges --pretty='- %s' >> notes.md
+            echo >> notes.md
+          fi
+          cat >> notes.md <<'EOF'
           ## Установка
 
-          1. Скачайте `AI-Mix-Assistant-*.zip` ниже и распакуйте.
-          2. Первый запуск: кликните по `AI Mix Assistant.app` правой кнопкой → «Открыть» → «Открыть» (приложение не нотаризовано Apple, поэтому обычный двойной клик macOS заблокирует; после первого раза запускается как обычно).
-          3. Выдайте приложению разрешение Accessibility, когда оно предложит (System Settings → Privacy & Security → Accessibility).
+          1. Скачайте `AI-Mix-Assistant-*.zip` ниже и распакуйте — получится папка `AI_Mix_<версия>` с приложением внутри.
+          2. Перенесите **всю папку** куда угодно (например в `~/Applications`) и запускайте приложение только изнутри неё: программа хранит все свои данные рядом с собой в этой папке, и удаление папки удаляет программу целиком со всеми данными.
+          3. Первый запуск: кликните по `AI Mix Assistant.app` правой кнопкой → «Открыть» → «Открыть» (приложение не нотаризовано Apple, поэтому обычный двойной клик macOS заблокирует; после первого раза запускается как обычно).
+          4. Выдайте приложению разрешение Accessibility, когда оно предложит (System Settings → Privacy & Security → Accessibility).
 
           ## Требования
 

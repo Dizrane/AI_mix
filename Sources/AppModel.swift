@@ -106,7 +106,7 @@ enum AudioExportPhase: Equatable { case idle, exporting, done, failed(String) }
     /// Runs after the SECOND confirmation only. Deletes the one app root, then quits — but only claims success if the directory is actually gone.
     func deleteApplication() {
         switch uninstaller.deleteApplicationRoot() {
-        case .deleted(let path): deleteStatus = "AI Mix Assistant has been deleted."; log.append("Deleted application root: \(path)"); Task { try? await Task.sleep(nanoseconds: 700_000_000); NSApp.terminate(nil) }
+        case .deleted(let path): deleteStatus = "AI Mix Assistant has been deleted."; log.append("Deleted application root: \(path)"); Task { try? await Task.sleep(nanoseconds: 700_000_000); exit(0) } // exit() skips AppKit's quit-time state saving, which would recreate the just-removed ~/Library artifacts
         case .blocked(let reason): deleteStatus = "Deletion blocked. \(reason)"
         case .failed(let reason): deleteStatus = "Unable to delete AI Mix Assistant. Reason: \(reason)"
         case .partiallyRemoved(let reason): deleteStatus = "AI Mix Assistant was only partially removed. \(reason)"

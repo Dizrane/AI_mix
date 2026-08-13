@@ -187,3 +187,17 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(md.contains("logicalTrackID: known: track_1"))
     #expect(!md.contains("Lead")); #expect(!md.contains("Double")) // no musical interpretation
 }
+
+// MARK: - Closed-shell storage rules
+
+@Test func sharedContainerDetectsCommonFolders() {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    #expect(SessionStore.sharedContainerName(home.appendingPathComponent("Downloads")) == "~/Downloads")
+    #expect(SessionStore.sharedContainerName(home) == "the home folder")
+    #expect(SessionStore.sharedContainerName(URL(fileURLWithPath: "/Applications")) == "/Applications")
+}
+@Test func dedicatedAppFolderIsNotShared() {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    #expect(SessionStore.sharedContainerName(home.appendingPathComponent("Downloads/AI_Mix_v1")) == nil)
+    #expect(SessionStore.sharedContainerName(URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("AI_Mix")) == nil)
+}
