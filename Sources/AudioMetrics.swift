@@ -168,7 +168,12 @@ struct AudioMetricsAnalyzer: Sendable {
         var lufs: Fact<Double> = .unavailable
         if kSubBlocks.count >= 4 {
             let blockFrames = Double(4 * subFrames)
-            let blocks = (0...(kSubBlocks.count - 4)).map { (kSubBlocks[$0] + kSubBlocks[$0 + 1] + kSubBlocks[$0 + 2] + kSubBlocks[$0 + 3]) / blockFrames }
+            var blocks: [Double] = []
+            blocks.reserveCapacity(kSubBlocks.count - 3)
+            for start in 0...(kSubBlocks.count - 4) {
+                let energy: Double = kSubBlocks[start] + kSubBlocks[start + 1] + kSubBlocks[start + 2] + kSubBlocks[start + 3]
+                blocks.append(energy / blockFrames)
+            }
             let absoluteGated = blocks.filter { -0.691 + decibels($0) > -70 }
             if !absoluteGated.isEmpty {
                 let relativeThreshold = -0.691 + decibels(absoluteGated.reduce(0, +) / Double(absoluteGated.count)) - 10
@@ -261,12 +266,19 @@ private final class KWeightingFilter {
         let gainDB = 3.999843853973347, shelfF0 = 1681.974450955533, shelfQ = 0.7071752369554196
         let k = tan(.pi * shelfF0 / sampleRate)
         let vh = pow(10, gainDB / 20), vb = pow(vh, 0.4996667741545416)
-        let a0 = 1 + k / shelfQ + k * k
-        let shelf = [(vh + vb * k / shelfQ + k * k) / a0, 2 * (k * k - vh) / a0, (vh - vb * k / shelfQ + k * k) / a0, 2 * (k * k - 1) / a0, (1 - k / shelfQ + k * k) / a0]
+        let a0: Double = 1 + k / shelfQ + k * k
+        let shelfB0: Double = (vh + vb * k / shelfQ + k * k) / a0
+        let shelfB1: Double = 2 * (k * k - vh) / a0
+        let shelfB2: Double = (vh - vb * k / shelfQ + k * k) / a0
+        let shelfA1: Double = 2 * (k * k - 1) / a0
+        let shelfA2: Double = (1 - k / shelfQ + k * k) / a0
+        let shelf: [Double] = [shelfB0, shelfB1, shelfB2, shelfA1, shelfA2]
         let hpF0 = 38.13547087602444, hpQ = 0.5003270373238773
         let kh = tan(.pi * hpF0 / sampleRate)
-        let a0h = 1 + kh / hpQ + kh * kh
-        let highPass = [1.0, -2.0, 1.0, 2 * (kh * kh - 1) / a0h, (1 - kh / hpQ + kh * kh) / a0h]
+        let a0h: Double = 1 + kh / hpQ + kh * kh
+        let hpA1: Double = 2 * (kh * kh - 1) / a0h
+        let hpA2: Double = (1 - kh / hpQ + kh * kh) / a0h
+        let highPass: [Double] = [1.0, -2.0, 1.0, hpA1, hpA2]
         return shelf + highPass
     }
 }
@@ -285,10 +297,11 @@ private final class TruePeakScanner {
     init(channels: Int, chunkCapacity: Int) {
         let taps = Self.phases * Self.tapsPerPhase
         let center = Double(taps - 1) / 2
-        let impulse: [Double] = (0..<taps).map { index in
-            let x = (Double(index) - center) / Double(Self.phases)
-            let sinc = x == 0 ? 1.0 : sin(.pi * x) / (.pi * x)
-            let window = 0.42 - 0.5 * cos(2 * .pi * Double(index) / Double(taps - 1)) + 0.08 * cos(4 * .pi * Double(index) / Double(taps - 1))
+        let impulse: [Double] = (0..<taps).map { (index: Int) -> Double in
+            let x: Double = (Double(index) - center) / Double(Self.phases)
+            let sinc: Double = x == 0 ? 1.0 : sin(.pi * x) / (.pi * x)
+            let angle: Double = 2 * .pi * Double(index) / Double(taps - 1)
+            let window: Double = 0.42 - 0.5 * cos(angle) + 0.08 * cos(2 * angle)
             return sinc * window
         }
         // Reversed per phase because vDSP_conv computes correlation; reversing the taps turns it into convolution.
