@@ -39,8 +39,9 @@ jobs:
       - name: Assemble .app bundle
         run: |
           APP="AI Mix Assistant.app"
-          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp AppInfo.plist "$APP/Contents/Info.plist"
+          cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION#v}" "$APP/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" "$APP/Contents/Info.plist"
           cp ".build/apple/Products/Release/AI Mix Assistant" "$APP/Contents/MacOS/AI Mix Assistant"
