@@ -268,7 +268,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.3`"))
+    #expect(md.contains("Package schema: `2.4`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -300,6 +300,20 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(!md.contains("- Group: unavailable")); #expect(!md.contains("- Automation: unavailable")) // pure-unavailable noise compressed…
     #expect(md.contains("- Unavailable: Automation, Group")); #expect(md.contains("- Unavailable: Output"))
     #expect(md.contains("- Pan: known: -20")); #expect(md.contains("- Volume: known: -1.5 dB")) // …while known facts keep their own lines
+    #expect(md.contains("- Flags: known: Mute false · Solo false · Record false · Monitoring false · EQ enabled false")) // known booleans share one line per block
+    #expect(!md.contains("- Mute: known: false"))
+}
+/// The document must teach the exact JSON the Review screen decodes: the example it prints has to parse through the app's
+/// own MixPlan decoder, or the model learns a shape whose paste later fails with "Invalid MixPlan JSON".
+@Test func packageMixPlanExampleParsesThroughTheAppDecoder() throws {
+    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t")
+    #expect(md.contains("## Mix Plan schema (machine-validated)"))
+    #expect(md.contains("Respond in Markdown a human will read")) // stages 1–4 are for the user, not for a parser
+    #expect(!md.contains("Return your first response as JSON"))
+    let json = try #require(md.components(separatedBy: "```json").last?.components(separatedBy: "```").first)
+    let plan = try JSONDecoder().decode(MixPlan.self, from: Data(json.utf8))
+    #expect(plan.actions.count == 2)
+    #expect(plan.actions.allSatisfy { CommandValidator().implemented.contains($0.action) })
 }
 /// The AX meter section is empty by nature (Logic publishes no numeric meters), and next to per-file LUFS/peak numbers a bare
 /// "LUFS: unavailable" reads as "no loudness data at all". It says which kind of reading it is and where the real numbers are.
@@ -472,13 +486,14 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.3`"))
+    #expect(md.contains("Package schema: `2.4`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
     #expect(md.contains("Stereo correlation L/R: unavailable")) // mono WAV — honest state, not a fabricated number
     #expect(md.contains("measured facts about the audio files, not musical judgements")) // External AI Instructions updated
     #expect(md.contains("Regions (1): `region_001`")) // regions name their provenance on one line; pixel geometry is not timing
+    #expect(!md.contains("1 region: region_001")) // provenance counts regions; the ID list lives under the asset alone
     #expect(!md.contains("timeline x:"))
 }
 /// A share that rounds to zero used to print "0% silent" directly above its own silence ranges, and a peak just under full scale
