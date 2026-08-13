@@ -548,3 +548,48 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     #expect(abs(rms - -23.01) < 0.2) // amplitude 0.1 sine ⇒ RMS = 20·log10(0.1/√2)
     #expect(back.assets.first { $0.audioID == "audio_track_002" }?.metrics == nil)
 }
+
+// MARK: - Self-update
+
+@Test func updaterComparesVersionsNumerically() {
+    #expect(AppUpdater.isNewer("v0.2.7", than: "0.2.6"))
+    #expect(AppUpdater.isNewer("v0.3.0", than: "0.2.10"))
+    #expect(AppUpdater.isNewer("v0.2.10", than: "0.2.9")) // numeric, not lexicographic
+    #expect(AppUpdater.isNewer("v0.2.6.1", than: "0.2.6"))
+    #expect(!AppUpdater.isNewer("v0.2.6", than: "0.2.6"))
+    #expect(!AppUpdater.isNewer("v0.2.5", than: "0.2.6"))
+    #expect(!AppUpdater.isNewer("garbage", than: "0.2.6")) // a malformed tag can never look newer
+}
+@Test func updaterPicksTheAppZipAssetFromReleaseJSON() throws {
+    let json = """
+    {"tag_name":"v0.2.7","assets":[{"name":"notes.txt","browser_download_url":"https://example.com/notes.txt"},{"name":"AI-Mix-Assistant-v0.2.7-macos-universal.zip","browser_download_url":"https://example.com/app.zip"}]}
+    """
+    let update = try AppUpdater.update(fromReleaseJSON: Data(json.utf8))
+    #expect(update.tag == "v0.2.7"); #expect(update.assetName == "AI-Mix-Assistant-v0.2.7-macos-universal.zip"); #expect(update.assetURL.absoluteString == "https://example.com/app.zip")
+}
+@Test func updaterRefusesAReleaseWithoutTheAppAsset() {
+    let json = #"{"tag_name":"v0.2.7","assets":[{"name":"notes.txt","browser_download_url":"https://example.com/n.txt"}]}"#
+    #expect(throws: (any Error).self) { try AppUpdater.update(fromReleaseJSON: Data(json.utf8)) }
+}
+@Test func updaterValidatesTheDownloadedBundleAgainstTheReleaseTag() throws {
+    let temp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: temp) }
+    let app = temp.appendingPathComponent("AI Mix Assistant.app")
+    let executable = app.appendingPathComponent("Contents/MacOS/Demo")
+    try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let plist = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+      <key>CFBundleExecutable</key><string>Demo</string>
+      <key>CFBundleIdentifier</key><string>test.updater.demo</string>
+      <key>CFBundleShortVersionString</key><string>0.9.9</string>
+    </dict></plist>
+    """
+    try plist.write(to: app.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8)
+    try Data("#!/bin/sh\n".utf8).write(to: executable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+    let updater = AppUpdater()
+    #expect(updater.validate(bundle: app, expectedTag: "v0.9.9") == nil)
+    #expect(updater.validate(bundle: app, expectedTag: "v1.0.0") != nil) // version mismatch is refused, not installed
+}

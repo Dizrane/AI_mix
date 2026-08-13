@@ -29,6 +29,8 @@ struct ApplicationLauncher: Sendable {
         do { store = try SessionStore(); storeInitFailure = nil } catch { store = nil; storeInitFailure = error.localizedDescription }
         refreshConnection()
         startConnectionMonitor()
+        AppUpdater.removeLeftovers()
+        checkForUpdates()
     }
     private var connectionMonitor: Task<Void, Never>?
     /// Keeps the connection indicators live: Logic launching/quitting and the Accessibility grant are picked up on their
@@ -73,6 +75,64 @@ struct ApplicationLauncher: Sendable {
             }
         }
     }
+    // MARK: Self-update
+    @Published var updateAvailable: AppUpdate?
+    @Published var updateStatus = ""
+    @Published var updateInProgress = false
+    private let updater = AppUpdater()
+    /// Reads the latest GitHub release and compares versions; nothing is downloaded or installed here. The automatic
+    /// launch check stays silent on failure (offline is not an error worth a banner); a user-initiated check reports
+    /// every outcome, including "already up to date".
+    func checkForUpdates(userInitiated: Bool = false) {
+        guard let current = AppUpdater.currentVersion() else {
+            if userInitiated { updateStatus = "Update checks need the released .app; this development run has no version to compare." }
+            return
+        }
+        if userInitiated { updateStatus = "Checking for updates\u{2026}" }
+        Task {
+            do {
+                let latest = try await updater.latestRelease()
+                if AppUpdater.isNewer(latest.tag, than: current) {
+                    updateAvailable = latest
+                    updateStatus = "Version \(latest.tag) is available (you have v\(current))."
+                } else {
+                    updateAvailable = nil
+                    if userInitiated { updateStatus = "You are on the latest version (v\(current))." }
+                }
+            } catch {
+                if userInitiated { updateStatus = "Update check failed: \(error.localizedDescription)" }
+            }
+        }
+    }
+    /// User-requested in-place update: download the release ZIP, verify the new bundle, swap it in next to the
+    /// untouched Data/, relaunch the new version and quit this one. Any failure is reported and leaves the current
+    /// installation working; a translocated (quarantined read-only) copy must be repaired first, because its real
+    /// bundle location is not what is running.
+    func installUpdate() {
+        guard let update = updateAvailable, !updateInProgress else { return }
+        if TranslocationRepair.isActive {
+            updateStatus = "The app is running from a translocated read-only copy. Click \u{201C}Fix and Relaunch\u{201D} first, then update."
+            return
+        }
+        updateInProgress = true
+        Task {
+            let result = await updater.downloadAndInstall(update) { message in Task { @MainActor in self.updateStatus = message } }
+            switch result {
+            case .installed(let app):
+                updateStatus = "Updated to \(update.tag). Relaunching\u{2026}"
+                log.append("Updated to \(update.tag); relaunching from \(app.path)")
+                if let failure = await ApplicationLauncher().launch(at: app, newInstance: true) {
+                    updateStatus = "Updated to \(update.tag), but relaunch failed: \(failure). Quit and open AI Mix Assistant.app yourself — it is already the new version."
+                    updateInProgress = false
+                } else { exit(0) }
+            case .failed(let reason):
+                updateStatus = reason
+                log.append(reason)
+                updateInProgress = false
+            }
+        }
+    }
+
     func refreshConnection() { connection = analyzer.connectionStatus(); log.append(connection.message) }
     func openAccessibilitySettings() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!) }
     func launchLogic() {
