@@ -142,7 +142,12 @@ struct ApplicationLauncher: Sendable {
             refreshConnection()
         }
     }
-    func isAvailable(_ target: WorkflowStage) -> Bool { switch target { case .connection: true; case .analysis: connection.found && connection.accessibilityTrusted && connection.projectOpen == true; case .audio, .aiPackage, .review: normalized != nil } }
+    /// One truth per stage: the sidebar checkmark, the next stage's availability and the "Continue" button all derive
+    /// from it. A stage is complete only when its own work is really done — Audio requires every discovered audio track
+    /// to have a real exported WAV on disk, never a merely prepared asset list.
+    func isComplete(_ stage: WorkflowStage) -> Bool { switch stage { case .connection: connection.found && connection.accessibilityTrusted && connection.projectOpen == true; case .analysis: normalized != nil; case .audio: !audioAssets.isEmpty && audioAssets.allSatisfy { $0.status == .exported }; case .aiPackage: !aiPackage.isEmpty; case .review: !validated.isEmpty } }
+    /// Strict step order: a stage opens only when the previous one is complete — never every stage at once after a scan.
+    func isAvailable(_ target: WorkflowStage) -> Bool { WorkflowStage(rawValue: target.rawValue - 1).map(isComplete) ?? true }
     func go(to target: WorkflowStage) { if isAvailable(target) { stage = target } }
     @Published var scanProgress = 0
     private var scanWork: Task<RawSnapshot, Error>?
