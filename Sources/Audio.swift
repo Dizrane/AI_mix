@@ -53,6 +53,13 @@ struct ExportSettingsFacts: Codable, Sendable {
     /// file — the other half of that write; `unavailable` when none were checked, the table unreadable, or the
     /// dialog was never observed. A row that refused to uncheck stays visible as checked in `formats`.
     var formatsUncheckedByApp: Fact<[String]> = .unavailable
+    /// The transport Cycle state proven before the bounce dialog opened ("Off" — Cycle constrains Logic's bounce to
+    /// the cycle section, so this is what makes the bounce range the whole project); `unavailable` when no Cycle
+    /// control could be read, or for the track export, which Cycle does not affect.
+    var cycle: Fact<String> = .unavailable
+    /// The value Cycle showed BEFORE the app switched it off — the third deliberate write; `unavailable` when Cycle
+    /// was already off, unreadable, or never had to be touched.
+    var cycleSwitchedFrom: Fact<String> = .unavailable
     init(settings: ExportDialogSettings) {
         format = settings.format.map { .known($0, source: "export dialog format pop-up") } ?? .unavailable
         bitDepth = settings.bitDepth.map { .known($0, source: "export dialog bit-depth pop-up") } ?? .unavailable
@@ -61,8 +68,10 @@ struct ExportSettingsFacts: Codable, Sendable {
         formats = settings.formats.map { .known($0, source: "bounce dialog format table") } ?? .unavailable
         pcmFormatCheckedByApp = settings.pcmFormatCheckedByApp.map { .known($0, source: "bounce dialog format table row the app checked") } ?? .unavailable
         formatsUncheckedByApp = settings.formatsUncheckedByApp.map { .known($0, source: "bounce dialog format table rows the app unchecked") } ?? .unavailable
+        cycle = settings.cycle.map { .known($0, source: "Logic transport Cycle control, read before the bounce dialog opened") } ?? .unavailable
+        cycleSwitchedFrom = settings.cycleSwitchedFrom.map { .known($0, source: "Logic transport Cycle control before the app switched it off") } ?? .unavailable
     }
-    enum CodingKeys: String, CodingKey { case format, bitDepth, normalize, normalizeSwitchedFrom, formats, pcmFormatCheckedByApp, formatsUncheckedByApp }
+    enum CodingKeys: String, CodingKey { case format, bitDepth, normalize, normalizeSwitchedFrom, formats, pcmFormatCheckedByApp, formatsUncheckedByApp, cycle, cycleSwitchedFrom }
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         format = try container.decode(Fact<String>.self, forKey: .format)
@@ -72,6 +81,8 @@ struct ExportSettingsFacts: Codable, Sendable {
         formats = try container.decodeIfPresent(Fact<[FormatSelection]>.self, forKey: .formats) ?? .unavailable
         pcmFormatCheckedByApp = try container.decodeIfPresent(Fact<String>.self, forKey: .pcmFormatCheckedByApp) ?? .unavailable
         formatsUncheckedByApp = try container.decodeIfPresent(Fact<[String]>.self, forKey: .formatsUncheckedByApp) ?? .unavailable
+        cycle = try container.decodeIfPresent(Fact<String>.self, forKey: .cycle) ?? .unavailable
+        cycleSwitchedFrom = try container.decodeIfPresent(Fact<String>.self, forKey: .cycleSwitchedFrom) ?? .unavailable
     }
 }
 
@@ -104,13 +115,36 @@ struct MixBounceAsset: Codable, Sendable {
     }
 }
 
+extension MixBounceAsset {
+    /// Proof that a bounce covers only part of the project: its audible content ends before the longest exported
+    /// track's audible content. Exports preserve timeline positions, so the missing span is missing project —
+    /// exactly what a cycle range, a region selection or a manual Start/End range produces.
+    struct BounceTruncation: Sendable, Equatable { var mixContentEnd: Double; var trackName: String; var trackContentEnd: Double }
+    /// Compares audible content, never file length: trailing measured silence (a file that ran past its material,
+    /// e.g. to the project end marker) is excluded on both sides via the silence map, so a padded file neither
+    /// accuses nor excuses anything. Nil when no exported track has a known duration or the bounce spans the
+    /// material — absence of proof never fails a bounce. Pure and testable.
+    static func provenTruncation(mix: MixBounceAsset, against assets: [AudioAsset]) -> BounceTruncation? {
+        guard let mixDuration = mix.durationSeconds.value else { return nil }
+        func contentEnd(duration: Double, metrics: AudioMetrics?) -> Double {
+            guard let silence = metrics?.silenceIntervals.value else { return duration }
+            return AudioMetrics.contentEndSeconds(duration: duration, silence: silence)
+        }
+        let trackEnds = assets.compactMap { asset in asset.durationSeconds.value.map { (name: asset.trackName.value ?? asset.logicalTrackID, end: contentEnd(duration: $0, metrics: asset.metrics)) } }
+        guard let longest = trackEnds.max(by: { $0.end < $1.end }) else { return nil }
+        let mixEnd = contentEnd(duration: mixDuration, metrics: mix.metrics)
+        guard mixEnd + 0.5 < longest.end else { return nil }
+        return BounceTruncation(mixContentEnd: mixEnd, trackName: longest.name, trackContentEnd: longest.end)
+    }
+}
+
 extension [FormatSelection] {
     /// One human- and LLM-readable line for a read format table: every row with its own checked state, facts only.
     var caption: String { map { "\($0.name): \($0.enabled ? "checked" : "unchecked")" }.joined(separator: " · ") }
 }
 
 struct AudioManifest: Codable, Sendable {
-    var schemaVersion = "1.6"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
+    var schemaVersion = "1.7"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
     /// Nil when this session never observed Logic's export dialog (manual export, or the app was restarted since).
     var exportSettings: ExportSettingsFacts?
     /// The bounced Stereo Out mix; nil when no bounce file exists — its absence is stated, never papered over.
@@ -137,6 +171,7 @@ extension AudioManifest {
         }
         if let mix {
             out += ["- Mix (Stereo Out): \(mix.relativePath) — the bounced sum through the master chain; per-track WAVs do not contain it."]
+            if let from = mix.bounceSettings?.cycleSwitchedFrom.value { out += ["- Logic's transport Cycle showed \u{201C}\(from)\u{201D} before the bounce; the app switched it Off (and verified) before opening the bounce dialog, so the whole project was bounced rather than the cycle section."] }
             if let from = mix.bounceSettings?.normalizeSwitchedFrom.value { out += ["- Bounce dialog Normalize showed \u{201C}\(from)\u{201D}; the app switched it to Off (and verified the switch) before the bounce, so the mix level was not rewritten."] }
             if let row = mix.bounceSettings?.pcmFormatCheckedByApp.value { out += ["- The bounce dialog opened with no uncompressed PCM format checked; the app checked \u{201C}\(row)\u{201D} (and verified the check) before the bounce, so a real PCM mix file was written."] }
             if let rows = mix.bounceSettings?.formatsUncheckedByApp.value { out += ["- The bounce dialog also had \(rows.map { "\u{201C}\($0)\u{201D}" }.joined(separator: ", ")) checked; the app unchecked \(rows.count == 1 ? "it" : "them") (and verified) before the bounce, so exactly one PCM mix file was written."] }
