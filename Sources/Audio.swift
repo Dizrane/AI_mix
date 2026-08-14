@@ -34,10 +34,14 @@ struct AudioExtractionSummary: Codable, Sendable { var logicTracks: Int; var aud
 /// The export dialog's level-affecting settings as facts: `known` only when the automation really read the control off
 /// Logic's own dialog when it launched the export, `unavailable` when the dialog did not expose it — or when the WAVs
 /// were exported outside this app session, where nothing about the dialog was observed at all. Normalize is the one
-/// that decides whether the files are level evidence: any known value other than Off cancels the export up front, so
-/// a recorded value is either "Off" or honestly missing.
+/// that decides whether the files are level evidence: any known value other than Off is switched to Off by the app
+/// itself before exporting (a switch that fails cancels the export up front), so a recorded value is either "Off" or
+/// honestly missing — and `normalizeSwitchedFrom` records the value the dialog showed before the app switched it.
 struct ExportSettingsFacts: Codable, Sendable {
     var format: Fact<String>; var bitDepth: Fact<String>; var normalize: Fact<String>
+    /// The value Normalize showed BEFORE the app switched it to Off — the one deliberate dialog write the automation
+    /// performs; `unavailable` when Normalize was already Off, unreadable, or the dialog was never observed.
+    var normalizeSwitchedFrom: Fact<String> = .unavailable
     /// The bounce dialog's format table (which format checkboxes were checked when the bounce was launched); the track
     /// export dialog has a single format pop-up instead, so there this fact is honestly `unavailable`.
     var formats: Fact<[FormatSelection]> = .unavailable
@@ -45,14 +49,16 @@ struct ExportSettingsFacts: Codable, Sendable {
         format = settings.format.map { .known($0, source: "export dialog format pop-up") } ?? .unavailable
         bitDepth = settings.bitDepth.map { .known($0, source: "export dialog bit-depth pop-up") } ?? .unavailable
         normalize = settings.normalize.map { .known($0, source: "export dialog Normalize control") } ?? .unavailable
+        normalizeSwitchedFrom = settings.normalizeSwitchedFrom.map { .known($0, source: "export dialog Normalize control before the app switched it to Off") } ?? .unavailable
         formats = settings.formats.map { .known($0, source: "bounce dialog format table") } ?? .unavailable
     }
-    enum CodingKeys: String, CodingKey { case format, bitDepth, normalize, formats }
+    enum CodingKeys: String, CodingKey { case format, bitDepth, normalize, normalizeSwitchedFrom, formats }
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         format = try container.decode(Fact<String>.self, forKey: .format)
         bitDepth = try container.decode(Fact<String>.self, forKey: .bitDepth)
         normalize = try container.decode(Fact<String>.self, forKey: .normalize)
+        normalizeSwitchedFrom = try container.decodeIfPresent(Fact<String>.self, forKey: .normalizeSwitchedFrom) ?? .unavailable
         formats = try container.decodeIfPresent(Fact<[FormatSelection]>.self, forKey: .formats) ?? .unavailable
     }
 }
@@ -92,7 +98,7 @@ extension [FormatSelection] {
 }
 
 struct AudioManifest: Codable, Sendable {
-    var schemaVersion = "1.4"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
+    var schemaVersion = "1.5"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
     /// Nil when this session never observed Logic's export dialog (manual export, or the app was restarted since).
     var exportSettings: ExportSettingsFacts?
     /// The bounced Stereo Out mix; nil when no bounce file exists — its absence is stated, never papered over.
@@ -112,12 +118,14 @@ extension AudioManifest {
         func setting(_ fact: Fact<String>) -> String { fact.value ?? fact.state.rawValue }
         if let s = exportSettings {
             out += ["- Export dialog settings (read from Logic's own dialog when the export was launched): Format \(setting(s.format)) · Bit depth \(setting(s.bitDepth)) · Normalize \(setting(s.normalize))"]
+            if let from = s.normalizeSwitchedFrom.value { out += ["- Normalize showed \u{201C}\(from)\u{201D} when the dialog opened; the app switched it to Off (and verified the switch) before the export, so the levels were not rewritten."] }
             if s.normalize.value == nil { out += ["- Normalize could not be read from the dialog, so whether the exported levels were rewritten is unverified — treat relative loudness between the WAVs with care unless the user confirms Normalize was Off."] }
         } else {
             out += ["- Export dialog settings: unavailable — this session did not observe Logic's export dialog, so whether Normalize altered the exported levels is unverified."]
         }
         if let mix {
             out += ["- Mix (Stereo Out): \(mix.relativePath) — the bounced sum through the master chain; per-track WAVs do not contain it."]
+            if let from = mix.bounceSettings?.normalizeSwitchedFrom.value { out += ["- Bounce dialog Normalize showed \u{201C}\(from)\u{201D}; the app switched it to Off (and verified the switch) before the bounce, so the mix level was not rewritten."] }
             if let formats = mix.bounceSettings?.formats.value { out += ["- Bounce dialog formats (read from Logic's own format table when the bounce was launched): \(formats.caption)"] }
         } else {
             out += ["- Mix (Stereo Out): none — no bounced mix file exists, so the sum (overall loudness, balance, masking) is not part of this delivery."]

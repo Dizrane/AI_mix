@@ -435,7 +435,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.12`"))
+    #expect(md.contains("Package schema: `2.13`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -539,7 +539,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 @Test func manifestRecordsExportDialogSettingsAsFacts() throws {
     let settings = ExportSettingsFacts(settings: ExportDialogSettings(format: "WAVE", bitDepth: "24 Bit", normalize: "Off"))
     let manifest = AudioManifest(assets: extractAudio(audioSnapshot()), exportSettings: settings)
-    #expect(manifest.schemaVersion == "1.4")
+    #expect(manifest.schemaVersion == "1.5")
     let md = manifest.markdown()
     #expect(md.contains("Format WAVE · Bit depth 24 Bit · Normalize Off"))
     #expect(!md.contains("unverified")) // a proven Off needs no caveat
@@ -718,6 +718,50 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     let raw = audioSnapshot()
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw), mix: mix)
     #expect(md.contains("- Bounce dialog formats (read from Logic's own format table; a bounce with no uncompressed PCM format checked is cancelled): known: PCM: checked · MP3: unchecked"))
+}
+
+// MARK: - Normalize switched to Off by the app (the one deliberate dialog write)
+
+/// The pop-up's "Off" item is matched by strict trimmed case-insensitive equality: Logic's Normalize menu is
+/// Off / On / Overload Protection Only, and nothing but the literal Off item may ever be pressed.
+@Test func normalizeOffMenuItemIsMatchedStrictly() {
+    #expect(LogicExportAutomator.offMenuItemIndex(["On", "Off", "Overload Protection Only"]) == 1)
+    #expect(LogicExportAutomator.offMenuItemIndex(["ON", " off ", "Overload Protection Only"]) == 1) // case and whitespace never hide the item
+    #expect(LogicExportAutomator.offMenuItemIndex(["Offset", "On"]) == nil) // containing the letters is not being the item
+    #expect(LogicExportAutomator.offMenuItemIndex([]) == nil)
+}
+@Test func normalizeSwitchIsRecordedAsAFactAndSurvivesJSON() throws {
+    let settings = ExportSettingsFacts(settings: ExportDialogSettings(format: "WAVE", bitDepth: "24 Bit", normalize: "Off", normalizeSwitchedFrom: "On"))
+    #expect(settings.normalizeSwitchedFrom.state == .known)
+    #expect(settings.normalizeSwitchedFrom.value == "On")
+    #expect(settings.normalizeSwitchedFrom.source == "export dialog Normalize control before the app switched it to Off")
+    // A dialog that already showed Off keeps the fact honestly unavailable — nothing was switched.
+    #expect(ExportSettingsFacts(settings: ExportDialogSettings(format: "WAVE", bitDepth: "24 Bit", normalize: "Off")).normalizeSwitchedFrom.state == .unavailable)
+    // Round trip, and a manifest written before schema 1.5 (no normalizeSwitchedFrom key) still decodes.
+    let back = try JSONDecoder().decode(ExportSettingsFacts.self, from: JSONEncoder().encode(settings))
+    #expect(back.normalizeSwitchedFrom.value == "On")
+    let legacy = #"{"format":{"state":"known","value":"WAVE"},"bitDepth":{"state":"unavailable"},"normalize":{"state":"known","value":"Off"}}"#
+    #expect(try JSONDecoder().decode(ExportSettingsFacts.self, from: Data(legacy.utf8)).normalizeSwitchedFrom.state == .unavailable)
+}
+@Test func manifestAndPackageStateTheNormalizeSwitch() throws {
+    let switched = ExportSettingsFacts(settings: ExportDialogSettings(format: "WAVE", bitDepth: "24 Bit", normalize: "Off", normalizeSwitchedFrom: "Overload Protection Only"))
+    let manifest = AudioManifest(assets: extractAudio(audioSnapshot()), exportSettings: switched)
+    #expect(manifest.markdown().contains("Normalize showed \u{201C}Overload Protection Only\u{201D} when the dialog opened; the app switched it to Off"))
+    let raw = audioSnapshot()
+    let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw), exportSettings: switched)
+    #expect(md.contains("- Normalize showed \u{201C}Overload Protection Only\u{201D} when the dialog opened; the app switched it to Off and verified the switch before exporting."))
+    // The bounce side: the switched fact travels with the mix's own bounce settings.
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try writeWAV(dir.appendingPathComponent("Mix.wav"), channels: 2)
+    let mix = MixBounceAsset.resolve(in: dir, settings: ExportSettingsFacts(settings: ExportDialogSettings(format: nil, bitDepth: nil, normalize: "Off", normalizeSwitchedFrom: "On")))
+    let mixMD = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw), mix: mix)
+    #expect(mixMD.contains("- Normalize showed \u{201C}On\u{201D} when the dialog opened; the app switched it to Off and verified the switch before the bounce."))
+    #expect(AudioManifest(assets: extractAudio(audioSnapshot()), mix: mix).markdown().contains("Bounce dialog Normalize showed \u{201C}On\u{201D}; the app switched it to Off"))
+    // An export whose dialog already showed Off carries no switch note anywhere.
+    let untouched = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw), exportSettings: ExportSettingsFacts(settings: ExportDialogSettings(format: "WAVE", bitDepth: "24 Bit", normalize: "Off")))
+    #expect(!untouched.contains("the app switched it to Off"))
 }
 
 // MARK: - Project window selection (dialogs never impersonate the project)
@@ -910,7 +954,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.12`"))
+    #expect(md.contains("Package schema: `2.13`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
