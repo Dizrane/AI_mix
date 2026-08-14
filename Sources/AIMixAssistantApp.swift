@@ -119,7 +119,7 @@ struct SettingsView: View {
             }
             Spacer()
         }
-        .padding(24).frame(width: 500, height: 610)
+        .padding(24).frame(width: 500, height: 640)
         .confirmationDialog("Clear Temporary Project Files?", isPresented: $confirmingClear, titleVisibility: .visible) {
             Button("Clear Data", role: .destructive) { model.clearProjectData() }
             Button("Cancel", role: .cancel) {}
