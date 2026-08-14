@@ -435,7 +435,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.9`"))
+    #expect(md.contains("Package schema: `2.10`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -523,6 +523,54 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     if case .repaired = TranslocationRepair.dequarantineOriginal() { Issue.record("dequarantine must refuse when the app is not translocated") }
 }
 
+
+// MARK: - Export dialog settings (level-preservation evidence)
+
+/// Only the literal "Off" leaves the exported levels untouched: "On" always rewrites gain, "Overload Protection Only"
+/// rewrites it whenever anything peaks over full scale. An unreadable caption is nil — no verdict, never a guess.
+@Test func normalizeOffIsTheOnlyEvidencePreservingSetting() {
+    #expect(LogicExportAutomator.normalizeBlocksExport("Off") == false)
+    #expect(LogicExportAutomator.normalizeBlocksExport("off") == false)
+    #expect(LogicExportAutomator.normalizeBlocksExport("On") == true)
+    #expect(LogicExportAutomator.normalizeBlocksExport("Overload Protection Only") == true)
+    #expect(LogicExportAutomator.normalizeBlocksExport(nil) == nil)
+    #expect(LogicExportAutomator.normalizeBlocksExport("   ") == nil)
+}
+@Test func manifestRecordsExportDialogSettingsAsFacts() throws {
+    let settings = ExportSettingsFacts(settings: ExportDialogSettings(format: "WAVE", bitDepth: "24 Bit", normalize: "Off"))
+    let manifest = AudioManifest(assets: extractAudio(audioSnapshot()), exportSettings: settings)
+    #expect(manifest.schemaVersion == "1.2")
+    let md = manifest.markdown()
+    #expect(md.contains("Format WAVE · Bit depth 24 Bit · Normalize Off"))
+    #expect(!md.contains("unverified")) // a proven Off needs no caveat
+    let back = try JSONDecoder().decode(AudioManifest.self, from: JSONEncoder().encode(manifest))
+    #expect(back.exportSettings?.normalize.value == "Off")
+    #expect(back.exportSettings?.normalize.state == .known)
+}
+@Test func manifestWithoutObservedDialogSaysSoInsteadOfAssumingSafety() {
+    let md = AudioManifest(assets: extractAudio(audioSnapshot())).markdown()
+    #expect(md.contains("Export dialog settings: unavailable"))
+    #expect(md.contains("unverified"))
+}
+@Test func unreadNormalizeStaysUnavailableWithACaveat() {
+    let settings = ExportSettingsFacts(settings: ExportDialogSettings(format: "WAVE", bitDepth: nil, normalize: nil))
+    #expect(settings.normalize.state == .unavailable); #expect(settings.bitDepth.state == .unavailable)
+    let md = AudioManifest(assets: extractAudio(audioSnapshot()), exportSettings: settings).markdown()
+    #expect(md.contains("Normalize unavailable"))
+    #expect(md.contains("Normalize could not be read"))
+}
+@Test func packageRendersExportSettingsAndHonestAbsence() {
+    let raw = audioSnapshot()
+    let settings = ExportSettingsFacts(settings: ExportDialogSettings(format: "WAVE", bitDepth: "24 Bit", normalize: "Off"))
+    let with = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw), exportSettings: settings)
+    #expect(with.contains("Export dialog format: known: WAVE"))
+    #expect(with.contains("Export dialog bit depth: known: 24 Bit"))
+    #expect(with.contains("Export dialog Normalize: known: Off"))
+    #expect(with.contains("the WAVs carry the project's real relative levels"))
+    let without = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw))
+    #expect(without.contains("Export dialog settings: unavailable"))
+    #expect(without.contains("whether Normalize altered the exported levels is unverified"))
+}
 // MARK: - Export clipboard preservation
 
 @Test func exportClipboardSnapshotRoundTripsEveryRepresentation() {
@@ -681,7 +729,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.9`"))
+    #expect(md.contains("Package schema: `2.10`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))

@@ -8,8 +8,8 @@ enum PackageDelivery: Sendable { case markdownOnly, fullPackage }
 
 /// Provider-neutral export of normalized, evidence-based DAW facts for any external LLM.
 struct AIPackageGenerator: Sendable {
-    static let schemaVersion = "2.9"
-    func make(snapshot: NormalizedSnapshot, sessionID: String, audio: [AudioAsset] = [], plugins: [PluginInventoryItem] = [], probes: [ProbeType] = ProbeType.allCases, delivery: PackageDelivery = .fullPackage) -> String {
+    static let schemaVersion = "2.10"
+    func make(snapshot: NormalizedSnapshot, sessionID: String, audio: [AudioAsset] = [], plugins: [PluginInventoryItem] = [], probes: [ProbeType] = ProbeType.allCases, delivery: PackageDelivery = .fullPackage, exportSettings: ExportSettingsFacts? = nil) -> String {
         let readiness = PackageReadiness.evaluate(snapshot: snapshot, assets: audio)
         var out: [String] = []
         out += ["# AI Mix Analysis", ""]
@@ -20,7 +20,7 @@ struct AIPackageGenerator: Sendable {
         out += readinessSection(readiness)
         out += trackLinkingSection(snapshot)
         out += signalFlowSection(snapshot)
-        out += audioAssetsSection(audio, delivery: delivery)
+        out += audioAssetsSection(audio, delivery: delivery, exportSettings: exportSettings)
         out += provenanceSection(audio)
         out += missingAudioSection(audio)
         out += pluginSections(plugins)
@@ -130,11 +130,20 @@ struct AIPackageGenerator: Sendable {
         return out
     }
     /// Exact provenance mapping audioID → logicalTrackID → Logic track/regions. The program does not interpret the audio; roles (lead/double/backing/beat/…) are for the LLM and user to decide by listening.
-    private func audioAssetsSection(_ assets: [AudioAsset], delivery: PackageDelivery) -> [String] {
+    private func audioAssetsSection(_ assets: [AudioAsset], delivery: PackageDelivery, exportSettings: ExportSettingsFacts?) -> [String] {
         var out: [String] = ["", "## Audio Assets", "", "Export unit is one WAV per Logic AUDIO track (Aux, Bus, Master, Output and other channel-only objects are not audio assets and have no WAV). The exported WAV represents the whole track on the project timeline (positions and gaps preserved), and every region of that track lives inside it — regions are named here as provenance only and are never separate files. Each exported asset carries DSP metrics measured locally from that exact file. This section carries no musical interpretation.", "", "Logic exposes region positions only as zoom-relative pixel coordinates, never as time, so they are not published as timing" + (delivery == .fullPackage ? " (the raw pixel values stay in `audio_manifest.json`)" : "") + ": they cannot be converted to seconds and would invite false conclusions. The silence map in each asset's metrics is the real timing evidence, measured from the WAV itself."]
         if assets.isEmpty { out += ["", "- No audio assets prepared. Run Prepare Audio Export after a read-only analysis."]; return out }
         let regionTotal = assets.reduce(0) { $0 + $1.regions.count }
         out += ["", "- Logic audio tracks: \(assets.count) • Audio regions: \(regionTotal) • Assets (WAV targets): \(assets.count)", "- Exported: \(assets.filter { $0.status == .exported }.count) • Requires user export: \(assets.filter { $0.status == .requiresUserExport }.count) • Failed: \(assets.filter { $0.status == .failed }.count)"]
+        // Whether the WAVs are level evidence hinges on Logic's export Normalize: the automation reads the dialog's own
+        // controls and cancels any export whose Normalize is not Off, so a known value here is always level-preserving.
+        // An export the app did not launch (or observe) is stated as exactly that — never assumed to have been safe.
+        if let s = exportSettings {
+            out += [fact("Export dialog format", s.format), fact("Export dialog bit depth", s.bitDepth), fact("Export dialog Normalize", s.normalize)]
+            out += s.normalize.value.map { ["- Normalize was read as \($0) off Logic's own export dialog (any other value cancels the export), so the WAVs carry the project's real relative levels."] } ?? ["- Normalize was not readable on the dialog, so whether the exported levels were rewritten is unverified — treat relative loudness between the WAVs with care."]
+        } else {
+            out += ["- Export dialog settings: unavailable — this session did not observe Logic's export dialog (the WAVs were exported manually, or the app was restarted since), so whether Normalize altered the exported levels is unverified."]
+        }
         out += technicalFaultsDigest(assets)
         for asset in assets {
             out += ["", "### Audio Asset \(asset.audioID)", "- logicalTrackID: known: \(asset.logicalTrackID)", "- Logic Track Name: \(render(asset.trackName))", "- WAV file: \(render(asset.actualExportedPath))", "- Expected export path: known: \(asset.expectedExportPath)", "- Status: known: \(asset.status.rawValue)"]

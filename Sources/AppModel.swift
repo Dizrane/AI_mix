@@ -21,6 +21,9 @@ struct ApplicationLauncher: Sendable {
     @Published var stage: WorkflowStage = .connection
     @Published var raw: RawSnapshot?; @Published var normalized: NormalizedSnapshot?; @Published var aiPackage = ""; @Published var aiPackageURL: URL?; @Published var aiPackageStatus = ""; @Published var planText = ""; @Published var validated: [ValidatedCommand] = []; @Published var analyzerState: AnalyzerVisualState = .ready; @Published var log: [String] = []; @Published var audioAssets: [AudioAsset] = []; @Published var audioStatus = ""; @Published var exportPhase: AudioExportPhase = .idle; @Published var showExportConfirm = false; private var analysisSessionID = "unsaved_session"
     @Published var availablePlugins: [PluginInventoryItem] = []
+    /// The export dialog settings read when THIS session launched Logic's export; nil when no export was launched (or observed) —
+    /// the manifests and the AI package then say so instead of assuming the WAVs were exported level-preserving.
+    @Published var exportSettings: ExportSettingsFacts?
     let analyzer: any DAWAnalyzer = LogicAccessibilityAnalyzer(); let normalizer = SnapshotNormalizer(); let validator = CommandValidator(); let audioExtractor = AudioAssetExtractor(); let metricsAnalyzer = AudioMetricsAnalyzer(); let exporter = LogicExportAutomator(); let pluginInventory = PluginInventory(); private var store: SessionStore?
     /// Metrics of already-analyzed WAVs keyed by absolute path; entries are reused only while the file's size and modification date match, so Refresh Export Status never re-analyzes unchanged files.
     private var metricsCache: [String: AudioMetrics] = [:]
@@ -171,7 +174,7 @@ struct ApplicationLauncher: Sendable {
             do {
                 try await store.resetForNewAnalysis()
                 analysisSessionID = "analysis_\(ISO8601DateFormatter().string(from: Date()))"
-                raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil; metricsCache = [:]
+                raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil; metricsCache = [:]; exportSettings = nil
                 log.append("Previous AI Mix Assistant analysis data removed. Starting a clean read-only scan.")
                 let exporter = exporter
                 let mixerOutcome = await Task.detached(priority: .userInitiated) { exporter.ensureMixerVisible() }.value
@@ -206,7 +209,7 @@ struct ApplicationLauncher: Sendable {
     @Published var packageFolderURL: URL?; @Published var packageZipURL: URL?
     var packageReadiness: PackageReadiness { PackageReadiness.evaluate(snapshot: normalized, assets: audioAssets) }
     func ensurePluginInventory() { if availablePlugins.isEmpty { availablePlugins = pluginInventory.discoverAvailable() } }
-    func generateAIPackage() { guard let snapshot = normalized else { aiPackageStatus = "Run a full analysis first."; return }; ensurePluginInventory(); aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: audioAssets, plugins: availablePlugins, delivery: .markdownOnly); let r = packageReadiness; aiPackageStatus = "AI package generated (\(r.overall.rawValue)) · \(availablePlugins.count) plugins available." + (r.audioTotal > 0 && r.audioExported < r.audioTotal ? " Audio incomplete: \(r.audioTotal - r.audioExported) WAV missing." : "") }
+    func generateAIPackage() { guard let snapshot = normalized else { aiPackageStatus = "Run a full analysis first."; return }; ensurePluginInventory(); aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: audioAssets, plugins: availablePlugins, delivery: .markdownOnly, exportSettings: exportSettings); let r = packageReadiness; aiPackageStatus = "AI package generated (\(r.overall.rawValue)) · \(availablePlugins.count) plugins available." + (r.audioTotal > 0 && r.audioExported < r.audioTotal ? " Audio incomplete: \(r.audioTotal - r.audioExported) WAV missing." : "") }
     func savePackage() {
         guard let snapshot = normalized, let raw, let store else { aiPackageStatus = "Run a full analysis first."; return }
         ensurePluginInventory()
@@ -219,9 +222,9 @@ struct ApplicationLauncher: Sendable {
             audioAssets = freshAssets
             // Two readers, two deliveries: the folder/ZIP ships the JSON and WAVs next to the document, while the on-screen text is
             // what "Copy for AI" puts on the clipboard — Markdown alone, so it must say so instead of pointing at files.
-            let markdown = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .fullPackage)
-            aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .markdownOnly)
-            let audioManifest = AudioManifest(assets: freshAssets); let packageManifest = PackageManifest(project: project, assets: freshAssets)
+            let markdown = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .fullPackage, exportSettings: exportSettings)
+            aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .markdownOnly, exportSettings: exportSettings)
+            let audioManifest = AudioManifest(assets: freshAssets, exportSettings: exportSettings); let packageManifest = PackageManifest(project: project, assets: freshAssets)
             let expected = freshAssets.filter { $0.status == .exported }.count
             do {
                 let result = try await store.savePackage(projectName: project, markdown: markdown, snapshot: snapshot, audioManifest: audioManifest, packageManifest: packageManifest, assets: freshAssets, audioExtractor: audioExtractor, probe: AudioFileProbe())
@@ -259,7 +262,7 @@ struct ApplicationLauncher: Sendable {
                 try await store.resetForNewAnalysis()
                 raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""
                 planText = ""; validated = []; planStatus = ""
-                audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; metricsCache = [:]
+                audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; metricsCache = [:]; exportSettings = nil
                 packageFolderURL = nil; packageZipURL = nil
                 analyzerState = .ready; log = []; analysisSessionID = "unsaved_session"
                 stage = .connection; refreshConnection()
@@ -279,7 +282,7 @@ struct ApplicationLauncher: Sendable {
             let audioDir = await store.folderURL("audio")
             let assets = await analyzedAssets(raw: raw, normalized: normalized, audioDir: audioDir)
             audioAssets = assets
-            let manifest = AudioManifest(assets: assets); let s = manifest.summary
+            let manifest = AudioManifest(assets: assets, exportSettings: exportSettings); let s = manifest.summary
             do {
                 _ = try await store.save(manifest, folder: "metadata", name: "audio_manifest.json")
                 _ = try await store.saveText(manifest.markdown(), folder: "metadata", name: "AUDIO_ASSETS.md")
@@ -301,7 +304,7 @@ struct ApplicationLauncher: Sendable {
         metricsCache = refreshedCache
         return assets
     }
-    func copyAudioManifest() { guard !audioAssets.isEmpty else { audioStatus = "Prepare track export first."; return }; NSPasteboard.general.clearContents(); NSPasteboard.general.setString(AudioManifest(assets: audioAssets).markdown(), forType: .string); audioStatus = "Audio manifest copied (Markdown) — paste it to your LLM with the WAV files." }
+    func copyAudioManifest() { guard !audioAssets.isEmpty else { audioStatus = "Prepare track export first."; return }; NSPasteboard.general.clearContents(); NSPasteboard.general.setString(AudioManifest(assets: audioAssets, exportSettings: exportSettings).markdown(), forType: .string); audioStatus = "Audio manifest copied (Markdown) — paste it to your LLM with the WAV files." }
 
     /// Preconditions + confirmation before launching Logic's native export. Never fakes success.
     func requestExport() {
@@ -333,9 +336,14 @@ struct ApplicationLauncher: Sendable {
                 audioStatus = "Logic export dialog could not be automated at ‘\(step)’: \(detail) You can finish Logic's dialog manually into the audio folder, then Refresh Export Status."
                 log.append("Logic export dialog automation failed at \(step): \(detail)")
                 await pollForExports(audioDir: audioDir) // still detect if the user completes it manually
-            case .exported(let item, let format):
+            case .blockedByNormalize(let value):
+                exportPhase = .failed("normalize")
+                audioStatus = "Export stopped: Logic's export dialog has Normalize set to ‘\(value)’, which would rewrite the exported levels and falsify the relative-loudness evidence. Set Normalize to Off in File ▸ Export ▸ All Tracks as Audio Files… once, then export again."
+                log.append("Logic export blocked: Normalize is ‘\(value)’, not Off — the dialog was cancelled and nothing was exported.")
+            case .exported(let item, let format, let settings):
+                exportSettings = ExportSettingsFacts(settings: settings)
                 audioStatus = "Logic is exporting via ‘\(item)’ (\(format)). Detecting files…"
-                log.append("Logic export launched via \(item), format=\(format).")
+                log.append("Logic export launched via \(item), format=\(format), bit depth=\(settings.bitDepth ?? "unread"), normalize=\(settings.normalize ?? "unread").")
                 await pollForExports(audioDir: audioDir)
             }
         }
@@ -372,7 +380,7 @@ struct ApplicationLauncher: Sendable {
         // really exist now, and DSP metrics are computed here, from those final stable files, never from mid-write intermediates.
         let finalAssets = await analyzedAssets(raw: raw, normalized: normalized, audioDir: audioDir)
         audioAssets = finalAssets
-        let manifest = AudioManifest(assets: finalAssets); let summary = manifest.summary
+        let manifest = AudioManifest(assets: finalAssets, exportSettings: exportSettings); let summary = manifest.summary
         _ = try? await store.save(manifest, folder: "metadata", name: "audio_manifest.json")
         _ = try? await store.saveText(manifest.markdown(), folder: "metadata", name: "AUDIO_ASSETS.md")
         if !aiPackage.isEmpty { generateAIPackage() }

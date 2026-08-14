@@ -31,10 +31,27 @@ struct AudioAsset: Codable, Identifiable, Sendable {
 
 struct AudioExtractionSummary: Codable, Sendable { var logicTracks: Int; var audioRegions: Int; var assets: Int; var exported: Int; var requiresUserExport: Int; var failed: Int }
 
+/// The export dialog's level-affecting settings as facts: `known` only when the automation really read the control off
+/// Logic's own dialog when it launched the export, `unavailable` when the dialog did not expose it — or when the WAVs
+/// were exported outside this app session, where nothing about the dialog was observed at all. Normalize is the one
+/// that decides whether the files are level evidence: any known value other than Off cancels the export up front, so
+/// a recorded value is either "Off" or honestly missing.
+struct ExportSettingsFacts: Codable, Sendable {
+    var format: Fact<String>; var bitDepth: Fact<String>; var normalize: Fact<String>
+    init(settings: ExportDialogSettings) {
+        format = settings.format.map { .known($0, source: "export dialog format pop-up") } ?? .unavailable
+        bitDepth = settings.bitDepth.map { .known($0, source: "export dialog bit-depth pop-up") } ?? .unavailable
+        normalize = settings.normalize.map { .known($0, source: "export dialog Normalize control") } ?? .unavailable
+    }
+}
+
 struct AudioManifest: Codable, Sendable {
-    var schemaVersion = "1.1"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
-    init(assets: [AudioAsset]) {
+    var schemaVersion = "1.2"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
+    /// Nil when this session never observed Logic's export dialog (manual export, or the app was restarted since).
+    var exportSettings: ExportSettingsFacts?
+    init(assets: [AudioAsset], exportSettings: ExportSettingsFacts? = nil) {
         self.assets = assets
+        self.exportSettings = exportSettings
         self.summary = AudioExtractionSummary(logicTracks: assets.count, audioRegions: assets.reduce(0) { $0 + $1.regions.count }, assets: assets.count, exported: assets.filter { $0.status == .exported }.count, requiresUserExport: assets.filter { $0.status == .requiresUserExport }.count, failed: assets.filter { $0.status == .failed }.count)
     }
 }
@@ -43,6 +60,13 @@ extension AudioManifest {
     /// Compact, human- and LLM-readable Markdown for "Copy Audio Manifest". Facts only — no musical interpretation.
     func markdown() -> String {
         var out = ["# AUDIO ASSETS", "", "One WAV per Logic track. Track names are the user's own Logic names (facts). Region lists are provenance only. This file carries no musical interpretation — roles (lead/double/backing/beat/…) are for you to decide by listening.", "", "- Tracks: \(summary.assets) · Exported: \(summary.exported) · Requires export: \(summary.requiresUserExport)\(summary.failed > 0 ? " · Failed: \(summary.failed)" : "")"]
+        func setting(_ fact: Fact<String>) -> String { fact.value ?? fact.state.rawValue }
+        if let s = exportSettings {
+            out += ["- Export dialog settings (read from Logic's own dialog when the export was launched): Format \(setting(s.format)) · Bit depth \(setting(s.bitDepth)) · Normalize \(setting(s.normalize))"]
+            if s.normalize.value == nil { out += ["- Normalize could not be read from the dialog, so whether the exported levels were rewritten is unverified — treat relative loudness between the WAVs with care unless the user confirms Normalize was Off."] }
+        } else {
+            out += ["- Export dialog settings: unavailable — this session did not observe Logic's export dialog, so whether Normalize altered the exported levels is unverified."]
+        }
         for asset in assets {
             out += ["", "## \(asset.audioID)", "", "- Logic Track: \(asset.trackName.value ?? "unknown")", "- logicalTrackID: \(asset.logicalTrackID)", "- WAV: \(asset.actualExportedPath.value ?? asset.expectedExportPath)", "- Status: \(asset.status.rawValue)", "- Regions: \(asset.regionCount)"]
         }
