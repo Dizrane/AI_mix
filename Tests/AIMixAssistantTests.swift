@@ -512,7 +512,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.19`"))
+    #expect(md.contains("Package schema: `2.20`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -590,6 +590,60 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     var retargeted = plan
     retargeted.actions = plan.actions.map { action in var a = action; a.target.trackID = "channel_aux_1"; return a }
     #expect(CommandValidator().validate(retargeted, against: fixture()).allSatisfy { $0.status == .valid })
+}
+/// `parameters.current` mismatches are transcription errors: the values sit scattered across long per-track sections, so
+/// the model retypes them wrong and the validator rejects the plan. The package must collect them into one table the model
+/// copies from, rendering every state honestly — a track without a linked channel strip shows `unavailable`, never a guess.
+@Test func packageCollectsCurrentControlValuesIntoOneTable() {
+    var snapshot = fixture()
+    snapshot.tracks.append(TrackFacts(logicalTrackID: "track_9", name: .known("Vox"), type: .unavailable, matchStatus: .unresolved, axPaths: .init(header: "ax.header", channel: nil), header: nil, channel: nil))
+    let md = AIPackageGenerator().make(snapshot: snapshot, sessionID: "t")
+    #expect(md.contains("## Current control values (source for `parameters.current`)"))
+    #expect(md.contains("| logicalTrackID | Logic track name | Volume (dB) | Pan | Mute | Solo |"))
+    #expect(md.contains("| `channel_aux_1` | \u{201C}Aux 1\u{201D} | -2 | 0 | false | false |"))
+    #expect(md.contains("| `track_9` | \u{201C}Vox\u{201D} | unavailable | unavailable | unavailable | unavailable |"))
+    #expect(md.contains("copied exactly from the Current control values table above")) // the schema points at the table
+}
+/// The plan's composition needs rules, not only its JSON shape: every reported ISSUE must be traceable into an action, a
+/// MANUAL STEPS item or an explicit "left as is because…", and `set_solo` — a monitoring control — must not appear in a
+/// delivered plan uninvited. Without these rules the answer is valid JSON that is still not a usable instruction sheet.
+@Test func packageStatesPlanCompositionRules() {
+    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t")
+    #expect(md.contains("Plan composition rules:"))
+    #expect(md.contains("Account for every ISSUE"))
+    #expect(md.contains("no `set_solo` action unless the user explicitly asked"))
+}
+/// The golden path between stage 4 and stage 5: a reply written exactly as the generated package instructs — prose around
+/// a `MIX PLAN` fenced JSON block plus MANUAL STEPS, with `current` copied from the package's own table — pastes into the
+/// Review screen and validates clean against the same snapshot the package was generated from. If the document's teaching
+/// and the validator ever drift apart, this test names the drift before a user's paste does.
+@Test func stageFourPackageFeedsStageFiveValidatorEndToEnd() throws {
+    let snapshot = fixture()
+    let md = AIPackageGenerator().make(snapshot: snapshot, sessionID: "t")
+    #expect(md.contains("| `channel_aux_1` | \u{201C}Aux 1\u{201D} | -2 | 0 | false | false |")) // the reply below copies current from this row
+    let reply = """
+    MIX PLAN
+
+    ```json
+    {
+      "version": "1.0",
+      "status": "ready",
+      "actions": [
+        { "id": "action_001", "target": { "trackID": "channel_aux_1" }, "action": "set_volume", "parameters": { "value": -4.5, "current": -2.0, "delta": -2.5 }, "reason": "Volume is known -2 dB; the target -4.5 dB moves the track down 2.5 dB because its measured RMS sits above the mix bed." },
+        { "id": "action_002", "target": { "trackID": "channel_aux_1" }, "action": "set_pan", "parameters": { "value": -20, "current": 0, "delta": -20 }, "reason": "Pan is known 0 (centre); the target -20 moves the track left to clear the centre for the lead." },
+        { "id": "action_003", "target": { "trackID": "channel_aux_1" }, "action": "set_mute", "parameters": { "value": false }, "reason": "Mute is known false and stays false; the track remains audible in the mix." }
+      ]
+    }
+    ```
+
+    MANUAL STEPS
+
+    1. Insert Pro-Q 4 on \u{201C}Aux 1\u{201D} (channel_aux_1) and cut 3 dB around 250 Hz — the low-mid share dominates the measured spectrum.
+    """
+    let plan = try JSONDecoder().decode(MixPlan.self, from: Data(MixPlan.extractJSON(from: reply).utf8))
+    let validated = CommandValidator().validate(plan, against: snapshot)
+    #expect(validated.count == 3)
+    #expect(validated.allSatisfy { $0.status == .valid }, "\(validated.map { "\($0.id): \($0.status.rawValue) — \($0.message)" })")
 }
 /// The AX meter section is empty by nature (Logic publishes no numeric meters), and next to per-file LUFS/peak numbers a bare
 /// "LUFS: unavailable" reads as "no loudness data at all". It says which kind of reading it is and where the real numbers are.
@@ -1235,7 +1289,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.19`"))
+    #expect(md.contains("Package schema: `2.20`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
