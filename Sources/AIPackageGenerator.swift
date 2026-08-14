@@ -8,7 +8,7 @@ enum PackageDelivery: Sendable { case markdownOnly, fullPackage }
 
 /// Provider-neutral export of normalized, evidence-based DAW facts for any external LLM.
 struct AIPackageGenerator: Sendable {
-    static let schemaVersion = "2.15"
+    static let schemaVersion = "2.16"
     func make(snapshot: NormalizedSnapshot, sessionID: String, audio: [AudioAsset] = [], plugins: [PluginInventoryItem] = [], probes: [ProbeType] = ProbeType.allCases, delivery: PackageDelivery = .fullPackage, exportSettings: ExportSettingsFacts? = nil, mix: MixBounceAsset? = nil) -> String {
         let readiness = PackageReadiness.evaluate(snapshot: snapshot, assets: audio)
         var out: [String] = []
@@ -135,7 +135,7 @@ struct AIPackageGenerator: Sendable {
     }
     /// Exact provenance mapping audioID → logicalTrackID → Logic track/regions. The program does not interpret the audio; roles (lead/double/backing/beat/…) are for the LLM and user to decide by listening.
     private func audioAssetsSection(_ assets: [AudioAsset], delivery: PackageDelivery, exportSettings: ExportSettingsFacts?, mix: MixBounceAsset?) -> [String] {
-        var out: [String] = ["", "## Audio Assets", "", "Export unit is one WAV per Logic AUDIO track (Aux, Bus, Master, Output and other channel-only objects are not audio assets and have no WAV). The exported WAV represents the whole track on the project timeline (positions and gaps preserved), and every region of that track lives inside it — regions are named here as provenance only and are never separate files. Each exported asset carries DSP metrics measured locally from that exact file. This section carries no musical interpretation.", "", "Logic exposes region positions only as zoom-relative pixel coordinates, never as time, so they are not published as timing" + (delivery == .fullPackage ? " (the raw pixel values stay in `audio_manifest.json`)" : "") + ": they cannot be converted to seconds and would invite false conclusions. The silence map in each asset's metrics is the real timing evidence, measured from the WAV itself."]
+        var out: [String] = ["", "## Audio Assets", "", "Export unit is one WAV per Logic AUDIO track (Aux, Bus, Master, Output and other channel-only objects are not audio assets and have no WAV). The exported WAV represents the whole track on the project timeline (positions and gaps preserved), and every region of that track lives inside it — regions are named here as provenance only and are never separate files. Each exported asset carries DSP metrics measured locally from that exact file. This section carries no musical interpretation.", "", "Logic exposes region positions only as zoom-relative pixel coordinates, never as time, so they are not published as timing" + (delivery == .fullPackage ? " (the raw pixel values stay in `audio_manifest.json`)" : "") + ": they cannot be converted to seconds and would invite false conclusions. The silence map in each asset's metrics is the real timing evidence, measured from the WAV itself. A file may also run past its material — Logic can export or bounce beyond the last region, e.g. to the project end marker — so a measured silent range reaching the file's end is named per asset as trailing silence, and every duration comparison in this document uses the audible content, never the file length."]
         if assets.isEmpty { out += ["", "- No audio assets prepared. Run Prepare Audio Export after a read-only analysis."]; return out }
         let regionTotal = assets.reduce(0) { $0 + $1.regions.count }
         out += ["", "- Logic audio tracks: \(assets.count) • Audio regions: \(regionTotal) • Assets (WAV targets): \(assets.count)", "- Exported: \(assets.filter { $0.status == .exported }.count) • Requires user export: \(assets.filter { $0.status == .requiresUserExport }.count) • Failed: \(assets.filter { $0.status == .failed }.count)"]
@@ -156,6 +156,7 @@ struct AIPackageGenerator: Sendable {
             if let reason = asset.statusReason { out += ["- Status note: \(reason)"] }
             out += ["- Duration: \(render(asset.durationSeconds, unit: " s"))", "- Sample rate: \(render(asset.sampleRate, unit: " Hz"))", "- Channels: \(render(asset.channels))", "- Bit depth: \(render(asset.bitDepth))", "- Format: \(render(asset.format))"]
             out += metricsLines(asset.metrics)
+            out += trailingSilenceLine(duration: asset.durationSeconds.value, metrics: asset.metrics, subject: "the track's material")
             out += ["- Regions (\(asset.regionCount)): " + (asset.regions.isEmpty ? "unavailable: no regions captured" : asset.regions.map { "`\($0.regionID)` \u{201C}\($0.name.value ?? "unnamed")\u{201D}" }.joined(separator: ", "))]
         }
         return out
@@ -181,14 +182,18 @@ struct AIPackageGenerator: Sendable {
             out += ["- Bounce dialog settings: unavailable — this session did not observe Logic's bounce dialog for this file, so whether Normalize altered its level is unverified."]
         }
         out += mix.metrics == nil ? ["- Audio metrics: unavailable — the file could not be analyzed"] : metricsLines(mix.metrics)
-        // Exports preserve timeline positions, so a bounce shorter than the longest exported track PROVABLY does not
-        // cover the whole project (a cycle range or a partial bounce) — mix and per-track metrics then span different
-        // time windows, and the document must say so instead of presenting the mix as the reference of the full song.
-        if let mixDuration = mix.durationSeconds.value, let longest = assets.compactMap({ asset in asset.durationSeconds.value.map { (name: asset.trackName.value ?? asset.logicalTrackID, seconds: $0) } }).max(by: { $0.seconds < $1.seconds }) {
-            if mixDuration + 0.5 < longest.seconds {
-                out += ["- Duration check: the bounce is \(decimalString(mixDuration)) s while the longest exported track \u{201C}\(longest.name)\u{201D} is \(decimalString(longest.seconds)) s — exports preserve timeline positions, so the bounce demonstrably does NOT cover the whole project (a cycle range or a partial bounce was active). Its metrics describe only the bounced span; comparisons against per-track metrics cross different time windows — name this under ISSUES instead of treating the mix as the full-song reference."]
+        out += trailingSilenceLine(duration: mix.durationSeconds.value, metrics: mix.metrics, subject: "the mix's material")
+        // Exports preserve timeline positions, so a bounce whose audible content ends before the longest exported
+        // track's content PROVABLY does not cover the whole project (a cycle range or a partial bounce) — mix and
+        // per-track metrics then span different time windows, and the document must say so instead of presenting the
+        // mix as the reference of the full song. Both sides are compared by measured content, never file length: an
+        // export or bounce that ran past the material into silence does not stretch the project it is compared to.
+        if let mixDuration = mix.durationSeconds.value, let longest = assets.compactMap({ asset in asset.durationSeconds.value.map { (name: asset.trackName.value ?? asset.logicalTrackID, seconds: contentEnd(duration: $0, metrics: asset.metrics)) } }).max(by: { $0.seconds < $1.seconds }) {
+            let mixContent = contentEnd(duration: mixDuration, metrics: mix.metrics)
+            if mixContent + 0.5 < longest.seconds {
+                out += ["- Duration check: the bounce's audible content ends at \(decimalString(mixContent)) s while the longest exported track's content (\u{201C}\(longest.name)\u{201D}) ends at \(decimalString(longest.seconds)) s — exports preserve timeline positions and trailing measured silence is excluded on both sides, so the bounce demonstrably does NOT cover the whole project (a cycle range or a partial bounce was active). Its metrics describe only the bounced span; comparisons against per-track metrics cross different time windows — name this under ISSUES instead of treating the mix as the full-song reference."]
             } else {
-                out += ["- Duration check: the bounce (\(decimalString(mixDuration)) s) spans at least the longest exported track (\(decimalString(longest.seconds)) s)."]
+                out += ["- Duration check: the bounce's audible content (\(decimalString(mixContent)) s) spans at least the longest exported track's content (\(decimalString(longest.seconds)) s); trailing measured silence is excluded on both sides, so a file that ran past its material does not distort this check."]
             }
         }
         if delivery == .fullPackage { out += ["", "Listen to this file (`" + mix.relativePath + "`) first for the overall picture, then to the per-track WAVs in `audio/`, and cross-check what you hear against the measured metrics."] }
@@ -234,6 +239,21 @@ struct AIPackageGenerator: Sendable {
         let scope = "Technical faults measured from the exported files" + (mixMeasured ? " and the bounced mix" : "")
         if faults.isEmpty { return ["", scope + ": none — no digital clipping, no true peak above 0 dBTP, no notable DC offset."] }
         return ["", scope + " (full numbers under each asset" + (mixMeasured ? " and under Mix (Stereo Out)" : "") + "):", ""] + faults
+    }
+    /// The end of the audible material, from the measured silence map; the file length when no metrics or no trailing
+    /// silent range prove otherwise. All duration comparisons in the document go through this, never raw file length.
+    private func contentEnd(duration: Double, metrics: AudioMetrics?) -> Double {
+        guard let silence = metrics?.silenceIntervals.value else { return duration }
+        return AudioMetrics.contentEndSeconds(duration: duration, silence: silence)
+    }
+    /// One honest line naming a file that provably runs past its material: the export/bounce wrote measured silence to
+    /// the file's end (Logic can run to the project end marker), so the file length overstates the content. Silent
+    /// tails of a second or less are ordinary release/reverb room and are not called out.
+    private func trailingSilenceLine(duration: Double?, metrics: AudioMetrics?, subject: String) -> [String] {
+        guard let duration, let silence = metrics?.silenceIntervals.value else { return [] }
+        let end = AudioMetrics.contentEndSeconds(duration: duration, silence: silence)
+        guard duration - end > 1.0 else { return [] }
+        return ["- Trailing silence: known: the audible content ends at \(decimalString(end)) s and the remaining \(decimalString(duration - end)) s to the file's end are measured silence — the file ran past \(subject), so its length overstates the content. Duration comparisons in this document already exclude this tail."]
     }
     private func metric(_ label: String, _ value: Fact<Double>, digits: Int, unit: String) -> String { guard let number = value.value else { return "  - \(label): \(value.state.rawValue)" }; return "  - \(label): known: \(rounded(number, digits: digits))\(unit)" }
     /// A value that rounds to zero prints as zero: "-0.0 dBTP" reads like a measurement error rather than a peak just under full scale.

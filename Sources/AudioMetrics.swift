@@ -54,6 +54,17 @@ struct AudioMetrics: Codable, Sendable {
     var analyzedFileModifiedAt: Date
 }
 
+extension AudioMetrics {
+    /// Where the audible material ends, derived from the measured silence map: a silent range that runs to the file's
+    /// end is trailing padding, not content — Logic's export and bounce can run past the last region (e.g. to the
+    /// project end marker), and the file length then overstates the material. Returns the full duration when the map
+    /// proves no trailing silent range; a fully silent file has its content end at 0. Pure and testable.
+    static func contentEndSeconds(duration: Double, silence: [SilenceInterval]) -> Double {
+        guard let last = silence.last, last.end >= duration - 0.2 else { return duration }
+        return last.start
+    }
+}
+
 // MARK: - Analyzer
 
 /// Local, read-only DSP analysis of an exported WAV. Opens the file via AVAudioFile for reading only and never
