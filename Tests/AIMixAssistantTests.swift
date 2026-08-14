@@ -467,7 +467,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.15`"))
+    #expect(md.contains("Package schema: `2.16`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -700,8 +700,9 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(md.contains("- Mix (Stereo Out) `mix/Mix.wav`:"))
     #expect(md.contains("faults of the finished sum itself"))
 }
-/// Exports preserve timeline positions, so a bounce shorter than the longest exported track PROVABLY does not cover
-/// the whole project; the package must state that instead of presenting the mix as the full-song reference.
+/// Exports preserve timeline positions, so a bounce whose audible content ends before the longest exported track's
+/// content PROVABLY does not cover the whole project; the package must state that instead of presenting the mix as
+/// the full-song reference.
 @Test func bounceShorterThanTheLongestTrackIsFlagged() throws {
     let audioDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
     let mixDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
@@ -709,15 +710,40 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     try FileManager.default.createDirectory(at: mixDir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: audioDir); try? FileManager.default.removeItem(at: mixDir) }
     try writeWAV(audioDir.appendingPathComponent("audio_track_001.wav"), seconds: 5)
-    try writeWAV(mixDir.appendingPathComponent("Mix.wav"), seconds: 1, channels: 2)
+    try writeFloatWAV(mixDir.appendingPathComponent("Mix.wav"), channels: [sineSamples(1000, amplitude: 0.5, seconds: 1)])
     let raw = audioSnapshot()
     let short = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw, dir: audioDir), mix: MixBounceAsset.resolve(in: mixDir, settings: nil))
     #expect(short.contains("demonstrably does NOT cover the whole project"))
     #expect(!short.contains("spans at least the longest exported track"))
-    try writeWAV(mixDir.appendingPathComponent("Mix.wav"), seconds: 6, channels: 2)
+    try FileManager.default.removeItem(at: mixDir.appendingPathComponent("Mix.wav"))
+    try writeFloatWAV(mixDir.appendingPathComponent("Mix.wav"), channels: [sineSamples(1000, amplitude: 0.5, seconds: 6)])
     let full = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw, dir: audioDir), mix: MixBounceAsset.resolve(in: mixDir, settings: nil))
     #expect(full.contains("spans at least the longest exported track"))
     #expect(!full.contains("demonstrably does NOT cover"))
+}
+/// The measured silence map separates material from padding: a trailing silent range means the file ran past its
+/// content (Logic can export/bounce to the project end marker) — the package names it, and every duration comparison
+/// uses the audible content, so a padded track export does not stretch the project the bounce is checked against.
+@Test func trailingSilenceIsNamedAndExcludedFromTheDurationCheck() throws {
+    #expect(AudioMetrics.contentEndSeconds(duration: 10, silence: [SilenceInterval(start: 2, end: 10)]) == 2)
+    #expect(AudioMetrics.contentEndSeconds(duration: 10, silence: [SilenceInterval(start: 2, end: 5)]) == 10) // mid-file silence is content structure, not padding
+    #expect(AudioMetrics.contentEndSeconds(duration: 10, silence: []) == 10)
+    #expect(AudioMetrics.contentEndSeconds(duration: 10, silence: [SilenceInterval(start: 0, end: 10)]) == 0)
+    let audioDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    let mixDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: mixDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: audioDir); try? FileManager.default.removeItem(at: mixDir) }
+    // The track's file is 10 s but its material ends at 2 s — the export ran 8 s past the beat.
+    try writeFloatWAV(audioDir.appendingPathComponent("audio_track_001.wav"), channels: [sineSamples(1000, amplitude: 0.5, seconds: 2) + [Float](repeating: 0, count: 8 * 48000)])
+    try writeFloatWAV(mixDir.appendingPathComponent("Mix.wav"), channels: [sineSamples(1000, amplitude: 0.5, seconds: 2.2)])
+    let raw = audioSnapshot()
+    let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: audioDir), audioDirectory: audioDir, cache: [:])
+    let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets, mix: MixBounceAsset.resolve(in: mixDir, settings: nil))
+    #expect(md.contains("- Trailing silence: known: the audible content ends at 2 s"))
+    #expect(md.contains("so its length overstates the content"))
+    #expect(md.contains("spans at least the longest exported track's content")) // 2.2 s of mix content covers 2 s of track content…
+    #expect(!md.contains("demonstrably does NOT cover")) // …even though the padded track FILE is 10 s long
 }
 
 // MARK: - Export dialog controls matched by row geometry
@@ -1086,7 +1112,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.15`"))
+    #expect(md.contains("Package schema: `2.16`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
