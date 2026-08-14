@@ -5,9 +5,20 @@ import CoreGraphics
 
 /// Outcome of the full one-click export. Never claims files were written — that is verified separately from disk.
 enum ExportOutcome: Sendable {
-    case exported(item: String, format: String)          // menu launched, destination set, Export pressed
+    case exported(item: String, format: String, settings: ExportDialogSettings) // menu launched, destination set, Export pressed
+    case blockedByNormalize(value: String)               // dialog read, Normalize would rewrite levels — cancelled, nothing exported
     case triggerFailed(step: String, detail: String)     // could not launch the export menu item
     case navigationFailed(step: String, detail: String)  // dialog opened but destination/confirm could not be driven
+}
+
+/// The level-affecting settings Logic's export dialog showed when the export was launched, read from the dialog's own
+/// labelled controls before Export is pressed. Each value is the control's own caption; a control the dialog does not
+/// expose stays nil — the setting is then honestly unknown, never assumed. The automation only READS these controls
+/// (the contract of never changing Logic's export settings stands); a harmful value cancels the export instead.
+struct ExportDialogSettings: Sendable, Equatable, Codable {
+    var format: String?
+    var bitDepth: String?
+    var normalize: String?
 }
 
 /// Result of just launching Logic's native export (kept for compatibility / diagnostics).
@@ -22,7 +33,9 @@ enum MixerEnsureOutcome: Sendable { case alreadyVisible, opened(item: String), f
 /// filename pattern "Track Name", and buttons "Cancel"/"Export"). It ONLY: presses menu items, posts the
 /// standard file-panel keys (⌘⇧G to go-to-folder, ⌘V to paste the destination, Return to accept) and presses
 /// the "Export" button. It never changes volume/pan/mute/solo/plug-ins/sends/routing/automation/regions or
-/// project/export settings (format, bit depth, normalize are left at Logic's defaults).
+/// project/export settings (format, bit depth, normalize are left exactly as the dialog shows them). The dialog's
+/// level-affecting settings ARE read as facts, and a Normalize other than Off cancels the export: normalized WAVs
+/// would silently falsify every relative-level fact the exported files are supposed to prove.
 struct LogicExportAutomator: Sendable {
     private let supportedBundleIDs: Set<String> = ["com.apple.logic10", "com.apple.mobilelogic"]
     /// Shown when a top-level menu title does not match: the automation relies on English menu names by design.
@@ -44,7 +57,14 @@ struct LogicExportAutomator: Sendable {
         case .pressed(let title): item = title
         }
         guard let dialog = waitForExportDialog(appElement, timeout: 8) else { return .navigationFailed(step: "export_dialog", detail: "Export dialog did not appear after launching \u{2018}\(item)\u{2019}.") }
-        let format = firstDescendant(dialog) { self.role($0) == "AXPopUpButton" && (self.string($0, kAXValueAttribute) ?? "").uppercased().contains("WAV") }.flatMap { self.string($0, kAXValueAttribute) } ?? "unknown"
+        // Read the dialog's level-affecting settings first: a Normalize other than Off would rewrite the exported
+        // levels, so the export is cancelled (Escape closes the dialog this automation opened) before anything else.
+        let settings = dialogSettings(dialog)
+        if let normalize = settings.normalize, Self.normalizeBlocksExport(normalize) == true {
+            for _ in 0..<3 where findExportDialog(appElement) != nil { postKey(53, [], to: pid); usleep(350_000) }
+            return .blockedByNormalize(value: normalize)
+        }
+        let format = settings.format ?? "unknown"
 
         // Destination via the standard Go-to-Folder field (AX-set is ignored by the panel, so paste real text).
         // The user's clipboard is snapshotted completely first — every item with all its representations, not just plain
@@ -64,7 +84,33 @@ struct LogicExportAutomator: Sendable {
         guard whereValue == destination.lastPathComponent else { return .navigationFailed(step: "navigate", detail: "Destination not confirmed (Where=\(whereValue ?? "?"), expected \(destination.lastPathComponent)); not exporting to avoid a wrong folder.") }
         guard let exportButton = firstDescendant(confirmed, { self.role($0) == "AXButton" && self.string($0, kAXTitleAttribute) == "Export" }) else { return .navigationFailed(step: "export_button", detail: "Export button not found on the dialog.") }
         guard press(exportButton) else { return .navigationFailed(step: "press_export", detail: "AXPress on the Export button did not succeed.") }
-        return .exported(item: item, format: format)
+        return .exported(item: item, format: format, settings: settings)
+    }
+
+    /// Only the literal "Off" preserves the files' real levels: "On" always rewrites gain and "Overload Protection Only"
+    /// rewrites it whenever anything peaks over full scale — either way the exported WAVs stop being evidence of the
+    /// project's relative loudness. Nil means the caption could not be read at all: the caller proceeds and the manifest
+    /// records the setting as unavailable instead of pretending it was checked.
+    static func normalizeBlocksExport(_ caption: String?) -> Bool? {
+        guard let caption = caption?.trimmingCharacters(in: .whitespacesAndNewlines), !caption.isEmpty else { return nil }
+        return caption.localizedCaseInsensitiveCompare("off") != .orderedSame
+    }
+
+    /// Reads the export dialog's own labelled settings controls. Labels come from each control's AXTitle (the same
+    /// mechanism the destination check uses on the "Where:" pop-up); the format pop-up keeps a value-based fallback
+    /// ("WAVE") for a dialog variant that does not title it. A control found nowhere yields nil — never a guess.
+    private func dialogSettings(_ dialog: AXUIElement) -> ExportDialogSettings {
+        func labelled(_ needle: String, roles: Set<String>) -> AXUIElement? {
+            firstDescendant(dialog) { roles.contains(self.role($0)) && (self.string($0, kAXTitleAttribute) ?? "").localizedCaseInsensitiveContains(needle) }
+        }
+        let formatControl = labelled("format", roles: ["AXPopUpButton"]) ?? firstDescendant(dialog) { self.role($0) == "AXPopUpButton" && (self.string($0, kAXValueAttribute) ?? "").uppercased().contains("WAV") }
+        var normalize: String? = nil
+        if let control = labelled("normalize", roles: ["AXPopUpButton", "AXCheckBox"]) {
+            let value = string(control, kAXValueAttribute)
+            // A checkbox exposes a switch position, and here the caption of that position is documented by the control itself: 1 is On, 0 is Off.
+            normalize = role(control) == "AXCheckBox" ? value.flatMap { $0 == "1" ? "On" : ($0 == "0" ? "Off" : nil) } : value
+        }
+        return ExportDialogSettings(format: formatControl.flatMap { self.string($0, kAXValueAttribute) }, bitDepth: labelled("bit depth", roles: ["AXPopUpButton"]).flatMap { self.string($0, kAXValueAttribute) }, normalize: normalize)
     }
 
     /// Makes Logic's Mixer visible before analysis, because channel strips carry the richest AX facts. Reads the View menu:
