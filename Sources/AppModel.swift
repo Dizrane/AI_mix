@@ -442,6 +442,9 @@ struct ApplicationLauncher: Sendable {
             case .bounced(let item, let settings):
                 if let from = settings.normalizeSwitchedFrom { log.append("Logic's bounce dialog had Normalize set to ‘\(from)’ — the app switched it to Off before bouncing, so the file keeps the mix's real level.") }
                 if let row = settings.pcmFormatCheckedByApp { log.append("Logic's bounce dialog had no uncompressed PCM format checked — the app checked ‘\(row)’ before bouncing, so a real PCM mix file is written.") }
+                if let rows = settings.formatsUncheckedByApp { log.append("Logic's bounce dialog also had \(rows.joined(separator: ", ")) checked — the app unchecked \(rows.count == 1 ? "it" : "them") before bouncing, so exactly one PCM mix file is written.") }
+                let leftover = LogicExportAutomator.nonPCMChecked(settings.formats)
+                if !leftover.isEmpty { log.append("Note: \(leftover.joined(separator: ", ")) stayed checked in the bounce dialog (unchecking did not stick) — Logic writes that extra file too; the mix detection ignores it.") }
                 mixStatus = "Logic is bouncing via ‘\(item)’. Waiting for the file…"
                 log.append("Logic bounce launched via \(item), format=\(settings.format ?? "unread"), normalize=\(settings.normalize ?? "unread").")
                 await pollForMixBounce(mixDir: mixDir, settings: ExportSettingsFacts(settings: settings))

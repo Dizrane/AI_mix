@@ -380,7 +380,7 @@ struct AudioScreen: View {
                     Button("Bounce Mix from Logic", action: model.requestMixBounce).disabled(model.normalized == nil || model.mixPhase == .exporting || model.exportPhase == .exporting)
                     Button("Open Mix Folder", action: model.openMixFolder).disabled(model.mixAsset == nil)
                 }
-                Text("Bounces the whole project through the master chain via Logic's own File \u{25B8} Bounce dialog into the app's mix folder, then measures the file. The sum is the reference for overall loudness and balance — per-track WAVs never contain it, so the AI Package stage opens only after both the track export and this bounce are done. Only two settings are ever corrected automatically: a level-rewriting Normalize is switched to Off, and an unchecked PCM (Uncompressed) format is checked; everything else is read as facts.").font(.caption).foregroundStyle(.secondary)
+                Text("Bounces the whole project through the master chain via Logic's own File \u{25B8} Bounce dialog into the app's mix folder, then measures the file. The sum is the reference for overall loudness and balance — per-track WAVs never contain it, so the AI Package stage opens only after both the track export and this bounce are done. Only two settings are ever corrected automatically: a level-rewriting Normalize is switched to Off, and the format table is set to PCM (Uncompressed) alone — compressed formats are unchecked; everything else is read as facts.").font(.caption).foregroundStyle(.secondary)
             }
             StageFooter(title: "Continue to AI Package", enabled: model.isAvailable(.aiPackage)) { model.go(to: .aiPackage) }
         }
@@ -392,7 +392,7 @@ struct AudioScreen: View {
         .confirmationDialog("Bounce the mix from Logic Pro?", isPresented: $model.showBounceConfirm, titleVisibility: .visible) {
             Button("Bounce") { model.confirmMixBounce() }
             Button("Cancel", role: .cancel) {}
-        } message: { Text("Logic Pro will bounce the whole project (Stereo Out) using its own File \u{25B8} Bounce dialog. AI Mix Assistant drives that dialog into its mix folder automatically — don't touch Logic until the bounce starts. A realtime bounce plays the song once; only a level-rewriting Normalize is switched to Off and an unchecked PCM (Uncompressed) format is checked, nothing else is changed, and your clipboard is restored afterwards.") }
+        } message: { Text("Logic Pro will bounce the whole project (Stereo Out) using its own File \u{25B8} Bounce dialog. AI Mix Assistant drives that dialog into its mix folder automatically — don't touch Logic until the bounce starts. A realtime bounce plays the song once; only a level-rewriting Normalize is switched to Off and the format table is set to PCM (Uncompressed) alone, nothing else is changed, and your clipboard is restored afterwards.") }
     }
     private var exportIndicator: (IndicatorState, String) {
         switch model.exportPhase { case .idle: return (.idle, "Ready"); case .exporting: return (.warn, "Exporting\u{2026}"); case .done: return (.ok, "Exported"); case .failed(let step): return (.error, "Failed: \(step)") }

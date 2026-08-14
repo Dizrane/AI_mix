@@ -718,10 +718,10 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(AudioManifest(assets: extractAudio(audioSnapshot()), mix: mix).markdown().contains("PCM: checked · MP3: unchecked"))
     let raw = audioSnapshot()
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw), mix: mix)
-    #expect(md.contains("- Bounce dialog formats (read from Logic's own format table; the app checks the PCM row itself when none is checked, and cancels only when that check fails): known: PCM: checked · MP3: unchecked"))
+    #expect(md.contains("- Bounce dialog formats (read from Logic's own format table; the app sets the table to uncompressed PCM alone, cancelling only when checking the PCM row fails): known: PCM: checked · MP3: unchecked"))
 }
 
-// MARK: - PCM format checked by the app (the second deliberate dialog write)
+// MARK: - Format table set to PCM alone by the app (the second deliberate dialog write)
 
 /// Only a row whose caption names the WAV/AIFF-family PCM grammar may ever be pressed: the current dialog titles it
 /// "Uncompressed", older ones "PCM", and no compressed or unrelated row ("MP3", "M4A: AAC", "Burn to CD / DVD")
@@ -732,32 +732,52 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(LogicExportAutomator.pcmRowIndex(["MP3", "M4A: AAC", "Burn to CD / DVD"]) == nil)
     #expect(LogicExportAutomator.pcmRowIndex([]) == nil)
 }
-@Test func pcmCheckIsRecordedAsAFactAndSurvivesJSON() throws {
-    let settings = ExportSettingsFacts(settings: ExportDialogSettings(format: nil, bitDepth: nil, normalize: "Off", formats: [FormatSelection(name: "Uncompressed", enabled: true), FormatSelection(name: "MP3", enabled: true)], pcmFormatCheckedByApp: "Uncompressed"))
+/// The complement of the PCM grammar: every CHECKED row that is not uncompressed PCM would make the bounce write an
+/// extra lossy file, so those rows are what the automation unchecks — unchecked rows and the PCM row never qualify.
+@Test func nonPCMCheckedNamesExactlyTheCheckedCompressedRows() {
+    #expect(LogicExportAutomator.nonPCMChecked([FormatSelection(name: "Uncompressed", enabled: true), FormatSelection(name: "MP3", enabled: true), FormatSelection(name: "M4A: AAC", enabled: false)]) == ["MP3"])
+    #expect(LogicExportAutomator.nonPCMChecked([FormatSelection(name: "PCM", enabled: true), FormatSelection(name: "MP3", enabled: false)]) == [])
+    #expect(LogicExportAutomator.nonPCMChecked([FormatSelection(name: "MP3", enabled: true), FormatSelection(name: "M4A: AAC", enabled: true)]) == ["MP3", "M4A: AAC"])
+    #expect(LogicExportAutomator.nonPCMChecked(nil) == [])
+}
+@Test func pcmCheckAndUnchecksAreRecordedAsFactsAndSurviveJSON() throws {
+    let settings = ExportSettingsFacts(settings: ExportDialogSettings(format: nil, bitDepth: nil, normalize: "Off", formats: [FormatSelection(name: "Uncompressed", enabled: true), FormatSelection(name: "MP3", enabled: false)], pcmFormatCheckedByApp: "Uncompressed", formatsUncheckedByApp: ["MP3"]))
     #expect(settings.pcmFormatCheckedByApp.state == .known)
     #expect(settings.pcmFormatCheckedByApp.value == "Uncompressed")
     #expect(settings.pcmFormatCheckedByApp.source == "bounce dialog format table row the app checked")
-    // A dialog that already had PCM checked keeps the fact honestly unavailable — nothing was pressed.
-    #expect(ExportSettingsFacts(settings: ExportDialogSettings(format: nil, bitDepth: nil, normalize: "Off", formats: [FormatSelection(name: "PCM", enabled: true)])).pcmFormatCheckedByApp.state == .unavailable)
-    // Round trip, and a manifest written before schema 1.6 (no pcmFormatCheckedByApp key) still decodes.
+    #expect(settings.formatsUncheckedByApp.value == ["MP3"])
+    #expect(settings.formatsUncheckedByApp.source == "bounce dialog format table rows the app unchecked")
+    // A dialog that already showed PCM alone keeps both facts honestly unavailable — nothing was pressed.
+    let untouched = ExportSettingsFacts(settings: ExportDialogSettings(format: nil, bitDepth: nil, normalize: "Off", formats: [FormatSelection(name: "PCM", enabled: true)]))
+    #expect(untouched.pcmFormatCheckedByApp.state == .unavailable)
+    #expect(untouched.formatsUncheckedByApp.state == .unavailable)
+    // Round trip, and a manifest written before schema 1.6 (neither key) still decodes.
     let back = try JSONDecoder().decode(ExportSettingsFacts.self, from: JSONEncoder().encode(settings))
     #expect(back.pcmFormatCheckedByApp.value == "Uncompressed")
+    #expect(back.formatsUncheckedByApp.value == ["MP3"])
     let legacy = #"{"format":{"state":"known","value":"WAVE"},"bitDepth":{"state":"unavailable"},"normalize":{"state":"known","value":"Off"}}"#
-    #expect(try JSONDecoder().decode(ExportSettingsFacts.self, from: Data(legacy.utf8)).pcmFormatCheckedByApp.state == .unavailable)
+    let decoded = try JSONDecoder().decode(ExportSettingsFacts.self, from: Data(legacy.utf8))
+    #expect(decoded.pcmFormatCheckedByApp.state == .unavailable)
+    #expect(decoded.formatsUncheckedByApp.state == .unavailable)
 }
-@Test func manifestAndPackageStateThePCMCheck() throws {
+@Test func manifestAndPackageStateThePCMCheckAndTheUnchecks() throws {
     let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: dir) }
     try writeWAV(dir.appendingPathComponent("Mix.wav"), channels: 2)
-    let mix = MixBounceAsset.resolve(in: dir, settings: ExportSettingsFacts(settings: ExportDialogSettings(format: nil, bitDepth: nil, normalize: "Off", formats: [FormatSelection(name: "Uncompressed", enabled: true), FormatSelection(name: "MP3", enabled: true)], pcmFormatCheckedByApp: "Uncompressed")))
-    #expect(AudioManifest(assets: extractAudio(audioSnapshot()), mix: mix).markdown().contains("the app checked \u{201C}Uncompressed\u{201D} (and verified the check) before the bounce"))
+    let mix = MixBounceAsset.resolve(in: dir, settings: ExportSettingsFacts(settings: ExportDialogSettings(format: nil, bitDepth: nil, normalize: "Off", formats: [FormatSelection(name: "Uncompressed", enabled: true), FormatSelection(name: "MP3", enabled: false)], pcmFormatCheckedByApp: "Uncompressed", formatsUncheckedByApp: ["MP3"])))
+    let manifestMD = AudioManifest(assets: extractAudio(audioSnapshot()), mix: mix).markdown()
+    #expect(manifestMD.contains("the app checked \u{201C}Uncompressed\u{201D} (and verified the check) before the bounce"))
+    #expect(manifestMD.contains("The bounce dialog also had \u{201C}MP3\u{201D} checked; the app unchecked it (and verified) before the bounce"))
     let raw = audioSnapshot()
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw), mix: mix)
     #expect(md.contains("- The format table opened with no uncompressed PCM format checked; the app checked \u{201C}Uncompressed\u{201D} and verified the check before the bounce."))
-    // A bounce whose dialog already had PCM checked carries no check note anywhere.
+    #expect(md.contains("- The format table also had \u{201C}MP3\u{201D} checked; the app unchecked it and verified before the bounce, so exactly one PCM mix file was written."))
+    // A bounce whose dialog already showed PCM alone carries no check or uncheck note anywhere.
     let untouched = MixBounceAsset.resolve(in: dir, settings: ExportSettingsFacts(settings: ExportDialogSettings(format: nil, bitDepth: nil, normalize: "Off", formats: [FormatSelection(name: "PCM", enabled: true)])))
-    #expect(!AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw), mix: untouched).contains("the app checked"))
+    let untouchedMD = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw), mix: untouched)
+    #expect(!untouchedMD.contains("the app checked"))
+    #expect(!untouchedMD.contains("the app unchecked"))
 }
 
 // MARK: - Normalize switched to Off by the app (the one deliberate dialog write)
