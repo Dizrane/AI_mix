@@ -792,13 +792,10 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(!md.contains("demonstrably does NOT cover")) // …even though the padded track FILE is 10 s long
 }
 
-// MARK: - Bounce coverage (Cycle + truncation)
+// MARK: - Bounce coverage (Cycle)
 
 private func silenceMetricsFixture(silence: [SilenceInterval]) -> AudioMetrics {
     AudioMetrics(integratedLoudnessLUFS: .unavailable, truePeakDBTP: .unavailable, samplePeakDBFS: .unavailable, rmsDBFS: .unavailable, crestFactorDB: .unavailable, spectralBands: .unavailable, spectralCentroidHz: .unavailable, stereoCorrelation: .unavailable, midSideRatioDB: .unavailable, silenceIntervals: .known(silence), silencePercent: .unavailable, dcOffsetMean: .unavailable, clippedSampleCount: .unavailable, analyzedFileSize: 1, analyzedFileModifiedAt: Date(timeIntervalSince1970: 0))
-}
-private func exportedAssetFixture(_ name: String, duration: Double, silence: [SilenceInterval]? = nil) -> AudioAsset {
-    AudioAsset(audioID: name, logicalTrackID: name, trackName: .known(name), expectedExportPath: "audio/\(name).wav", actualExportedPath: .known("audio/\(name).wav"), sourceFile: .unavailable, status: .exported, statusReason: nil, regions: [], durationSeconds: .known(duration), sampleRate: .known(48000), channels: .known(2), bitDepth: .known(24), format: .known("PCM (integer)"), trackAXPath: nil, metrics: silence.map { silenceMetricsFixture(silence: $0) })
 }
 private func mixFixture(duration: Double, silence: [SilenceInterval]? = nil, settings: ExportSettingsFacts? = nil) -> MixBounceAsset {
     MixBounceAsset(relativePath: "mix/mix.wav", durationSeconds: .known(duration), sampleRate: .known(48000), channels: .known(2), bitDepth: .known(24), format: .known("PCM (integer)"), bounceSettings: settings, metrics: silence.map { silenceMetricsFixture(silence: $0) })
@@ -816,22 +813,6 @@ private func mixFixture(duration: Double, silence: [SilenceInterval]? = nil, set
     #expect(!LogicExportAutomator.isCycleCaption("Bicycle"))
     #expect(!LogicExportAutomator.isCycleCaption(""))
     #expect(!LogicExportAutomator.isCycleCaption(nil))
-}
-/// A bounce provably shorter than the project is rejected by measured audible content, never by file length: trailing
-/// measured silence is excluded on both sides, so a file that ran past its material neither accuses nor excuses anything.
-@Test func bounceTruncationIsProvenByAudibleContentNotFileLength() {
-    let tracks = [exportedAssetFixture("Beat", duration: 100), exportedAssetFixture("Vocal", duration: 60)]
-    let cut = MixBounceAsset.provenTruncation(mix: mixFixture(duration: 60), against: tracks)
-    #expect(cut == .init(mixContentEnd: 60, trackName: "Beat", trackContentEnd: 100))
-    // A track file padded with measured silence to 100 s carries only 60 s of material — it accuses nothing.
-    let padded = [exportedAssetFixture("Beat", duration: 100, silence: [SilenceInterval(start: 60, end: 100)])]
-    #expect(MixBounceAsset.provenTruncation(mix: mixFixture(duration: 60), against: padded) == nil)
-    // And a padded bounce is judged by its content: 100 s of file with material to 60 s covers a 60 s project…
-    #expect(MixBounceAsset.provenTruncation(mix: mixFixture(duration: 100, silence: [SilenceInterval(start: 60, end: 100)]), against: padded) == nil)
-    // …but material to 40 s does not, whatever the file length says.
-    #expect(MixBounceAsset.provenTruncation(mix: mixFixture(duration: 100, silence: [SilenceInterval(start: 40, end: 100)]), against: padded) != nil)
-    // No exported track with a known duration proves nothing — absence of proof never fails a bounce.
-    #expect(MixBounceAsset.provenTruncation(mix: mixFixture(duration: 10), against: []) == nil)
 }
 /// The Cycle facts travel like every other bounce fact: recorded with sources, rendered in the manifest, and an older
 /// manifest without the new keys still decodes with the facts honestly unavailable.

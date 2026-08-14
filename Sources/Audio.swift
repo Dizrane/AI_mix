@@ -115,29 +115,6 @@ struct MixBounceAsset: Codable, Sendable {
     }
 }
 
-extension MixBounceAsset {
-    /// Proof that a bounce covers only part of the project: its audible content ends before the longest exported
-    /// track's audible content. Exports preserve timeline positions, so the missing span is missing project —
-    /// exactly what a cycle range, a region selection or a manual Start/End range produces.
-    struct BounceTruncation: Sendable, Equatable { var mixContentEnd: Double; var trackName: String; var trackContentEnd: Double }
-    /// Compares audible content, never file length: trailing measured silence (a file that ran past its material,
-    /// e.g. to the project end marker) is excluded on both sides via the silence map, so a padded file neither
-    /// accuses nor excuses anything. Nil when no exported track has a known duration or the bounce spans the
-    /// material — absence of proof never fails a bounce. Pure and testable.
-    static func provenTruncation(mix: MixBounceAsset, against assets: [AudioAsset]) -> BounceTruncation? {
-        guard let mixDuration = mix.durationSeconds.value else { return nil }
-        func contentEnd(duration: Double, metrics: AudioMetrics?) -> Double {
-            guard let silence = metrics?.silenceIntervals.value else { return duration }
-            return AudioMetrics.contentEndSeconds(duration: duration, silence: silence)
-        }
-        let trackEnds = assets.compactMap { asset in asset.durationSeconds.value.map { (name: asset.trackName.value ?? asset.logicalTrackID, end: contentEnd(duration: $0, metrics: asset.metrics)) } }
-        guard let longest = trackEnds.max(by: { $0.end < $1.end }) else { return nil }
-        let mixEnd = contentEnd(duration: mixDuration, metrics: mix.metrics)
-        guard mixEnd + 0.5 < longest.end else { return nil }
-        return BounceTruncation(mixContentEnd: mixEnd, trackName: longest.name, trackContentEnd: longest.end)
-    }
-}
-
 extension [FormatSelection] {
     /// One human- and LLM-readable line for a read format table: every row with its own checked state, facts only.
     var caption: String { map { "\($0.name): \($0.enabled ? "checked" : "unchecked")" }.joined(separator: " · ") }
