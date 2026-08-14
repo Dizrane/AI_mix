@@ -17,18 +17,21 @@ struct FormatSelection: Sendable, Equatable, Codable { var name: String; var ena
 
 /// The level-affecting settings Logic's export dialog showed when the export was launched, read from the dialog's own
 /// labelled controls before Export is pressed. Each value is the control's own caption; a control the dialog does not
-/// expose stays nil — the setting is then honestly unknown, never assumed. Normalize is the one control the automation
-/// is allowed to change, and only in one direction: a level-rewriting value is switched to Off before the export, the
-/// switch is verified by re-reading the control, and `normalizeSwitchedFrom` records the value the dialog showed before
-/// (nil when Normalize was already Off, unreadable, or never had to be touched). Format and bit depth are never changed.
-/// `formats` is the bounce dialog's format table (the track-export dialog has a single format pop-up instead, so it
-/// stays nil there); nil also when the table could not be read at all.
+/// expose stays nil — the setting is then honestly unknown, never assumed. Two controls are the only ones the automation
+/// is allowed to change, each in one evidence-preserving direction only: a level-rewriting Normalize is switched to Off
+/// before the export (`normalizeSwitchedFrom` records the value the dialog showed before; nil when Normalize was already
+/// Off, unreadable, or never had to be touched), and on the bounce dialog an unchecked uncompressed PCM row of the format
+/// table is checked (`pcmFormatCheckedByApp` records that row's own caption; nil when PCM was already checked, the table
+/// unreadable, or nothing had to be touched). Both switches are verified by re-reading the control. Format and bit depth
+/// are never changed. `formats` is the bounce dialog's format table (the track-export dialog has a single format pop-up
+/// instead, so it stays nil there); nil also when the table could not be read at all.
 struct ExportDialogSettings: Sendable, Equatable, Codable {
     var format: String?
     var bitDepth: String?
     var normalize: String?
     var normalizeSwitchedFrom: String? = nil
     var formats: [FormatSelection]? = nil
+    var pcmFormatCheckedByApp: String? = nil
 }
 
 /// Outcome of the one-click mix bounce (Logic's File ▸ Bounce). Mirrors `ExportOutcome`: it never claims a file was
@@ -37,7 +40,7 @@ struct ExportDialogSettings: Sendable, Equatable, Codable {
 enum BounceOutcome: Sendable {
     case bounced(item: String, settings: ExportDialogSettings) // menu launched, destination set, Bounce pressed
     case blockedByNormalize(value: String, detail: String) // Normalize would rewrite levels and could not be switched to Off — cancelled, nothing bounced
-    case blockedByFormat(selected: [FormatSelection])    // dialog read, no uncompressed PCM format is checked — cancelled, nothing bounced
+    case blockedByFormat(selected: [FormatSelection], detail: String) // no uncompressed PCM format is checked and the app could not check it — cancelled, nothing bounced
     case triggerFailed(step: String, detail: String)     // could not launch the bounce menu item
     case navigationFailed(step: String, detail: String)  // dialog opened but settings/destination could not be driven
 }
@@ -55,11 +58,13 @@ enum MixerEnsureOutcome: Sendable { case alreadyVisible, opened(item: String), f
 /// standard file-panel keys (⌘⇧G to go-to-folder, ⌘V to paste the destination, Return to accept) and presses
 /// the "Export" button. It never changes volume/pan/mute/solo/plug-ins/sends/routing/automation/regions or
 /// the dialog's format and bit depth (left exactly as the dialog shows them). The dialog's level-affecting
-/// settings ARE read as facts, and Normalize is the ONE deliberate exception to read-only: a Normalize other
-/// than Off would silently falsify every relative-level fact the exported files are supposed to prove, so the
-/// automation switches that control to Off itself (the same documented AXPress mechanism as every button),
-/// verifies the switch by re-reading the control, and records the original value as a fact. Only when the
-/// switch demonstrably fails is the export cancelled — never silently exported with rewritten levels.
+/// settings ARE read as facts, and Normalize is the ONE deliberate exception to read-only here: a Normalize
+/// other than Off would silently falsify every relative-level fact the exported files are supposed to prove,
+/// so the automation switches that control to Off itself (the same documented AXPress mechanism as every
+/// button), verifies the switch by re-reading the control, and records the original value as a fact. Only when
+/// the switch demonstrably fails is the export cancelled — never silently exported with rewritten levels.
+/// The bounce (`bounceMix`) has one more such exception: an unchecked uncompressed PCM row of its format table
+/// is checked by the same mechanism, with the same verification and the same honest cancellation on failure.
 struct LogicExportAutomator: Sendable {
     private let supportedBundleIDs: Set<String> = ["com.apple.logic10", "com.apple.mobilelogic"]
     /// Shown when a top-level menu title does not match: the automation relies on English menu names by design.
@@ -222,14 +227,14 @@ struct LogicExportAutomator: Sendable {
             .offset
     }
 
-    /// The bounce dialog's format table, read as facts: every table row that carries a checkbox is a format row —
-    /// the checkbox is the selection, the row's text its caption. Only the BOUNCE dialog is read this way (the track
-    /// export has a single format pop-up, and a save panel's file browser rows carry no checkboxes, so nothing else
-    /// matches). nil when no such rows exist — the table is then honestly unread, never assumed.
-    private func formatSelections(_ dialog: AXUIElement) -> [FormatSelection]? {
+    /// The bounce dialog's format table with each row's own checkbox element: every table row that carries a checkbox
+    /// is a format row — the checkbox is the selection, the row's text its caption. Only the BOUNCE dialog is read
+    /// this way (the track export has a single format pop-up, and a save panel's file browser rows carry no
+    /// checkboxes, so nothing else matches). Empty when no such rows exist.
+    private func formatRows(_ dialog: AXUIElement) -> [(selection: FormatSelection, checkbox: AXUIElement)] {
         var elements: [AXUIElement] = []
         collectDescendants(dialog, into: &elements)
-        var selections: [FormatSelection] = []
+        var rows: [(selection: FormatSelection, checkbox: AXUIElement)] = []
         for row in elements where role(row) == "AXRow" {
             var rowElements: [AXUIElement] = []
             collectDescendants(row, into: &rowElements)
@@ -238,18 +243,55 @@ struct LogicExportAutomator: Sendable {
                 [self.string(element, kAXTitleAttribute), self.role(element) == "AXStaticText" ? self.string(element, kAXValueAttribute) : nil, self.string(element, kAXDescriptionAttribute)]
             }.compactMap { $0 }
             guard let caption = texts.first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { continue }
-            selections.append(FormatSelection(name: caption.trimmingCharacters(in: .whitespaces), enabled: value == "1"))
+            rows.append((FormatSelection(name: caption.trimmingCharacters(in: .whitespaces), enabled: value == "1"), checkbox))
         }
+        return rows
+    }
+    /// The format table read as facts alone; nil when no rows exist — the table is then honestly unread, never assumed.
+    private func formatSelections(_ dialog: AXUIElement) -> [FormatSelection]? {
+        let selections = formatRows(dialog).map { $0.selection }
         return selections.isEmpty ? nil : selections
     }
 
-    /// Whether the bounce must be cancelled because the checked formats provably contain no uncompressed PCM entry.
-    /// The bounced mix is the measurable loudness reference, so it must be a WAV/AIFF-family PCM file: a lossy MP3/AAC
-    /// bounce is not level evidence and the app would not even detect it as the mix. An unread table (nil) never
-    /// blocks — the setting is then published as unavailable instead of guessed.
+    /// Whether the checked formats provably contain no uncompressed PCM entry. The bounced mix is the measurable
+    /// loudness reference, so it must be a WAV/AIFF-family PCM file: a lossy MP3/AAC bounce is not level evidence and
+    /// the app would not even detect it as the mix. When this is true the automation checks the PCM row itself (see
+    /// `switchPCMFormatOn`) and cancels only when that check demonstrably fails. An unread table (nil) never blocks —
+    /// the setting is then published as unavailable instead of guessed.
     static func formatsBlockBounce(_ formats: [FormatSelection]?) -> Bool {
         guard let formats, !formats.isEmpty else { return false }
         return !formats.contains { $0.enabled && Self.isUncompressedPCM($0.name) }
+    }
+    /// The index of the format-table row whose caption names the uncompressed PCM family (see `isUncompressedPCM`).
+    /// Pure and testable; nil when no such row exists — the automation then has nothing provable to check.
+    static func pcmRowIndex(_ captions: [String]) -> Int? { captions.firstIndex(where: isUncompressedPCM) }
+
+    /// Result of the second deliberate dialog write: the PCM format row checked, or an honest failure.
+    private enum FormatSwitch { case switched(row: String), failed(detail: String) }
+    /// Checks the bounce dialog's uncompressed PCM format row — the same documented AXPress mechanism as every button,
+    /// and (with Normalize) one of only two settings the automation ever changes: with no PCM format checked the bounce
+    /// would produce only lossy files that are no level evidence, and asking the user to tick the checkbox by hand was
+    /// a manual step this automation can prove instead. Only the PCM row is ever pressed (found by the same caption
+    /// grammar `formatsBlockBounce` trusts) and only in one direction — an unchecked box becomes checked; the checked
+    /// compressed rows are left exactly as the user set them. The switch is only believed when re-reading the table
+    /// proves a PCM row is now checked; anything short of that proof is a failure and the caller cancels the bounce.
+    private func switchPCMFormatOn(_ dialog: AXUIElement) -> FormatSwitch {
+        let rows = formatRows(dialog)
+        guard !rows.isEmpty else { return .failed(detail: "The format table could not be read again.") }
+        guard let index = Self.pcmRowIndex(rows.map { $0.selection.name }) else {
+            return .failed(detail: "The format table has no uncompressed PCM row (rows: \(rows.map { $0.selection.name }.joined(separator: ", "))).")
+        }
+        let row = rows[index]
+        if row.selection.enabled { return .switched(row: row.selection.name) } // already checked — nothing to change
+        guard press(row.checkbox) else { return .failed(detail: "AXPress on the \u{2018}\(row.selection.name)\u{2019} row's checkbox did not succeed.") }
+        // Proof over trust: the check counts only when the re-read table itself shows a checked PCM row —
+        // a table that stops being readable is not proof and keeps waiting.
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            usleep(150_000)
+            if let after = formatSelections(dialog), !Self.formatsBlockBounce(after) { return .switched(row: row.selection.name) }
+        }
+        return .failed(detail: "The \u{2018}\(row.selection.name)\u{2019} row still reads unchecked after pressing its checkbox.")
     }
     /// The caption grammar of Logic's own format rows: the PCM row is titled "PCM" (older dialogs) or "Uncompressed"
     /// and its file types are the WAV/AIFF/CAF family. A caption naming none of these is not PCM — never a guess.
@@ -260,8 +302,9 @@ struct LogicExportAutomator: Sendable {
 
     /// Full one-click bounce of the mix (Logic's Stereo Out) to `destination` via File ▸ Bounce — the sum through the
     /// whole master chain, which no per-track export contains. Same discipline as the track export: every element is
-    /// discovered at runtime, settings are read as facts and only Normalize is ever changed (a level-rewriting value
-    /// is switched to Off and verified; the bounce is cancelled only when that switch demonstrably fails), the
+    /// discovered at runtime, settings are read as facts and only two are ever changed, each in one evidence-preserving
+    /// direction (a level-rewriting Normalize is switched to Off, an unchecked uncompressed PCM format row is checked —
+    /// both verified by re-reading; the bounce is cancelled only when such a switch demonstrably fails), the
     /// destination is driven through the standard save-panel keys and verified before the final press,
     /// and the user's clipboard is snapshotted and restored. Logic's bounce dialog ships in two shapes — a settings
     /// window whose confirm opens a separate name/destination panel, or one combined window — and both are handled by
@@ -283,9 +326,11 @@ struct LogicExportAutomator: Sendable {
         guard let dialog = waitForBounceWindow(appElement, timeout: 8) else { return .navigationFailed(step: "bounce_dialog", detail: "Bounce dialog did not appear after launching \u{2018}\(item)\u{2019}.") }
         // Level-affecting settings first: a Normalize other than Off would rewrite the bounced level, so the
         // automation switches it to Off itself and cancels the bounce only when that switch demonstrably fails
-        // (Escape then closes what this automation opened). The format table is read as facts: a bounce whose
-        // checked formats contain no uncompressed PCM would produce a lossy file that is not level evidence (and
-        // would not even be detected as the mix), so it is cancelled — checkbox rows are never toggled.
+        // (Escape then closes what this automation opened). The format table is read as facts, and one row is the
+        // second deliberate write: a bounce whose checked formats contain no uncompressed PCM would produce only
+        // lossy files that are no level evidence (and would not even be detected as the mix), so the automation
+        // checks the PCM row itself — verified by re-reading the table — and cancels only when that check
+        // demonstrably fails. The compressed rows are never touched.
         var settings = dialogSettings(dialog)
         settings.formats = formatSelections(dialog)
         if let normalize = settings.normalize, Self.normalizeBlocksExport(normalize) == true {
@@ -299,8 +344,13 @@ struct LogicExportAutomator: Sendable {
             }
         }
         if Self.formatsBlockBounce(settings.formats) {
-            closeWindows(while: { self.firstBounceWindow(appElement) }, applicationPid: pid)
-            return .blockedByFormat(selected: settings.formats ?? [])
+            switch switchPCMFormatOn(dialog) {
+            case .switched(let row):
+                settings.formats = formatSelections(dialog); settings.pcmFormatCheckedByApp = row
+            case .failed(let detail):
+                closeWindows(while: { self.firstBounceWindow(appElement) }, applicationPid: pid)
+                return .blockedByFormat(selected: settings.formats ?? [], detail: detail)
+            }
         }
         // The name/destination panel: the dialog itself when it already carries the save-panel controls, otherwise the
         // panel that appears after the settings window is confirmed.

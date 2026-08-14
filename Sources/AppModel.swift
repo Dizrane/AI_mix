@@ -164,8 +164,9 @@ struct ApplicationLauncher: Sendable {
     }
     /// One truth per stage: the sidebar checkmark, the next stage's availability and the "Continue" button all derive
     /// from it. A stage is complete only when its own work is really done — Audio requires every discovered audio track
-    /// to have a real exported WAV on disk, never a merely prepared asset list.
-    func isComplete(_ stage: WorkflowStage) -> Bool { switch stage { case .connection: connection.found && connection.accessibilityTrusted && connection.projectOpen == true; case .analysis: normalized != nil; case .audio: !audioAssets.isEmpty && audioAssets.allSatisfy { $0.status == .exported }; case .aiPackage: !aiPackage.isEmpty; case .review: !validated.isEmpty } }
+    /// to have a real exported WAV on disk AND the bounced Stereo Out mix validated in current/mix (the sum is the
+    /// loudness reference the AI package is built around), never a merely prepared asset list or the tracks alone.
+    func isComplete(_ stage: WorkflowStage) -> Bool { switch stage { case .connection: connection.found && connection.accessibilityTrusted && connection.projectOpen == true; case .analysis: normalized != nil; case .audio: !audioAssets.isEmpty && audioAssets.allSatisfy { $0.status == .exported } && mixAsset != nil; case .aiPackage: !aiPackage.isEmpty; case .review: !validated.isEmpty } }
     /// Strict step order: a stage opens only when the previous one is complete — never every stage at once after a scan.
     func isAvailable(_ target: WorkflowStage) -> Bool { WorkflowStage(rawValue: target.rawValue - 1).map(isComplete) ?? true }
     func go(to target: WorkflowStage) { if isAvailable(target) { stage = target } }
@@ -428,11 +429,11 @@ struct ApplicationLauncher: Sendable {
                 mixPhase = .failed("normalize")
                 mixStatus = "Bounce stopped: Logic's bounce dialog has Normalize set to ‘\(value)’, which would rewrite the mix level, and the app could not switch it to Off (\(detail)) Set Normalize to Off in the bounce dialog once, then bounce again."
                 log.append("Logic bounce blocked: Normalize is ‘\(value)’ and switching it to Off failed (\(detail)) — the dialog was cancelled and nothing was bounced.")
-            case .blockedByFormat(let selected):
+            case .blockedByFormat(let selected, let detail):
                 mixPhase = .failed("format")
                 let checked = selected.filter(\.enabled).map(\.name)
-                mixStatus = "Bounce stopped: the bounce dialog's format table has no uncompressed PCM format checked (\(checked.isEmpty ? "nothing is checked" : "checked: \(checked.joined(separator: ", "))")). A lossy file is not level evidence and would not be detected as the mix. In the bounce dialog, check PCM (Uncompressed) once and uncheck the compressed formats, then bounce again."
-                log.append("Logic bounce blocked: format table read as \(selected.caption) — no uncompressed PCM format is checked; the dialog was cancelled and nothing was bounced.")
+                mixStatus = "Bounce stopped: the bounce dialog's format table has no uncompressed PCM format checked (\(checked.isEmpty ? "nothing is checked" : "checked: \(checked.joined(separator: ", "))")), and the app could not check it itself (\(detail)) A lossy file is not level evidence and would not be detected as the mix. Check PCM (Uncompressed) in the bounce dialog once, then bounce again."
+                log.append("Logic bounce blocked: format table read as \(selected.isEmpty ? "unreadable" : selected.caption) — no uncompressed PCM format is checked and checking it failed (\(detail)); the dialog was cancelled and nothing was bounced.")
             case .navigationFailed(let step, let detail):
                 mixPhase = .failed(step)
                 mixStatus = "Logic's bounce dialog could not be automated at ‘\(step)’: \(detail) You can finish the dialog manually into the mix folder — the file will still be detected."
@@ -440,6 +441,7 @@ struct ApplicationLauncher: Sendable {
                 await pollForMixBounce(mixDir: mixDir, settings: nil) // still detect if the user completes it manually
             case .bounced(let item, let settings):
                 if let from = settings.normalizeSwitchedFrom { log.append("Logic's bounce dialog had Normalize set to ‘\(from)’ — the app switched it to Off before bouncing, so the file keeps the mix's real level.") }
+                if let row = settings.pcmFormatCheckedByApp { log.append("Logic's bounce dialog had no uncompressed PCM format checked — the app checked ‘\(row)’ before bouncing, so a real PCM mix file is written.") }
                 mixStatus = "Logic is bouncing via ‘\(item)’. Waiting for the file…"
                 log.append("Logic bounce launched via \(item), format=\(settings.format ?? "unread"), normalize=\(settings.normalize ?? "unread").")
                 await pollForMixBounce(mixDir: mixDir, settings: ExportSettingsFacts(settings: settings))
