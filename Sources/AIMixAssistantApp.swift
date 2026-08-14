@@ -86,7 +86,7 @@ struct SettingsView: View {
             HStack { Text("Settings").font(.system(.title2, design: .rounded).weight(.semibold)); Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
             Card {
                 Text("Updates").font(.headline)
-                Text("The app updates itself in place from this project's GitHub Releases: the new AI Mix Assistant.app replaces the current one inside the same folder, and Data/ with your analyses stays untouched.").font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text("The app updates itself in place from this project's GitHub Releases: the new AI Mix Assistant.app replaces the current one inside the same folder, and Data/ with your analyses stays untouched. A folder still named after the old version (AI_Mix_<version>) is renamed to the new one; a folder you named yourself is never touched.").font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 10) {
                     Button("Check for Updates") { model.checkForUpdates(userInitiated: true) }.disabled(model.updateInProgress)
                     if let update = model.updateAvailable {

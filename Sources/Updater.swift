@@ -3,7 +3,8 @@ import AppKit
 
 /// In-place self-update from this repository's GitHub Releases. The released app lives inside one closed-shell folder
 /// together with its `Data/`, so an update is the replacement of a single `.app`: download the release ZIP, unpack it,
-/// verify the new bundle really is the released version, swap it in next to the untouched `Data/`, and relaunch. Every
+/// verify the new bundle really is the released version, swap it in next to the untouched `Data/`, rename the folder
+/// itself to the new version when it still carries the release's versioned name (`AI_Mix_<tag>`), and relaunch. Every
 /// step reports honestly and any failure before the swap leaves the current installation exactly as it was; a failure
 /// during the swap restores the old bundle. Nothing runs automatically: the check only reads the public releases API,
 /// and installation happens on an explicit click.
@@ -51,6 +52,55 @@ struct AppUpdater: Sendable {
             throw UpdateError.noAppAsset(release.tag_name)
         }
         return AppUpdate(tag: release.tag_name, assetName: asset.name, assetURL: asset.browser_download_url)
+    }
+
+    /// The release ZIP unpacks into one closed-shell folder named `AI_Mix_<tag>`, so after an in-place update the
+    /// folder's name still advertises the version it was downloaded as, not the version it now contains. Returns the
+    /// name such a folder should carry for `installedVersion` (release naming, `v` included), or nil when nothing
+    /// must change: a custom user-chosen folder name never matches the scheme and is never touched, and a name that
+    /// already matches needs no rename. A versioned name whose format merely drifted (no `v`, wrong version) is
+    /// normalized to the canonical `AI_Mix_v<version>`.
+    static func shellRename(folderName: String, installedVersion: String) -> String? {
+        let prefix = "AI_Mix_"
+        guard folderName.hasPrefix(prefix), parseVersion(String(folderName.dropFirst(prefix.count))) != nil else { return nil }
+        guard parseVersion(installedVersion) != nil else { return nil }
+        let target = prefix + "v" + (installedVersion.hasPrefix("v") ? String(installedVersion.dropFirst()) : installedVersion)
+        return folderName == target ? nil : target
+    }
+
+    /// Renames the closed-shell folder around `app` to the release naming for `version` and returns the app's URL inside
+    /// the renamed folder. Returns `app` unchanged when the folder carries a custom name, already matches, the target
+    /// name is taken by a sibling, or the move fails — the rename is naming bookkeeping and must never break an
+    /// installation that is already correct on disk.
+    static func renameShell(around app: URL, toMatch version: String) -> URL {
+        let shell = app.deletingLastPathComponent()
+        guard let newName = shellRename(folderName: shell.lastPathComponent, installedVersion: version) else { return app }
+        let destination = shell.deletingLastPathComponent().appendingPathComponent(newName, isDirectory: true)
+        guard !FileManager.default.fileExists(atPath: destination.path) else { return app }
+        do { try FileManager.default.moveItem(at: shell, to: destination) } catch { return app }
+        return destination.appendingPathComponent(app.lastPathComponent)
+    }
+
+    /// Catch-up for an installation whose update ran under an app version that did not yet rename the folder: a
+    /// v0.2.12 app still living inside `AI_Mix_v0.2.10`. Called once at launch, before storage initializes, because
+    /// a successful rename makes every `Bundle.main` path stale — running on would recreate the old folder on the
+    /// first write. So on success the app is relaunched from the renamed folder and this call never returns; if the
+    /// relaunch cannot be started, the rename is reverted and this run continues unchanged from the name it started
+    /// with. Custom folder names, translocated copies and development runs are left alone.
+    static func adoptVersionedShellName() {
+        let bundleURL = Bundle.main.bundleURL
+        guard bundleURL.pathExtension == "app", !TranslocationRepair.isActive, let version = currentVersion() else { return }
+        let renamedApp = renameShell(around: bundleURL, toMatch: version)
+        guard renamedApp != bundleURL else { return }
+        let open = Process()
+        open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        open.arguments = ["-n", renamedApp.path]
+        open.standardOutput = FileHandle.nullDevice; open.standardError = FileHandle.nullDevice
+        if (try? open.run()) != nil {
+            open.waitUntilExit()
+            if open.terminationStatus == 0 { exit(0) }
+        }
+        try? FileManager.default.moveItem(at: renamedApp.deletingLastPathComponent(), to: bundleURL.deletingLastPathComponent())
     }
 
     /// The GitHub website's `releases/latest` page redirects to `releases/tag/<tag>`. Unlike the JSON API, that web endpoint
@@ -128,7 +178,12 @@ struct AppUpdater: Sendable {
         }
         _ = run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", currentApp.path])
         try? manager.removeItem(at: backup)
-        return .installed(app: currentApp)
+        // The shell folder from the release ZIP is named AI_Mix_<tag>; left alone after the swap it would keep
+        // advertising the replaced version. A folder that follows that versioned naming scheme is renamed to the
+        // installed tag; a custom name is never touched, and a failed rename never fails the completed update.
+        let installedApp = Self.renameShell(around: currentApp, toMatch: update.tag)
+        if installedApp != currentApp { status("Renamed the app's folder to \(installedApp.deletingLastPathComponent().lastPathComponent).") }
+        return .installed(app: installedApp)
     }
 
     /// The new bundle is installed only after it proves it is what the release says: a readable Info.plist whose

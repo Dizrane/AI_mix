@@ -26,6 +26,10 @@ struct ApplicationLauncher: Sendable {
     private var metricsCache: [String: AudioMetrics] = [:]
     private let storeInitFailure: String?
     init() {
+        // Folder-name catch-up first, before anything derives paths from Bundle.main: an install updated by an app
+        // version that did not rename the shell folder yet still sits in AI_Mix_<old tag>. On a successful rename
+        // this relaunches from the renamed folder and never returns; otherwise it changes nothing.
+        AppUpdater.adoptVersionedShellName()
         do { store = try SessionStore(); storeInitFailure = nil } catch { store = nil; storeInitFailure = error.localizedDescription }
         refreshConnection()
         startConnectionMonitor()
