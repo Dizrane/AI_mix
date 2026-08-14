@@ -45,14 +45,24 @@ struct ExportSettingsFacts: Codable, Sendable {
     /// The bounce dialog's format table (which format checkboxes were checked when the bounce was launched); the track
     /// export dialog has a single format pop-up instead, so there this fact is honestly `unavailable`.
     var formats: Fact<[FormatSelection]> = .unavailable
+    /// The caption of the uncompressed PCM format row the app checked because the bounce dialog opened with no PCM
+    /// format checked — half of the second deliberate dialog write (a check that fails cancels the bounce up front);
+    /// `unavailable` when PCM was already checked, the table unreadable, or the dialog was never observed.
+    var pcmFormatCheckedByApp: Fact<String> = .unavailable
+    /// The captions of the checked compressed format rows the app unchecked so the bounce writes exactly one PCM
+    /// file — the other half of that write; `unavailable` when none were checked, the table unreadable, or the
+    /// dialog was never observed. A row that refused to uncheck stays visible as checked in `formats`.
+    var formatsUncheckedByApp: Fact<[String]> = .unavailable
     init(settings: ExportDialogSettings) {
         format = settings.format.map { .known($0, source: "export dialog format pop-up") } ?? .unavailable
         bitDepth = settings.bitDepth.map { .known($0, source: "export dialog bit-depth pop-up") } ?? .unavailable
         normalize = settings.normalize.map { .known($0, source: "export dialog Normalize control") } ?? .unavailable
         normalizeSwitchedFrom = settings.normalizeSwitchedFrom.map { .known($0, source: "export dialog Normalize control before the app switched it to Off") } ?? .unavailable
         formats = settings.formats.map { .known($0, source: "bounce dialog format table") } ?? .unavailable
+        pcmFormatCheckedByApp = settings.pcmFormatCheckedByApp.map { .known($0, source: "bounce dialog format table row the app checked") } ?? .unavailable
+        formatsUncheckedByApp = settings.formatsUncheckedByApp.map { .known($0, source: "bounce dialog format table rows the app unchecked") } ?? .unavailable
     }
-    enum CodingKeys: String, CodingKey { case format, bitDepth, normalize, normalizeSwitchedFrom, formats }
+    enum CodingKeys: String, CodingKey { case format, bitDepth, normalize, normalizeSwitchedFrom, formats, pcmFormatCheckedByApp, formatsUncheckedByApp }
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         format = try container.decode(Fact<String>.self, forKey: .format)
@@ -60,6 +70,8 @@ struct ExportSettingsFacts: Codable, Sendable {
         normalize = try container.decode(Fact<String>.self, forKey: .normalize)
         normalizeSwitchedFrom = try container.decodeIfPresent(Fact<String>.self, forKey: .normalizeSwitchedFrom) ?? .unavailable
         formats = try container.decodeIfPresent(Fact<[FormatSelection]>.self, forKey: .formats) ?? .unavailable
+        pcmFormatCheckedByApp = try container.decodeIfPresent(Fact<String>.self, forKey: .pcmFormatCheckedByApp) ?? .unavailable
+        formatsUncheckedByApp = try container.decodeIfPresent(Fact<[String]>.self, forKey: .formatsUncheckedByApp) ?? .unavailable
     }
 }
 
@@ -98,7 +110,7 @@ extension [FormatSelection] {
 }
 
 struct AudioManifest: Codable, Sendable {
-    var schemaVersion = "1.5"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
+    var schemaVersion = "1.6"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
     /// Nil when this session never observed Logic's export dialog (manual export, or the app was restarted since).
     var exportSettings: ExportSettingsFacts?
     /// The bounced Stereo Out mix; nil when no bounce file exists — its absence is stated, never papered over.
@@ -126,6 +138,8 @@ extension AudioManifest {
         if let mix {
             out += ["- Mix (Stereo Out): \(mix.relativePath) — the bounced sum through the master chain; per-track WAVs do not contain it."]
             if let from = mix.bounceSettings?.normalizeSwitchedFrom.value { out += ["- Bounce dialog Normalize showed \u{201C}\(from)\u{201D}; the app switched it to Off (and verified the switch) before the bounce, so the mix level was not rewritten."] }
+            if let row = mix.bounceSettings?.pcmFormatCheckedByApp.value { out += ["- The bounce dialog opened with no uncompressed PCM format checked; the app checked \u{201C}\(row)\u{201D} (and verified the check) before the bounce, so a real PCM mix file was written."] }
+            if let rows = mix.bounceSettings?.formatsUncheckedByApp.value { out += ["- The bounce dialog also had \(rows.map { "\u{201C}\($0)\u{201D}" }.joined(separator: ", ")) checked; the app unchecked \(rows.count == 1 ? "it" : "them") (and verified) before the bounce, so exactly one PCM mix file was written."] }
             if let formats = mix.bounceSettings?.formats.value { out += ["- Bounce dialog formats (read from Logic's own format table when the bounce was launched): \(formats.caption)"] }
         } else {
             out += ["- Mix (Stereo Out): none — no bounced mix file exists, so the sum (overall loudness, balance, masking) is not part of this delivery."]

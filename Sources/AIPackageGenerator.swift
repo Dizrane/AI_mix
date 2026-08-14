@@ -8,7 +8,7 @@ enum PackageDelivery: Sendable { case markdownOnly, fullPackage }
 
 /// Provider-neutral export of normalized, evidence-based DAW facts for any external LLM.
 struct AIPackageGenerator: Sendable {
-    static let schemaVersion = "2.13"
+    static let schemaVersion = "2.14"
     func make(snapshot: NormalizedSnapshot, sessionID: String, audio: [AudioAsset] = [], plugins: [PluginInventoryItem] = [], probes: [ProbeType] = ProbeType.allCases, delivery: PackageDelivery = .fullPackage, exportSettings: ExportSettingsFacts? = nil, mix: MixBounceAsset? = nil) -> String {
         let readiness = PackageReadiness.evaluate(snapshot: snapshot, assets: audio)
         var out: [String] = []
@@ -170,7 +170,9 @@ struct AIPackageGenerator: Sendable {
         if let s = mix.bounceSettings {
             out += [fact("Bounce dialog format", s.format), fact("Bounce dialog bit depth", s.bitDepth), fact("Bounce dialog Normalize", s.normalize)]
             if let from = s.normalizeSwitchedFrom.value { out += ["- Normalize showed \u{201C}\(from)\u{201D} when the dialog opened; the app switched it to Off and verified the switch before the bounce."] }
-            if let formats = s.formats.value { out += ["- Bounce dialog formats (read from Logic's own format table; a bounce with no uncompressed PCM format checked is cancelled): known: \(formats.caption)"] }
+            if let row = s.pcmFormatCheckedByApp.value { out += ["- The format table opened with no uncompressed PCM format checked; the app checked \u{201C}\(row)\u{201D} and verified the check before the bounce."] }
+            if let rows = s.formatsUncheckedByApp.value { out += ["- The format table also had \(rows.map { "\u{201C}\($0)\u{201D}" }.joined(separator: ", ")) checked; the app unchecked \(rows.count == 1 ? "it" : "them") and verified before the bounce, so exactly one PCM mix file was written."] }
+            if let formats = s.formats.value { out += ["- Bounce dialog formats (read from Logic's own format table; the app sets the table to uncompressed PCM alone, cancelling only when checking the PCM row fails): known: \(formats.caption)"] }
             out += s.normalize.value.map { ["- Normalize was read as \($0) off Logic's own bounce dialog (a level-rewriting value is switched to Off by the app, and an unswitchable one cancels the bounce), so the file carries the mix's real level."] } ?? ["- Normalize was not readable on the bounce dialog, so whether the bounced level was rewritten is unverified."]
         } else {
             out += ["- Bounce dialog settings: unavailable — this session did not observe Logic's bounce dialog for this file, so whether Normalize altered its level is unverified."]
