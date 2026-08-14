@@ -403,8 +403,8 @@ struct LogicExportAutomator: Sendable {
         // earlier work silently truncates the one file the analysis treats as the full-project reference. So Cycle is
         // the third and last deliberate write: the transport Cycle control is read, switched off when it is provably
         // on (verified by re-reading, recorded as a fact), and a proven-On Cycle that cannot be switched off cancels
-        // the bounce honestly. An unreadable control never blocks — the truncation check on the finished file is the
-        // safety net there.
+        // the bounce honestly. An unreadable control never blocks — the finished file is accepted as is, and the AI
+        // Package's duration check publishes any mismatch as a fact for the user and the model to judge.
         var cycleValue: String? = nil
         var cycleSwitchedFrom: String? = nil
         switch ensureCycleOff(appElement) {

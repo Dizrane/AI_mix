@@ -477,17 +477,6 @@ struct ApplicationLauncher: Sendable {
             if !current.isEmpty, current == previous {
                 let resolved = await Task.detached(priority: .userInitiated) { MixBounceAsset.resolve(in: mixDir, settings: settings) }.value
                 if let resolved {
-                    // The bounce is the full-project reference, so a file whose audible content provably ends before the
-                    // longest exported track's content is rejected here, not discovered later as a package ISSUE: Logic
-                    // bounced a section (a cycle range, selected regions, or a manual Start/End range), and accepting it
-                    // would gate the AI Package on a mix that measures only part of the song. Compared by measured
-                    // content, never file length, so a bounce padded with trailing silence is never falsely accused.
-                    if let cut = MixBounceAsset.provenTruncation(mix: resolved, against: audioAssets) {
-                        mixPhase = .failed("truncated")
-                        mixStatus = String(format: "The bounce covers only part of the project: its audible content ends at %.1f s while ‘%@’ runs to %.1f s. Logic bounced a section — a cycle range, selected regions, or a manual Start/End range in the bounce dialog. Turn Cycle off, click an empty spot in the Tracks area to deselect regions, then Bounce Mix from Logic again.", cut.mixContentEnd, cut.trackName, cut.trackContentEnd)
-                        log.append(String(format: "Mix bounce rejected as truncated: audible content %.1f s vs ‘%@’ %.1f s (trailing silence excluded on both sides). The file stays in mix/ but is not used as the mix.", cut.mixContentEnd, cut.trackName, cut.trackContentEnd))
-                        return
-                    }
                     mixAsset = resolved
                     mixPhase = .done
                     mixStatus = "Mix bounced: \((resolved.relativePath as NSString).lastPathComponent)" + (resolved.metrics?.integratedLoudnessLUFS.value.map { String(format: " · %.1f LUFS integrated", $0) } ?? "")
