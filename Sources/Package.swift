@@ -33,8 +33,11 @@ struct PackageManifest: Codable, Sendable {
     struct TrackRef: Codable, Sendable { var logicalTrackID: String; var logicTrackName: String; var wav: String?; var expectedExportPath: String; var status: String; var regionCount: Int; var regionIDs: [String] }
     /// The manifest describes the package it ships in, so it declares the same schema version as the package document itself.
     var schemaVersion = AIPackageGenerator.schemaVersion; var project: String; var generatedAt = Date(); var assets: Int; var exported: Int; var requiresExport: Int; var tracks: [TrackRef]
-    init(project: String, assets audioAssets: [AudioAsset]) {
+    /// Relative path of the bounced Stereo Out mix inside the package; nil when no mix bounce exists.
+    var mixWAV: String?
+    init(project: String, assets audioAssets: [AudioAsset], mix: MixBounceAsset? = nil) {
         self.project = project
+        self.mixWAV = mix?.relativePath
         self.assets = audioAssets.count
         self.exported = audioAssets.filter { $0.status == .exported }.count
         self.requiresExport = audioAssets.filter { $0.status == .requiresUserExport }.count

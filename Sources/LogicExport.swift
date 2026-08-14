@@ -21,6 +21,16 @@ struct ExportDialogSettings: Sendable, Equatable, Codable {
     var normalize: String?
 }
 
+/// Outcome of the one-click mix bounce (Logic's File ▸ Bounce). Mirrors `ExportOutcome`: it never claims a file was
+/// written — the real bounce file is detected and verified from disk separately, because a realtime bounce keeps
+/// writing long after the dialog is confirmed.
+enum BounceOutcome: Sendable {
+    case bounced(item: String, settings: ExportDialogSettings) // menu launched, destination set, Bounce pressed
+    case blockedByNormalize(value: String)               // dialog read, Normalize would rewrite levels — cancelled, nothing bounced
+    case triggerFailed(step: String, detail: String)     // could not launch the bounce menu item
+    case navigationFailed(step: String, detail: String)  // dialog opened but settings/destination could not be driven
+}
+
 /// Result of just launching Logic's native export (kept for compatibility / diagnostics).
 enum ExportTriggerResult: Sendable { case opened(item: String); case pressedNoDialog(item: String); case failed(step: String, detail: String) }
 
@@ -113,6 +123,63 @@ struct LogicExportAutomator: Sendable {
         return ExportDialogSettings(format: formatControl.flatMap { self.string($0, kAXValueAttribute) }, bitDepth: labelled("bit depth", roles: ["AXPopUpButton"]).flatMap { self.string($0, kAXValueAttribute) }, normalize: normalize)
     }
 
+    /// Full one-click bounce of the mix (Logic's Stereo Out) to `destination` via File ▸ Bounce — the sum through the
+    /// whole master chain, which no per-track export contains. Same discipline as the track export: every element is
+    /// discovered at runtime, settings are only READ (a Normalize other than Off cancels the bounce instead of being
+    /// changed), the destination is driven through the standard save-panel keys and verified before the final press,
+    /// and the user's clipboard is snapshotted and restored. Logic's bounce dialog ships in two shapes — a settings
+    /// window whose confirm opens a separate name/destination panel, or one combined window — and both are handled by
+    /// looking for the panel's own "Where:" pop-up rather than assuming a shape.
+    func bounceMix(destination: URL) -> BounceOutcome {
+        guard AXIsProcessTrusted() else { return .triggerFailed(step: "accessibility", detail: "Accessibility permission is not granted to AI Mix Assistant.") }
+        guard let app = runningLogic() else { return .triggerFailed(step: "logic_running", detail: "Logic Pro is not running.") }
+        let pid = app.processIdentifier
+        let appElement = AXUIElementCreateApplication(pid)
+        app.activate(); usleep(400_000)
+        // Close any stale bounce windows left over from a previous run.
+        for _ in 0..<3 where firstBounceWindow(appElement) != nil { postKey(53, [], to: pid); usleep(350_000) }
+
+        let item: String
+        switch pressBounceMenu(appElement) {
+        case .failed(let step, let detail): return .triggerFailed(step: step, detail: detail)
+        case .pressed(let title): item = title
+        }
+        guard let dialog = waitForBounceWindow(appElement, timeout: 8) else { return .navigationFailed(step: "bounce_dialog", detail: "Bounce dialog did not appear after launching \u{2018}\(item)\u{2019}.") }
+        // Level-affecting settings first: a Normalize other than Off would rewrite the bounced level, so the bounce
+        // is cancelled (Escape closes what this automation opened) before any destination work.
+        let settings = dialogSettings(dialog)
+        if let normalize = settings.normalize, Self.normalizeBlocksExport(normalize) == true {
+            for _ in 0..<3 where firstBounceWindow(appElement) != nil { postKey(53, [], to: pid); usleep(350_000) }
+            return .blockedByNormalize(value: normalize)
+        }
+        // The name/destination panel: the dialog itself when it already carries the save-panel controls, otherwise the
+        // panel that appears after the settings window is confirmed.
+        let panel: AXUIElement
+        if hasWherePopup(dialog) { panel = dialog }
+        else {
+            guard let confirm = bounceConfirmButton(dialog) else { return .navigationFailed(step: "bounce_button", detail: "No Bounce/OK button found on the bounce dialog.") }
+            guard press(confirm) else { return .navigationFailed(step: "press_bounce", detail: "AXPress on the bounce dialog's confirm button did not succeed.") }
+            guard let saved = waitForBounceWindow(appElement, timeout: 8, where: { self.hasWherePopup($0) }) else { return .navigationFailed(step: "save_panel", detail: "The bounce name/destination panel did not appear.") }
+            panel = saved
+        }
+        // Destination via the standard Go-to-Folder field, exactly like the track export; clipboard fully preserved.
+        let savedClipboard = Self.clipboardSnapshot()
+        defer { Self.restoreClipboard(savedClipboard) }
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(destination.path, forType: .string)
+        postKey(5, [.maskCommand, .maskShift], to: pid); usleep(700_000) // ⌘⇧G
+        guard let sheet = firstDescendant(panel, { self.role($0) == "AXSheet" }), let field = firstDescendant(sheet, { ["AXComboBox", "AXTextField"].contains(self.role($0)) }) else { return .navigationFailed(step: "goto_sheet", detail: "Go-to-folder field not found after ⌘⇧G.") }
+        postKey(9, [.maskCommand], to: pid); usleep(450_000) // ⌘V
+        let pasted = string(field, kAXValueAttribute) ?? ""
+        guard pasted.contains(destination.path) else { return .navigationFailed(step: "paste_path", detail: "Destination did not paste into the go-to field (got: \(pasted)).") }
+        postKey(36, [], to: pid); usleep(1_000_000) // Return accepts the path
+        let confirmed = waitForBounceWindow(appElement, timeout: 3, where: { self.hasWherePopup($0) }) ?? panel
+        let whereValue = firstDescendant(confirmed) { self.role($0) == "AXPopUpButton" && self.string($0, kAXTitleAttribute) == "Where:" }.flatMap { self.string($0, kAXValueAttribute) }
+        guard whereValue == destination.lastPathComponent else { return .navigationFailed(step: "navigate", detail: "Destination not confirmed (Where=\(whereValue ?? "?"), expected \(destination.lastPathComponent)); not bouncing to avoid a wrong folder.") }
+        guard let finalButton = bounceConfirmButton(confirmed) else { return .navigationFailed(step: "final_button", detail: "No Bounce/OK button found on the destination panel.") }
+        guard press(finalButton) else { return .navigationFailed(step: "press_final", detail: "AXPress on the final Bounce button did not succeed.") }
+        return .bounced(item: item, settings: settings)
+    }
+
     /// Makes Logic's Mixer visible before analysis, because channel strips carry the richest AX facts. Reads the View menu:
     /// "Hide Mixer" means it is already on screen (the opened menu is closed with Escape, nothing pressed); "Show Mixer" is
     /// pressed via AXPress — the same documented menu mechanism the export automation uses, never a blind keystroke that
@@ -159,6 +226,36 @@ struct LogicExportAutomator: Sendable {
         guard press(leaf) else { return .failed("press", "AXPress on ‘\(leafTitle)’ did not succeed.") }
         return .pressed(leafTitle)
     }
+
+    // MARK: bounce menu + window discovery
+
+    /// File ▸ Bounce ▸ Project or Section… in current Logic; an older un-nested "Bounce…" leaf opens the dialog directly.
+    private func pressBounceMenu(_ appElement: AXUIElement) -> MenuPress {
+        guard let menuBar = copyElement(appElement, kAXMenuBarAttribute) else { return .failed("menu_bar", "AXMenuBar attribute is unavailable.") }
+        guard let fileItem = childByTitle(menuBar, "File") else { return .failed("file_menu", "File menu not found. Menus: \(childTitles(menuBar)). \(englishUIHint)") }
+        _ = press(fileItem); usleep(400_000) // open File so Logic validates & populates the submenu
+        guard let fileMenu = firstMenu(of: fileItem), let bounceItem = childContaining(fileMenu, "bounce") else { return .failed("bounce_item", "No Bounce item found in the File menu. \(englishUIHint)") }
+        let bounceTitle = string(bounceItem, kAXTitleAttribute) ?? "Bounce"
+        if bool(bounceItem, kAXEnabledAttribute) == false { return .failed("item_disabled", "\u{2018}\(bounceTitle)\u{2019} is disabled — is a project open?") }
+        _ = press(bounceItem); usleep(400_000)
+        guard let submenu = firstMenu(of: bounceItem) else { return .pressed(bounceTitle) } // an un-nested Bounce… item was already pressed
+        guard let leaf = childContaining(submenu, "project") else { return .failed("bounce_leaf", "No \u{2018}Project or Section\u{2019} item found under \u{2018}\(bounceTitle)\u{2019}. Items: \(childTitles(submenu)).") }
+        let leafTitle = string(leaf, kAXTitleAttribute) ?? "Project or Section…"
+        if bool(leaf, kAXEnabledAttribute) == false { return .failed("item_disabled", "\u{2018}\(leafTitle)\u{2019} is disabled — is a project open?") }
+        guard press(leaf) else { return .failed("press", "AXPress on \u{2018}\(leafTitle)\u{2019} did not succeed.") }
+        return .pressed("\(bounceTitle) \u{25B8} \(leafTitle)")
+    }
+    /// A bounce window is recognised by its own evidence: a title containing "bounce", or a "Bounce"-titled button.
+    private func isBounceWindow(_ window: AXUIElement) -> Bool {
+        if (string(window, kAXTitleAttribute) ?? "").localizedCaseInsensitiveContains("bounce") { return true }
+        return firstDescendant(window) { self.role($0) == "AXButton" && self.string($0, kAXTitleAttribute) == "Bounce" } != nil
+    }
+    private func firstBounceWindow(_ app: AXUIElement, where predicate: ((AXUIElement) -> Bool)? = nil) -> AXUIElement? { windows(app).first { isBounceWindow($0) && (predicate?($0) ?? true) } }
+    private func waitForBounceWindow(_ app: AXUIElement, timeout: TimeInterval, where predicate: ((AXUIElement) -> Bool)? = nil) -> AXUIElement? { let deadline = Date().addingTimeInterval(timeout); while Date() < deadline { if let window = firstBounceWindow(app, where: predicate) { return window }; usleep(250_000) }; return nil }
+    /// The confirm control on either bounce window shape: current Logic titles it "Bounce", older dialogs "OK".
+    private func bounceConfirmButton(_ window: AXUIElement) -> AXUIElement? { firstDescendant(window) { self.role($0) == "AXButton" && ["Bounce", "OK"].contains(self.string($0, kAXTitleAttribute) ?? "") } }
+    /// The standard save-panel destination pop-up — the evidence that a window can take the go-to-folder keys at all.
+    private func hasWherePopup(_ window: AXUIElement) -> Bool { firstDescendant(window) { self.role($0) == "AXPopUpButton" && self.string($0, kAXTitleAttribute) == "Where:" } != nil }
 
     // MARK: clipboard preservation
     /// The complete state of a pasteboard: every item with the data of every representation it carries (files, images,

@@ -24,6 +24,11 @@ struct ApplicationLauncher: Sendable {
     /// The export dialog settings read when THIS session launched Logic's export; nil when no export was launched (or observed) —
     /// the manifests and the AI package then say so instead of assuming the WAVs were exported level-preserving.
     @Published var exportSettings: ExportSettingsFacts?
+    /// The bounced Stereo Out mix, resolved from a real file in current/mix; nil until a bounce file is validated on disk.
+    @Published var mixAsset: MixBounceAsset?
+    @Published var mixStatus = ""
+    @Published var mixPhase: AudioExportPhase = .idle
+    @Published var showBounceConfirm = false
     let analyzer: any DAWAnalyzer = LogicAccessibilityAnalyzer(); let normalizer = SnapshotNormalizer(); let validator = CommandValidator(); let audioExtractor = AudioAssetExtractor(); let metricsAnalyzer = AudioMetricsAnalyzer(); let exporter = LogicExportAutomator(); let pluginInventory = PluginInventory(); private var store: SessionStore?
     /// Metrics of already-analyzed WAVs keyed by absolute path; entries are reused only while the file's size and modification date match, so Refresh Export Status never re-analyzes unchanged files.
     private var metricsCache: [String: AudioMetrics] = [:]
@@ -114,7 +119,7 @@ struct ApplicationLauncher: Sendable {
     /// Installing an update while the app is mid-work would sabotage that work: the swap renames the folder and
     /// relaunches the app, killing a running scan or the WAV-detection polling, and Logic would keep exporting into
     /// a destination path whose folder name just changed. The buttons disable on this and the guard tells the reason.
-    var updateBlockedByWork: Bool { analyzerState == .scanning || exportPhase == .exporting }
+    var updateBlockedByWork: Bool { analyzerState == .scanning || exportPhase == .exporting || mixPhase == .exporting }
     /// User-requested in-place update: download the release ZIP, verify the new bundle, swap it in next to the
     /// untouched Data/, relaunch the new version and quit this one. Any failure is reported and leaves the current
     /// installation working; a translocated (quarantined read-only) copy must be repaired first, because its real
@@ -174,7 +179,7 @@ struct ApplicationLauncher: Sendable {
             do {
                 try await store.resetForNewAnalysis()
                 analysisSessionID = "analysis_\(ISO8601DateFormatter().string(from: Date()))"
-                raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil; metricsCache = [:]; exportSettings = nil
+                raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil; metricsCache = [:]; exportSettings = nil; mixAsset = nil; mixStatus = ""; mixPhase = .idle; showBounceConfirm = false
                 log.append("Previous AI Mix Assistant analysis data removed. Starting a clean read-only scan.")
                 let exporter = exporter
                 let mixerOutcome = await Task.detached(priority: .userInitiated) { exporter.ensureMixerVisible() }.value
@@ -209,7 +214,7 @@ struct ApplicationLauncher: Sendable {
     @Published var packageFolderURL: URL?; @Published var packageZipURL: URL?
     var packageReadiness: PackageReadiness { PackageReadiness.evaluate(snapshot: normalized, assets: audioAssets) }
     func ensurePluginInventory() { if availablePlugins.isEmpty { availablePlugins = pluginInventory.discoverAvailable() } }
-    func generateAIPackage() { guard let snapshot = normalized else { aiPackageStatus = "Run a full analysis first."; return }; ensurePluginInventory(); aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: audioAssets, plugins: availablePlugins, delivery: .markdownOnly, exportSettings: exportSettings); let r = packageReadiness; aiPackageStatus = "AI package generated (\(r.overall.rawValue)) · \(availablePlugins.count) plugins available." + (r.audioTotal > 0 && r.audioExported < r.audioTotal ? " Audio incomplete: \(r.audioTotal - r.audioExported) WAV missing." : "") }
+    func generateAIPackage() { guard let snapshot = normalized else { aiPackageStatus = "Run a full analysis first."; return }; ensurePluginInventory(); aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: audioAssets, plugins: availablePlugins, delivery: .markdownOnly, exportSettings: exportSettings, mix: mixAsset); let r = packageReadiness; aiPackageStatus = "AI package generated (\(r.overall.rawValue)) · \(availablePlugins.count) plugins available." + (r.audioTotal > 0 && r.audioExported < r.audioTotal ? " Audio incomplete: \(r.audioTotal - r.audioExported) WAV missing." : "") }
     func savePackage() {
         guard let snapshot = normalized, let raw, let store else { aiPackageStatus = "Run a full analysis first."; return }
         ensurePluginInventory()
@@ -222,12 +227,12 @@ struct ApplicationLauncher: Sendable {
             audioAssets = freshAssets
             // Two readers, two deliveries: the folder/ZIP ships the JSON and WAVs next to the document, while the on-screen text is
             // what "Copy for AI" puts on the clipboard — Markdown alone, so it must say so instead of pointing at files.
-            let markdown = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .fullPackage, exportSettings: exportSettings)
-            aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .markdownOnly, exportSettings: exportSettings)
-            let audioManifest = AudioManifest(assets: freshAssets, exportSettings: exportSettings); let packageManifest = PackageManifest(project: project, assets: freshAssets)
+            let markdown = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .fullPackage, exportSettings: exportSettings, mix: mixAsset)
+            aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .markdownOnly, exportSettings: exportSettings, mix: mixAsset)
+            let audioManifest = AudioManifest(assets: freshAssets, exportSettings: exportSettings, mix: mixAsset); let packageManifest = PackageManifest(project: project, assets: freshAssets, mix: mixAsset)
             let expected = freshAssets.filter { $0.status == .exported }.count
             do {
-                let result = try await store.savePackage(projectName: project, markdown: markdown, snapshot: snapshot, audioManifest: audioManifest, packageManifest: packageManifest, assets: freshAssets, audioExtractor: audioExtractor, probe: AudioFileProbe())
+                let result = try await store.savePackage(projectName: project, markdown: markdown, snapshot: snapshot, audioManifest: audioManifest, packageManifest: packageManifest, assets: freshAssets, mix: mixAsset, audioExtractor: audioExtractor, probe: AudioFileProbe())
                 packageFolderURL = result.folder; packageZipURL = result.zip; aiPackageURL = result.folder.appendingPathComponent("AI_MIX_ANALYSIS.md")
                 if result.copiedWAVs == expected && result.missing.isEmpty {
                     aiPackageStatus = "Package saved (\(packageReadiness.overall.rawValue)) — \(result.copiedWAVs)/\(expected) WAV copied\(result.zip != nil ? ", zip ready" : "")."
@@ -263,6 +268,7 @@ struct ApplicationLauncher: Sendable {
                 raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""
                 planText = ""; validated = []; planStatus = ""
                 audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; metricsCache = [:]; exportSettings = nil
+                mixAsset = nil; mixStatus = ""; mixPhase = .idle; showBounceConfirm = false
                 packageFolderURL = nil; packageZipURL = nil
                 analyzerState = .ready; log = []; analysisSessionID = "unsaved_session"
                 stage = .connection; refreshConnection()
@@ -282,7 +288,7 @@ struct ApplicationLauncher: Sendable {
             let audioDir = await store.folderURL("audio")
             let assets = await analyzedAssets(raw: raw, normalized: normalized, audioDir: audioDir)
             audioAssets = assets
-            let manifest = AudioManifest(assets: assets, exportSettings: exportSettings); let s = manifest.summary
+            let manifest = AudioManifest(assets: assets, exportSettings: exportSettings, mix: mixAsset); let s = manifest.summary
             do {
                 _ = try await store.save(manifest, folder: "metadata", name: "audio_manifest.json")
                 _ = try await store.saveText(manifest.markdown(), folder: "metadata", name: "AUDIO_ASSETS.md")
@@ -304,7 +310,7 @@ struct ApplicationLauncher: Sendable {
         metricsCache = refreshedCache
         return assets
     }
-    func copyAudioManifest() { guard !audioAssets.isEmpty else { audioStatus = "Prepare track export first."; return }; NSPasteboard.general.clearContents(); NSPasteboard.general.setString(AudioManifest(assets: audioAssets, exportSettings: exportSettings).markdown(), forType: .string); audioStatus = "Audio manifest copied (Markdown) — paste it to your LLM with the WAV files." }
+    func copyAudioManifest() { guard !audioAssets.isEmpty else { audioStatus = "Prepare track export first."; return }; NSPasteboard.general.clearContents(); NSPasteboard.general.setString(AudioManifest(assets: audioAssets, exportSettings: exportSettings, mix: mixAsset).markdown(), forType: .string); audioStatus = "Audio manifest copied (Markdown) — paste it to your LLM with the WAV files." }
 
     /// Preconditions + confirmation before launching Logic's native export. Never fakes success.
     func requestExport() {
@@ -380,7 +386,7 @@ struct ApplicationLauncher: Sendable {
         // really exist now, and DSP metrics are computed here, from those final stable files, never from mid-write intermediates.
         let finalAssets = await analyzedAssets(raw: raw, normalized: normalized, audioDir: audioDir)
         audioAssets = finalAssets
-        let manifest = AudioManifest(assets: finalAssets, exportSettings: exportSettings); let summary = manifest.summary
+        let manifest = AudioManifest(assets: finalAssets, exportSettings: exportSettings, mix: mixAsset); let summary = manifest.summary
         _ = try? await store.save(manifest, folder: "metadata", name: "audio_manifest.json")
         _ = try? await store.saveText(manifest.markdown(), folder: "metadata", name: "AUDIO_ASSETS.md")
         if !aiPackage.isEmpty { generateAIPackage() }
@@ -389,4 +395,93 @@ struct ApplicationLauncher: Sendable {
     }
     func openAudioFolder() { Task { await store?.reveal(folder: "audio") } }
     func revealData() { Task { await store?.reveal() } }
+
+    // MARK: Mix bounce (Stereo Out)
+
+    /// Preconditions + confirmation before launching Logic's native bounce. Never fakes success.
+    func requestMixBounce() {
+        guard normalized != nil, store != nil else { mixStatus = "Run a full read-only analysis first."; mixPhase = .failed("no analysis"); return }
+        connection = analyzer.connectionStatus()
+        guard connection.found else { mixStatus = "Logic Pro is not running — open your project first."; mixPhase = .failed("Logic not running"); return }
+        guard connection.accessibilityTrusted else { mixStatus = "Accessibility permission is required to control Logic's bounce dialog."; mixPhase = .failed("accessibility denied"); return }
+        showBounceConfirm = true
+    }
+    /// Launches File ▸ Bounce via AX, then waits for the REAL file on disk — a realtime bounce writes for as long as
+    /// the song plays, so nothing is claimed until a stable, AVAudioFile-readable file exists in current/mix.
+    func confirmMixBounce() {
+        showBounceConfirm = false
+        guard let store else { return }
+        mixPhase = .exporting; mixStatus = "Bouncing the mix from Logic…"; mixAsset = nil
+        Task {
+            let mixDir = await store.folderURL("mix")
+            await store.clearAudioFiles(folder: "mix") // one unambiguous file per bounce
+            let exporter = exporter
+            let outcome = await Task.detached(priority: .userInitiated) { exporter.bounceMix(destination: mixDir) }.value
+            NSApp.activate() // Logic keeps bouncing on its own; bring the user back to the detection progress
+            switch outcome {
+            case .triggerFailed(let step, let detail):
+                mixPhase = .failed(step)
+                mixStatus = "Could not launch Logic's bounce at ‘\(step)’: \(detail)"
+                log.append("Logic bounce trigger failed at \(step): \(detail)")
+            case .blockedByNormalize(let value):
+                mixPhase = .failed("normalize")
+                mixStatus = "Bounce stopped: Logic's bounce dialog has Normalize set to ‘\(value)’, which would rewrite the mix level and falsify the loudness evidence. Set Normalize to Off in the bounce dialog once, then bounce again."
+                log.append("Logic bounce blocked: Normalize is ‘\(value)’, not Off — the dialog was cancelled and nothing was bounced.")
+            case .navigationFailed(let step, let detail):
+                mixPhase = .failed(step)
+                mixStatus = "Logic's bounce dialog could not be automated at ‘\(step)’: \(detail) You can finish the dialog manually into the mix folder — the file will still be detected."
+                log.append("Logic bounce dialog automation failed at \(step): \(detail)")
+                await pollForMixBounce(mixDir: mixDir, settings: nil) // still detect if the user completes it manually
+            case .bounced(let item, let settings):
+                mixStatus = "Logic is bouncing via ‘\(item)’. Waiting for the file…"
+                log.append("Logic bounce launched via \(item), format=\(settings.format ?? "unread"), normalize=\(settings.normalize ?? "unread").")
+                await pollForMixBounce(mixDir: mixDir, settings: ExportSettingsFacts(settings: settings))
+            }
+        }
+    }
+    /// Done only when the file set in current/mix is stable between two scans AND the newest file really reads as audio
+    /// (a mid-write bounce file does not); the asset's facts and DSP metrics then come from that final file alone.
+    private func pollForMixBounce(mixDir: URL, settings: ExportSettingsFacts?) async {
+        func signature() -> [String] {
+            let manager = FileManager.default
+            guard let names = try? manager.contentsOfDirectory(atPath: mixDir.path) else { return [] }
+            return names.filter { ["wav", "aif", "aiff", "caf"].contains(($0 as NSString).pathExtension.lowercased()) }
+                .map { name in
+                    let size = (try? manager.attributesOfItem(atPath: mixDir.appendingPathComponent(name).path))?[.size] as? Int
+                    return "\(name)|\(size.map(String.init) ?? "?")"
+                }.sorted()
+        }
+        var previous: [String]? = nil
+        var idleScans = 0
+        for _ in 0..<1200 { // hard cap ~30 minutes: a realtime bounce takes as long as the song plays
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            let current = signature()
+            if !current.isEmpty, current == previous {
+                let resolved = await Task.detached(priority: .userInitiated) { MixBounceAsset.resolve(in: mixDir, settings: settings) }.value
+                if let resolved {
+                    mixAsset = resolved
+                    mixPhase = .done
+                    mixStatus = "Mix bounced: \((resolved.relativePath as NSString).lastPathComponent)" + (resolved.metrics?.integratedLoudnessLUFS.value.map { String(format: " · %.1f LUFS integrated", $0) } ?? "")
+                    log.append("Mix bounce detected: \(resolved.relativePath).")
+                    await saveAudioManifest()
+                    if !aiPackage.isEmpty { generateAIPackage() }
+                    return
+                }
+            }
+            idleScans = current == previous ? idleScans + 1 : 0
+            previous = current
+            mixStatus = current.isEmpty ? "Waiting for Logic's bounce file…" : "Bounce in progress — waiting for the file to finish…"
+            if idleScans >= 80 { break } // two minutes with nothing arriving or becoming readable — Logic is not bouncing (anymore)
+        }
+        mixPhase = .idle
+        mixStatus = "No finished mix bounce was detected in the mix folder. Finish Logic's bounce there manually or bounce again."
+    }
+    /// Rewrites audio_manifest.json / AUDIO_ASSETS.md from the current state (assets, export settings, mix).
+    private func saveAudioManifest() async {
+        guard let store else { return }
+        let manifest = AudioManifest(assets: audioAssets, exportSettings: exportSettings, mix: mixAsset)
+        _ = try? await store.save(manifest, folder: "metadata", name: "audio_manifest.json")
+        _ = try? await store.saveText(manifest.markdown(), folder: "metadata", name: "AUDIO_ASSETS.md")
+    }
+    func openMixFolder() { Task { await store?.reveal(folder: "mix") } }
 }

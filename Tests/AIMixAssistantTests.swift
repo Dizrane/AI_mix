@@ -435,7 +435,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.10`"))
+    #expect(md.contains("Package schema: `2.11`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -539,7 +539,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 @Test func manifestRecordsExportDialogSettingsAsFacts() throws {
     let settings = ExportSettingsFacts(settings: ExportDialogSettings(format: "WAVE", bitDepth: "24 Bit", normalize: "Off"))
     let manifest = AudioManifest(assets: extractAudio(audioSnapshot()), exportSettings: settings)
-    #expect(manifest.schemaVersion == "1.2")
+    #expect(manifest.schemaVersion == "1.3")
     let md = manifest.markdown()
     #expect(md.contains("Format WAVE · Bit depth 24 Bit · Normalize Off"))
     #expect(!md.contains("unverified")) // a proven Off needs no caveat
@@ -571,6 +571,83 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(without.contains("Export dialog settings: unavailable"))
     #expect(without.contains("whether Normalize altered the exported levels is unverified"))
 }
+// MARK: - Mix bounce (Stereo Out reference)
+
+@Test func mixResolvePicksTheRealFileAndMeasuresIt() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try writeWAV(dir.appendingPathComponent("My Song.wav"), seconds: 1, channels: 2)
+    let mix = MixBounceAsset.resolve(in: dir, settings: nil)
+    #expect(mix?.relativePath == "mix/My Song.wav")
+    #expect(mix?.channels.value == 2); #expect(mix?.sampleRate.value == 44100); #expect(mix?.format.value == "PCM (integer)")
+    #expect(mix?.metrics != nil) // the bounced file gets the same locally measured DSP facts as every track WAV
+}
+@Test func mixResolveNeverFabricatesFromAnEmptyOrUnreadableFolder() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    #expect(MixBounceAsset.resolve(in: dir, settings: nil) == nil) // nothing there
+    try Data([0x00, 0x01, 0x02]).write(to: dir.appendingPathComponent("mid-write.wav")) // not readable audio
+    #expect(MixBounceAsset.resolve(in: dir, settings: nil) == nil)
+}
+@Test func mixResolvePrefersTheNewestReadableFile() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let old = dir.appendingPathComponent("old bounce.wav"); let new = dir.appendingPathComponent("new bounce.wav")
+    try writeWAV(old); try writeWAV(new)
+    try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -3600)], ofItemAtPath: old.path)
+    try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: new.path)
+    #expect(MixBounceAsset.resolve(in: dir, settings: nil)?.relativePath == "mix/new bounce.wav")
+}
+@Test func manifestCarriesTheMixAndItsAbsenceHonestly() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try writeWAV(dir.appendingPathComponent("Mix.wav"), channels: 2)
+    let mix = MixBounceAsset.resolve(in: dir, settings: ExportSettingsFacts(settings: ExportDialogSettings(format: "WAVE", bitDepth: "24 Bit", normalize: "Off")))
+    let with = AudioManifest(assets: extractAudio(audioSnapshot()), mix: mix)
+    #expect(with.markdown().contains("Mix (Stereo Out): mix/Mix.wav"))
+    let back = try JSONDecoder().decode(AudioManifest.self, from: JSONEncoder().encode(with))
+    #expect(back.mix?.relativePath == "mix/Mix.wav"); #expect(back.mix?.bounceSettings?.normalize.value == "Off")
+    let without = AudioManifest(assets: extractAudio(audioSnapshot())).markdown()
+    #expect(without.contains("Mix (Stereo Out): none"))
+}
+@Test func packageRendersTheMixSectionWithMetricsAndSettings() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try writeFloatWAV(dir.appendingPathComponent("Mix.wav"), channels: [sineSamples(1000, amplitude: 0.5, seconds: 1), sineSamples(1000, amplitude: 0.5, seconds: 1)])
+    let mix = MixBounceAsset.resolve(in: dir, settings: ExportSettingsFacts(settings: ExportDialogSettings(format: "WAVE", bitDepth: "24 Bit", normalize: "Off")))
+    let raw = audioSnapshot()
+    let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw), mix: mix)
+    #expect(md.contains("## Mix (Stereo Out)"))
+    #expect(md.contains("- File: known: mix/Mix.wav"))
+    #expect(md.contains("Bounce dialog Normalize: known: Off"))
+    #expect(md.contains("the file carries the mix's real level"))
+    #expect(md.contains("Listen to this file (`mix/Mix.wav`) first")) // fullPackage delivery orders the listening
+    #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // the mix's own measured block
+}
+@Test func packageStatesTheMissingMixAsALimitationNeverAnAssumption() {
+    let raw = audioSnapshot()
+    let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw))
+    #expect(md.contains("## Mix (Stereo Out)"))
+    #expect(md.contains("No bounced mix exists in this analysis"))
+    #expect(md.contains("NOT supported by measurements here"))
+}
+@Test func markdownOnlyMixDeliveryNamesTheFileAsAbsent() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try writeWAV(dir.appendingPathComponent("Mix.wav"), channels: 2)
+    let mix = MixBounceAsset.resolve(in: dir, settings: nil)
+    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", audio: extractAudio(audioSnapshot()), delivery: .markdownOnly, mix: mix)
+    #expect(md.contains("the file is not part of this delivery"))
+    #expect(!md.contains("Listen to this file"))
+    #expect(md.contains("Bounce dialog settings: unavailable")) // an unobserved dialog stays honest
+}
+
 // MARK: - Export clipboard preservation
 
 @Test func exportClipboardSnapshotRoundTripsEveryRepresentation() {
@@ -729,7 +806,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.10`"))
+    #expect(md.contains("Package schema: `2.11`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))

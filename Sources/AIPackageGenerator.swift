@@ -8,8 +8,8 @@ enum PackageDelivery: Sendable { case markdownOnly, fullPackage }
 
 /// Provider-neutral export of normalized, evidence-based DAW facts for any external LLM.
 struct AIPackageGenerator: Sendable {
-    static let schemaVersion = "2.10"
-    func make(snapshot: NormalizedSnapshot, sessionID: String, audio: [AudioAsset] = [], plugins: [PluginInventoryItem] = [], probes: [ProbeType] = ProbeType.allCases, delivery: PackageDelivery = .fullPackage, exportSettings: ExportSettingsFacts? = nil) -> String {
+    static let schemaVersion = "2.11"
+    func make(snapshot: NormalizedSnapshot, sessionID: String, audio: [AudioAsset] = [], plugins: [PluginInventoryItem] = [], probes: [ProbeType] = ProbeType.allCases, delivery: PackageDelivery = .fullPackage, exportSettings: ExportSettingsFacts? = nil, mix: MixBounceAsset? = nil) -> String {
         let readiness = PackageReadiness.evaluate(snapshot: snapshot, assets: audio)
         var out: [String] = []
         out += ["# AI Mix Analysis", ""]
@@ -21,6 +21,7 @@ struct AIPackageGenerator: Sendable {
         out += trackLinkingSection(snapshot)
         out += signalFlowSection(snapshot)
         out += audioAssetsSection(audio, delivery: delivery, exportSettings: exportSettings)
+        out += mixSection(mix, delivery: delivery)
         out += provenanceSection(audio)
         out += missingAudioSection(audio)
         out += pluginSections(plugins)
@@ -149,17 +150,37 @@ struct AIPackageGenerator: Sendable {
             out += ["", "### Audio Asset \(asset.audioID)", "- logicalTrackID: known: \(asset.logicalTrackID)", "- Logic Track Name: \(render(asset.trackName))", "- WAV file: \(render(asset.actualExportedPath))", "- Expected export path: known: \(asset.expectedExportPath)", "- Status: known: \(asset.status.rawValue)"]
             if let reason = asset.statusReason { out += ["- Status note: \(reason)"] }
             out += ["- Duration: \(render(asset.durationSeconds, unit: " s"))", "- Sample rate: \(render(asset.sampleRate, unit: " Hz"))", "- Channels: \(render(asset.channels))", "- Bit depth: \(render(asset.bitDepth))", "- Format: \(render(asset.format))"]
-            out += metricsLines(asset)
+            out += metricsLines(asset.metrics)
             out += ["- Regions (\(asset.regionCount)): " + (asset.regions.isEmpty ? "unavailable: no regions captured" : asset.regions.map { "`\($0.regionID)` \u{201C}\($0.name.value ?? "unnamed")\u{201D}" }.joined(separator: ", "))]
         }
+        return out
+    }
+    /// The bounced Stereo Out: the one file where overall loudness, tonal balance, stereo width and masking are real,
+    /// measurable properties — no per-track WAV contains the master chain or the sum. Its absence is a stated limitation
+    /// the model must respect, never paper over with per-track extrapolation.
+    private func mixSection(_ mix: MixBounceAsset?, delivery: PackageDelivery) -> [String] {
+        var out: [String] = ["", "## Mix (Stereo Out)", "", "The bounced sum of the project through the whole master chain (Logic's File \u{25B8} Bounce) — the reference the per-track WAVs are judged against: overall loudness, tonal balance, stereo image and masking exist only in the sum, and no per-track WAV contains the master-chain processing."]
+        guard let mix else {
+            out += ["", "- No bounced mix exists in this analysis. Every audio fact above is per-track only; statements about the finished mix (its loudness, overall balance, how the tracks sit together) are NOT supported by measurements here — name them as requiring the bounced mix instead of asserting them."]
+            return out
+        }
+        out += ["", "- File: known: \(mix.relativePath)" + (delivery == .fullPackage ? "" : " (the file is not part of this delivery — the measurements below are the mix evidence available to you)"), "- Duration: \(render(mix.durationSeconds, unit: " s"))", "- Sample rate: \(render(mix.sampleRate, unit: " Hz"))", "- Channels: \(render(mix.channels))", "- Bit depth: \(render(mix.bitDepth))", "- Format: \(render(mix.format))"]
+        if let s = mix.bounceSettings {
+            out += [fact("Bounce dialog format", s.format), fact("Bounce dialog bit depth", s.bitDepth), fact("Bounce dialog Normalize", s.normalize)]
+            out += s.normalize.value.map { ["- Normalize was read as \($0) off Logic's own bounce dialog (any other value cancels the bounce), so the file carries the mix's real level."] } ?? ["- Normalize was not readable on the bounce dialog, so whether the bounced level was rewritten is unverified."]
+        } else {
+            out += ["- Bounce dialog settings: unavailable — this session did not observe Logic's bounce dialog for this file, so whether Normalize altered its level is unverified."]
+        }
+        out += mix.metrics == nil ? ["- Audio metrics: unavailable — the file could not be analyzed"] : metricsLines(mix.metrics)
+        if delivery == .fullPackage { out += ["", "Listen to this file (`" + mix.relativePath + "`) first for the overall picture, then to the per-track WAVs in `audio/`, and cross-check what you hear against the measured metrics."] }
         return out
     }
     /// Locally computed DSP measurements of one exported WAV — facts about that file (BS.1770-4 loudness and true peak,
     /// levels, spectrum, stereo, silence map, technical flags), never musical judgements. Values are rounded for reading
     /// (LUFS/dB to 0.1, percent to 1, centroid to 1 Hz); the JSON manifests keep full precision. States render honestly:
     /// an `unavailable` metric (e.g. stereo correlation of a mono file, dB level of digital silence) stays visible as such.
-    private func metricsLines(_ asset: AudioAsset) -> [String] {
-        guard let m = asset.metrics else { return [] }
+    private func metricsLines(_ metrics: AudioMetrics?) -> [String] {
+        guard let m = metrics else { return [] }
         var out = ["- Audio metrics (computed locally, facts):", metric("Integrated loudness (BS.1770-4)", m.integratedLoudnessLUFS, digits: 1, unit: " LUFS"), metric("True peak (BS.1770-4, 4× oversampled)", m.truePeakDBTP, digits: 1, unit: " dBTP"), metric("Sample peak", m.samplePeakDBFS, digits: 1, unit: " dBFS"), metric("RMS", m.rmsDBFS, digits: 1, unit: " dBFS"), metric("Crest factor", m.crestFactorDB, digits: 1, unit: " dB")]
         if let bands = m.spectralBands.value {
             out += ["  - Spectral energy share: known: sub 20–60 Hz \(percent(bands.subPercent)) · bass 60–250 Hz \(percent(bands.bassPercent)) · low-mid 250–500 Hz \(percent(bands.lowMidPercent)) · mid 500–2000 Hz \(percent(bands.midPercent)) · high-mid 2000–6000 Hz \(percent(bands.highMidPercent)) · high 6000–20000 Hz \(percent(bands.highPercent))"]
