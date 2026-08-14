@@ -46,16 +46,24 @@ struct LogicAccessibilityAnalyzer: DAWAnalyzer {
         return .init(application: .init(name: status.localizedName ?? "Logic Pro", bundleIdentifier: status.bundleIdentifier ?? "unavailable", pid: pid, projectWindowTitle: identity.title, projectWindowDocument: identity.document, projectWindowSource: identity.source), root: root, targets: windowTargets + targeted, diagnostics: diagnostics)
     }
     /// The two documented attributes that identify the open project: a window's `AXDocument` (the `.logicx` file URL) and its `AXTitle`.
-    /// The window itself is `AXMainWindow`, or `AXFocusedWindow` when Logic exposes no main window, so none has to be guessed — and the
-    /// attribute that supplied it is returned alongside, because a fact must cite the path it was actually read from. All nil when the
-    /// application exposes no such window, as it does with no open project.
+    /// Which window carries them is not guessed: every window Logic exposes (main, focused, then the full `AXWindows`
+    /// list) is offered with its subrole to `ProjectPresence.selectWindow`, which prefers a document from ANY window
+    /// over any title and refuses a dialog's caption as title evidence — so an open file dialog (the export panel is
+    /// titled "Open") never impersonates the project while the real project window still names its `.logicx` file.
+    /// The attribute the winning window came from is returned alongside, because a fact must cite its real read path.
     private func projectIdentity(of application: AXUIElement) -> (title: String?, document: String?, source: String?) {
+        var candidates: [ProjectWindowEvidence] = []
+        func describe(_ element: AXUIElement, source: String) -> ProjectWindowEvidence {
+            .init(title: string(element, kAXTitleAttribute), document: string(element, kAXDocumentAttribute), subrole: string(element, kAXSubroleAttribute), source: source)
+        }
         for key in [kAXMainWindowAttribute, kAXFocusedWindowAttribute] {
             guard let window = attribute(application, key), CFGetTypeID(window) == AXUIElementGetTypeID() else { continue }
-            let element = window as! AXUIElement
-            return (string(element, kAXTitleAttribute), string(element, kAXDocumentAttribute), key)
+            candidates.append(describe(window as! AXUIElement, source: key))
         }
-        return (nil, nil, nil)
+        if let list = attribute(application, kAXWindowsAttribute) as? [AXUIElement] {
+            candidates += list.map { describe($0, source: kAXWindowsAttribute) }
+        }
+        return ProjectPresence.selectWindow(candidates)
     }
     func runProbe(_ request: ProbeRequest) throws -> ProbeResult {
         let snapshot = try fullScan()

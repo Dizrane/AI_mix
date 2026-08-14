@@ -435,7 +435,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.11`"))
+    #expect(md.contains("Package schema: `2.12`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -539,7 +539,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 @Test func manifestRecordsExportDialogSettingsAsFacts() throws {
     let settings = ExportSettingsFacts(settings: ExportDialogSettings(format: "WAVE", bitDepth: "24 Bit", normalize: "Off"))
     let manifest = AudioManifest(assets: extractAudio(audioSnapshot()), exportSettings: settings)
-    #expect(manifest.schemaVersion == "1.3")
+    #expect(manifest.schemaVersion == "1.4")
     let md = manifest.markdown()
     #expect(md.contains("Format WAVE · Bit depth 24 Bit · Normalize Off"))
     #expect(!md.contains("unverified")) // a proven Off needs no caveat
@@ -646,6 +646,110 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(md.contains("the file is not part of this delivery"))
     #expect(!md.contains("Listen to this file"))
     #expect(md.contains("Bounce dialog settings: unavailable")) // an unobserved dialog stays honest
+}
+
+// MARK: - Export dialog controls matched by row geometry
+
+/// Logic's real dialog captions Normalize with a SEPARATE static text ("Normalize:") while the pop-up itself is anonymous,
+/// so a title search finds nothing; the link is the dialog's own geometry. The coordinates are the live snapshot's: the
+/// label sits at y=504 and its pop-up at y=500 on one row — a neighbouring row or a control left of the label never matches.
+@Test func rowGeometryMatchesTheUnlabelledNormalizePopup() {
+    let label = CGRect(x: 420, y: 504, width: 70, height: 16)
+    let sameRowPopup = CGRect(x: 495, y: 500, width: 200, height: 22)
+    let rowAbove = CGRect(x: 495, y: 470, width: 200, height: 22)
+    let leftOfLabel = CGRect(x: 100, y: 500, width: 200, height: 22)
+    #expect(LogicExportAutomator.rowControlIndex(labelFrame: label, controlFrames: [rowAbove, sameRowPopup, leftOfLabel]) == 1)
+    #expect(LogicExportAutomator.rowControlIndex(labelFrame: label, controlFrames: [rowAbove, leftOfLabel]) == nil) // no control on the row: no guess
+}
+@Test func rowGeometryPicksTheNearestControlOnTheRow() {
+    let label = CGRect(x: 420, y: 504, width: 70, height: 16)
+    let near = CGRect(x: 495, y: 500, width: 120, height: 22)
+    let far = CGRect(x: 700, y: 500, width: 120, height: 22)
+    #expect(LogicExportAutomator.rowControlIndex(labelFrame: label, controlFrames: [far, near]) == 1)
+}
+
+// MARK: - File-panel key routing
+
+/// macOS runs open/save panels in their own system process, so a key posted to Logic's pid never reaches the panel —
+/// the go-to-folder sheet simply does not open (the v0.2.12 regression). The panel element's own pid is tried first,
+/// Logic's pid stays the fallback for an in-process panel, and the system-wide stream comes last (the caller uses it
+/// only while Logic is frontmost, so a paste can never land in another application).
+@Test func panelKeysTargetThePanelOwnerFirstThenLogicThenGlobal() {
+    #expect(LogicExportAutomator.keyRouteCandidates(panelOwner: 555, applicationPid: 42) == [.pid(555), .pid(42), .global])
+    #expect(LogicExportAutomator.keyRouteCandidates(panelOwner: 42, applicationPid: 42) == [.pid(42), .global])
+    #expect(LogicExportAutomator.keyRouteCandidates(panelOwner: nil, applicationPid: 42) == [.pid(42), .global])
+}
+
+// MARK: - Bounce format table (the mix must be an uncompressed PCM file)
+
+@Test func bounceFormatsMustIncludeAnUncompressedPCMEntry() {
+    // The real failure case: only MP3 checked, the PCM row unchecked — the bounce would produce a lossy file that is
+    // not level evidence and would not even be detected as the mix, so it must be cancelled.
+    #expect(LogicExportAutomator.formatsBlockBounce([FormatSelection(name: "MP3", enabled: true), FormatSelection(name: "PCM", enabled: false)]) == true)
+    #expect(LogicExportAutomator.formatsBlockBounce([FormatSelection(name: "PCM", enabled: true), FormatSelection(name: "MP3", enabled: true)]) == false)
+    #expect(LogicExportAutomator.formatsBlockBounce([FormatSelection(name: "Uncompressed", enabled: true)]) == false) // current Logic titles the PCM row "Uncompressed"
+    #expect(LogicExportAutomator.formatsBlockBounce([FormatSelection(name: "M4A: AAC", enabled: true)]) == true)
+    #expect(LogicExportAutomator.formatsBlockBounce([FormatSelection(name: "PCM", enabled: false), FormatSelection(name: "MP3", enabled: false)]) == true) // nothing checked: no PCM file will be written
+    #expect(LogicExportAutomator.formatsBlockBounce(nil) == false) // an unread table never blocks — it is published unavailable instead
+    #expect(LogicExportAutomator.formatsBlockBounce([]) == false)
+}
+@Test func bounceFormatTableBecomesAFactAndSurvivesJSON() throws {
+    let table = [FormatSelection(name: "PCM", enabled: true), FormatSelection(name: "MP3", enabled: false)]
+    let settings = ExportSettingsFacts(settings: ExportDialogSettings(format: nil, bitDepth: nil, normalize: "Off", formats: table))
+    #expect(settings.formats.state == .known)
+    #expect(settings.formats.value == table)
+    #expect(settings.formats.source == "bounce dialog format table")
+    // A dialog without a format table (the track export) keeps the fact honestly unavailable.
+    #expect(ExportSettingsFacts(settings: ExportDialogSettings(format: "WAVE", bitDepth: "24 Bit", normalize: "Off")).formats.state == .unavailable)
+    // Round trip, and a manifest written before schema 1.4 (no formats key) still decodes.
+    let back = try JSONDecoder().decode(ExportSettingsFacts.self, from: JSONEncoder().encode(settings))
+    #expect(back.formats.value == table)
+    let legacy = #"{"format":{"state":"known","value":"WAVE"},"bitDepth":{"state":"unavailable"},"normalize":{"state":"known","value":"Off"}}"#
+    #expect(try JSONDecoder().decode(ExportSettingsFacts.self, from: Data(legacy.utf8)).formats.state == .unavailable)
+}
+@Test func manifestAndPackageRenderTheBounceFormatTable() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try writeWAV(dir.appendingPathComponent("Mix.wav"), channels: 2)
+    let settings = ExportSettingsFacts(settings: ExportDialogSettings(format: nil, bitDepth: nil, normalize: "Off", formats: [FormatSelection(name: "PCM", enabled: true), FormatSelection(name: "MP3", enabled: false)]))
+    let mix = MixBounceAsset.resolve(in: dir, settings: settings)
+    #expect(AudioManifest(assets: extractAudio(audioSnapshot()), mix: mix).markdown().contains("PCM: checked · MP3: unchecked"))
+    let raw = audioSnapshot()
+    let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw), mix: mix)
+    #expect(md.contains("- Bounce dialog formats (read from Logic's own format table; a bounce with no uncompressed PCM format checked is cancelled): known: PCM: checked · MP3: unchecked"))
+}
+
+// MARK: - Project window selection (dialogs never impersonate the project)
+
+@Test func projectWindowSelectionIgnoresTheOpenFileDialog() {
+    // While the export dialog is up it IS Logic's main/focused window — titled "Open", no document; the real project
+    // window with its .logicx document is still in the window list. The dialog's caption must never become the project name.
+    let picked = ProjectPresence.selectWindow([
+        .init(title: "Open", document: nil, subrole: "AXDialog", source: "AXMainWindow"),
+        .init(title: "Open", document: nil, subrole: "AXDialog", source: "AXFocusedWindow"),
+        .init(title: "fanlove — Tracks", document: "file:///Users/dizrane/Music/Logic/fanlove.logicx", subrole: "AXStandardWindow", source: "AXWindows")
+    ])
+    #expect(picked.document == "file:///Users/dizrane/Music/Logic/fanlove.logicx")
+    #expect(picked.source == "AXWindows")
+    let presence = ProjectPresence.evaluate(title: picked.title, document: picked.document, windowSource: picked.source)
+    #expect(presence.open); #expect(presence.name == "fanlove"); #expect(presence.source == "AXDocument of AXWindows")
+}
+@Test func dialogTitleAloneIsNeverProjectEvidence() {
+    let picked = ProjectPresence.selectWindow([.init(title: "Open", document: nil, subrole: "AXDialog", source: "AXMainWindow")])
+    #expect(picked.title == nil); #expect(picked.document == nil); #expect(picked.source == nil)
+    #expect(ProjectPresence.evaluate(title: picked.title, document: picked.document, windowSource: picked.source).open == false)
+}
+@Test func unsavedProjectTitleStillCountsFromItsStandardWindow() {
+    // An unsaved project has no document anywhere; its own standard window's title is still evidence even while a dialog is frontmost.
+    let picked = ProjectPresence.selectWindow([
+        .init(title: "Bounce", document: nil, subrole: "AXDialog", source: "AXMainWindow"),
+        .init(title: "Untitled", document: nil, subrole: "AXStandardWindow", source: "AXWindows")
+    ])
+    #expect(picked.title == "Untitled"); #expect(picked.source == "AXWindows")
+    // A window with no readable subrole keeps the old behaviour: its title still counts.
+    let bare = ProjectPresence.selectWindow([.init(title: "fanlove — Tracks", document: nil, subrole: nil, source: "AXMainWindow")])
+    #expect(bare.title == "fanlove — Tracks"); #expect(bare.source == "AXMainWindow")
 }
 
 // MARK: - Export clipboard preservation
@@ -806,7 +910,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.11`"))
+    #expect(md.contains("Package schema: `2.12`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))

@@ -427,6 +427,11 @@ struct ApplicationLauncher: Sendable {
                 mixPhase = .failed("normalize")
                 mixStatus = "Bounce stopped: Logic's bounce dialog has Normalize set to ‘\(value)’, which would rewrite the mix level and falsify the loudness evidence. Set Normalize to Off in the bounce dialog once, then bounce again."
                 log.append("Logic bounce blocked: Normalize is ‘\(value)’, not Off — the dialog was cancelled and nothing was bounced.")
+            case .blockedByFormat(let selected):
+                mixPhase = .failed("format")
+                let checked = selected.filter(\.enabled).map(\.name)
+                mixStatus = "Bounce stopped: the bounce dialog's format table has no uncompressed PCM format checked (\(checked.isEmpty ? "nothing is checked" : "checked: \(checked.joined(separator: ", "))")). A lossy file is not level evidence and would not be detected as the mix. In the bounce dialog, check PCM (Uncompressed) once and uncheck the compressed formats, then bounce again."
+                log.append("Logic bounce blocked: format table read as \(selected.caption) — no uncompressed PCM format is checked; the dialog was cancelled and nothing was bounced.")
             case .navigationFailed(let step, let detail):
                 mixPhase = .failed(step)
                 mixStatus = "Logic's bounce dialog could not be automated at ‘\(step)’: \(detail) You can finish the dialog manually into the mix folder — the file will still be detected."

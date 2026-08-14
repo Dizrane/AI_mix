@@ -36,6 +36,10 @@ struct RawSnapshot: Codable, Sendable {
 /// itself came from, so a published project fact can cite the exact read path. All nil when Logic exposes no such window.
 struct ApplicationInfo: Codable, Sendable { var name: String; var bundleIdentifier: String; var pid: Int32; var projectWindowTitle: String? = nil; var projectWindowDocument: String? = nil; var projectWindowSource: String? = nil }
 
+/// The documented identity of one Logic window, as the analyzer read it: caption, document, subrole and the attribute
+/// path the window itself came from — the raw material the project-window selection works on.
+struct ProjectWindowEvidence: Sendable, Equatable { var title: String?; var document: String?; var subrole: String?; var source: String }
+
 /// Whether Logic currently shows an open project, decided from the documented identity of its main/focused window. One rule
 /// shared by the live Connection indicator and the normalizer's project name: `AXDocument` (the project file URL) is proof and
 /// supplies the name; with no document the window's own non-empty `AXTitle` is the next real evidence, published verbatim (an
@@ -45,6 +49,25 @@ struct ApplicationInfo: Codable, Sendable { var name: String; var bundleIdentifi
 struct ProjectPresence: Sendable, Equatable {
     var open: Bool; var name: String?; var source: String?
     private static let chooserTitles: Set<String> = ["choose a project", "choose project"]
+    /// Picks the ONE window whose identity is project evidence, out of everything Logic exposes. A file dialog (the
+    /// export panel is literally titled "Open", the bounce window "Bounce") becomes the main/focused window while it
+    /// is up, and its caption used to be published as the project name. Two rules fix that without weakening honesty:
+    /// a window's `AXDocument` is proof wherever the window sits in the list (the real project window keeps its
+    /// document while a dialog is frontmost), and a bare `AXTitle` counts only on a standard window — a dialog's
+    /// subrole (`AXDialog`, `AXSheet`, `AXSystemDialog`, `AXFloatingWindow`) disqualifies its caption, and a window
+    /// with no readable subrole keeps the old behaviour. Candidates are evaluated in the order given (main, focused,
+    /// then the full window list), so the most authoritative evidence wins.
+    static func selectWindow(_ windows: [ProjectWindowEvidence]) -> (title: String?, document: String?, source: String?) {
+        if let documented = windows.first(where: { $0.document?.isEmpty == false }) {
+            return (documented.title, documented.document, documented.source)
+        }
+        let titled = windows.first { window in
+            guard let title = window.title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty else { return false }
+            return window.subrole == nil || window.subrole == "AXStandardWindow"
+        }
+        if let titled { return (titled.title, nil, titled.source) }
+        return (nil, nil, nil)
+    }
     static func evaluate(title: String?, document: String?, windowSource: String?) -> ProjectPresence {
         let window = windowSource ?? "AXWindow"
         if let document, let name = documentName(document) { return .init(open: true, name: name, source: "AXDocument of \(window)") }
