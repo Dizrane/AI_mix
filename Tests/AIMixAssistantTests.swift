@@ -54,6 +54,35 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
 @Test func validatorChecksReportedRange() { let plan = MixPlan(version: "1.0", status: "ready", actions: [.init(id: "a", target: .init(trackID: "channel_aux_1", pluginID: "q", parameterID: "gain"), action: .setPluginParameter, parameters: ["value": .number(20)], reason: "LLM")]); #expect(CommandValidator().validate(plan, against: fixture()).first?.status == .invalid) }
 @Test func diffReportsChangedTrack() { var after = fixture(); after.tracks[0].channel?.volumeDB = .known(-3); #expect(DiffEngine().compare(before: fixture(), after: after).changed == ["Changed: Aux 1"]) }
 @Test func planJSONRoundTrip() throws { let plan = MixPlan(version: "1.0", status: "ready", actions: []); #expect(try JSONDecoder().decode(MixPlan.self, from: JSONEncoder().encode(plan)).version == "1.0") }
+/// "Technically valid" must mean the value can actually be applied: an implemented action with a missing or mistyped
+/// `parameters.value` is malformed — invalid — never waved through.
+@Test func validatorRequiresTypedValuesForTrackActions() {
+    let plan = MixPlan(version: "1.0", status: "ready", actions: [
+        .init(id: "a", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: [:], reason: "LLM"),
+        .init(id: "b", target: .init(trackID: "channel_aux_1"), action: .setMute, parameters: ["value": .number(1)], reason: "LLM"),
+        .init(id: "c", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-3)], reason: "LLM"),
+        .init(id: "d", target: .init(trackID: "channel_aux_1"), action: .setSolo, parameters: ["value": .bool(true)], reason: "LLM")
+    ])
+    #expect(CommandValidator().validate(plan, against: fixture()).map(\.status) == [.invalid, .invalid, .valid, .valid])
+}
+@Test func validatorRequiresABooleanForPluginBypass() {
+    let plan = MixPlan(version: "1.0", status: "ready", actions: [
+        .init(id: "a", target: .init(trackID: "channel_aux_1", pluginID: "q"), action: .setPluginBypass, parameters: ["value": .number(1)], reason: "LLM"),
+        .init(id: "b", target: .init(trackID: "channel_aux_1", pluginID: "q"), action: .setPluginBypass, parameters: ["value": .bool(true)], reason: "LLM")
+    ])
+    #expect(CommandValidator().validate(plan, against: fixture()).map(\.status) == [.invalid, .valid])
+}
+/// The document tells the model to deliver the plan as one JSON code block, so the Review paste must accept exactly
+/// that: the fenced block, the block inside a larger reply, or the bare object — never fail on the fence itself.
+@Test func planPasteAcceptsFencedAndBareJSON() throws {
+    let bare = "{\"version\":\"1.0\",\"status\":\"ready\",\"actions\":[]}"
+    #expect(MixPlan.extractJSON(from: bare) == bare)
+    #expect(MixPlan.extractJSON(from: "```json\n\(bare)\n```") == bare)
+    #expect(MixPlan.extractJSON(from: "Here is the plan:\n\n```json\n\(bare)\n```\nLet me know.") == bare)
+    #expect(MixPlan.extractJSON(from: "The plan follows.\n\(bare)\nDone.") == bare)
+    let plan = try JSONDecoder().decode(MixPlan.self, from: Data(MixPlan.extractJSON(from: "```json\n\(bare)\n```").utf8))
+    #expect(plan.version == "1.0")
+}
 @Test func sessionStorage() async throws { let temp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString); let store = try SessionStore(root: temp); let url = try await store.save(fixture(), folder: "normalized", name: "s.json"); #expect(FileManager.default.fileExists(atPath: url.path)) }
 
 // MARK: - Channel-strip fact extraction
@@ -117,7 +146,9 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
     #expect(md.contains("- Destination: known: Bus 3 · kind: bus"))
     #expect(md.contains("- Bypass: known: false"))
     #expect(md.contains("- Level: requires_probe"))
-    #expect(md.contains("- none: no destination button on this strip is left unclassified"))
+    #expect(md.contains("- Routing buttons (slot kind unclassified): none")) // empty subsections compress to one line
+    #expect(md.contains("- Plugins: unavailable"))
+    #expect(!md.contains("no destination button on this strip")) // …their explanation lives once, in the legend
     #expect(!md.contains("no confirmed send facts"))
 }
 @Test func destinationKindsFollowLogicCaptionGrammar() {
@@ -193,6 +224,7 @@ private func flowTracks(_ strips: [RawAccessibilityNode]) -> [TrackFacts] { norm
     #expect(md.contains("## Signal flow (derived)"))
     #expect(md.contains("- `channel_audio_3` “Audio 3” → (output, Bus 1) → `channel_aux_1` “Aux 1”"))
     #expect(md.contains("  - Derived from: output fact at ")) // each edge cites the sources of both joined facts
+    #expect(!md.contains("is the strip's output slot + input fact at")) // …as bare AX paths: the rule text lives once, in the legend
     #expect(md.contains("- Terminal node: `channel_stereo_out` “Stereo Out” — the project's stereo output."))
     #expect(md.contains("- Bus 9: fed by channel_aux_1 (output), no channel with this input in the snapshot"))
 }
@@ -435,7 +467,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.14`"))
+    #expect(md.contains("Package schema: `2.15`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -481,6 +513,11 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     let plan = try JSONDecoder().decode(MixPlan.self, from: Data(json.utf8))
     #expect(plan.actions.count == 2)
     #expect(plan.actions.allSatisfy { CommandValidator().implemented.contains($0.action) })
+    // The schema section must route plug-in proposals to prose (no action adds a plug-in) and spell out each action's
+    // typed parameters.value, or the model builds plans the validator can only reject.
+    #expect(md.contains("NO action that adds a plug-in"))
+    #expect(md.contains("Plug-in recommendations are PROSE for the user"))
+    #expect(md.contains("`set_mute` and `set_solo` take a boolean `parameters.value`"))
 }
 /// The AX meter section is empty by nature (Logic publishes no numeric meters), and next to per-file LUFS/peak numbers a bare
 /// "LUFS: unavailable" reads as "no loudness data at all". It says which kind of reading it is and where the real numbers are.
@@ -646,6 +683,41 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(md.contains("the file is not part of this delivery"))
     #expect(!md.contains("Listen to this file"))
     #expect(md.contains("Bounce dialog settings: unavailable")) // an unobserved dialog stays honest
+}
+/// The finished mix's measured faults are the loudest news in the package; they must surface in the up-front digest,
+/// not only deep inside the Mix section under ten per-asset metric blocks.
+@Test func mixFaultsAppearInTheUpFrontDigest() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    var samples = sineSamples(1000, amplitude: 0.5, seconds: 2).map { $0 + 0.01 } // DC offset of 1% full scale
+    for index in 1_000..<1_010 { samples[index] = 1.0 } // a 10-sample run on the digital ceiling
+    try writeFloatWAV(dir.appendingPathComponent("Mix.wav"), channels: [samples])
+    let mix = MixBounceAsset.resolve(in: dir, settings: nil)
+    let raw = audioSnapshot()
+    let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw), mix: mix)
+    #expect(md.contains("Technical faults measured from the exported files and the bounced mix"))
+    #expect(md.contains("- Mix (Stereo Out) `mix/Mix.wav`:"))
+    #expect(md.contains("faults of the finished sum itself"))
+}
+/// Exports preserve timeline positions, so a bounce shorter than the longest exported track PROVABLY does not cover
+/// the whole project; the package must state that instead of presenting the mix as the full-song reference.
+@Test func bounceShorterThanTheLongestTrackIsFlagged() throws {
+    let audioDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    let mixDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: mixDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: audioDir); try? FileManager.default.removeItem(at: mixDir) }
+    try writeWAV(audioDir.appendingPathComponent("audio_track_001.wav"), seconds: 5)
+    try writeWAV(mixDir.appendingPathComponent("Mix.wav"), seconds: 1, channels: 2)
+    let raw = audioSnapshot()
+    let short = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw, dir: audioDir), mix: MixBounceAsset.resolve(in: mixDir, settings: nil))
+    #expect(short.contains("demonstrably does NOT cover the whole project"))
+    #expect(!short.contains("spans at least the longest exported track"))
+    try writeWAV(mixDir.appendingPathComponent("Mix.wav"), seconds: 6, channels: 2)
+    let full = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: extractAudio(raw, dir: audioDir), mix: MixBounceAsset.resolve(in: mixDir, settings: nil))
+    #expect(full.contains("spans at least the longest exported track"))
+    #expect(!full.contains("demonstrably does NOT cover"))
 }
 
 // MARK: - Export dialog controls matched by row geometry
@@ -1014,7 +1086,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.14`"))
+    #expect(md.contains("Package schema: `2.15`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
