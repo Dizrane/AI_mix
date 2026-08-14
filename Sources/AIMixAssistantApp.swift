@@ -482,7 +482,11 @@ struct ReviewScreen: View {
                     ForEach(model.validated) { item in
                         HStack(spacing: 10) {
                             StatusDot(state: item.status == .valid ? .ok : (item.status == .invalid ? .error : .warn))
-                            VStack(alignment: .leading, spacing: 2) { Text("\(item.command.action.rawValue) · \(targetLabel(item.command.target))").font(.system(size: 13, weight: .medium)); Text(item.message).font(.caption).foregroundStyle(.secondary) }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(item.command.action.rawValue)\(valueLabel(item.command).map { " \u{2192} \($0)" } ?? "") · \(targetLabel(item.command.target))").font(.system(size: 13, weight: .medium))
+                                if !item.command.reason.isEmpty { Text(item.command.reason).font(.caption).foregroundStyle(.secondary) }
+                                Text(item.message).font(.caption).foregroundStyle(.tertiary)
+                            }
                             Spacer()
                             Text(item.status.rawValue).font(.caption.weight(.semibold)).foregroundStyle(item.status == .valid ? .green : (item.status == .invalid ? .red : .orange))
                         }
@@ -490,7 +494,7 @@ struct ReviewScreen: View {
                     }
                 }
             }
-            Text("Live execution is not available in this build. AI Mix Assistant validates and previews the plan only; it never modifies Logic Pro.").font(.caption).foregroundStyle(.secondary)
+            Text("Live execution is not available in this build. AI Mix Assistant validates and previews the plan only; it never modifies Logic Pro. A validated plan is your instruction sheet: apply each action in Logic by hand — the value shown is the absolute target setting — together with the MANUAL STEPS from the model's reply.").font(.caption).foregroundStyle(.secondary)
         }
     }
     private func targetLabel(_ target: CommandTarget) -> String {
@@ -498,5 +502,16 @@ struct ReviewScreen: View {
         if let plugin = target.pluginName ?? target.pluginID { parts.append(plugin) }
         if let param = target.parameterName ?? target.parameterID { parts.append(param) }
         return parts.joined(separator: " / ")
+    }
+    /// The action's absolute target value, rendered for the human who will set it in Logic: dB for volume, plain numbers
+    /// for pan and plug-in parameters, on/off for the boolean actions. Nil when the plan carries no readable value.
+    private func valueLabel(_ command: MixCommand) -> String? {
+        if let number = command.parameters["value"]?.numberValue {
+            var text = String(format: "%.1f", number)
+            if text.hasSuffix(".0") { text.removeLast(2) }
+            return command.action == .setVolume ? "\(text) dB" : text
+        }
+        if let flag = command.parameters["value"]?.boolValue { return flag ? "on" : "off" }
+        return nil
     }
 }
