@@ -504,12 +504,21 @@ struct ReviewScreen: View {
         return parts.joined(separator: " / ")
     }
     /// The action's absolute target value, rendered for the human who will set it in Logic: dB for volume, plain numbers
-    /// for pan and plug-in parameters, on/off for the boolean actions. Nil when the plan carries no readable value.
+    /// for pan and plug-in parameters, on/off for the boolean actions. When the plan restates the control's current
+    /// value (volume/pan carry `parameters.current`), the move is shown as "current → target (Δ signed)" so its
+    /// direction is visible at a glance. Nil when the plan carries no readable value.
     private func valueLabel(_ command: MixCommand) -> String? {
-        if let number = command.parameters["value"]?.numberValue {
-            var text = String(format: "%.1f", number)
+        func number(_ n: Double) -> String {
+            var text = String(format: "%.1f", n)
             if text.hasSuffix(".0") { text.removeLast(2) }
             return command.action == .setVolume ? "\(text) dB" : text
+        }
+        if let value = command.parameters["value"]?.numberValue {
+            if let current = command.parameters["current"]?.numberValue {
+                let delta = value - current
+                return "\(number(current)) \u{2192} \(number(value)) (\u{0394} \(delta >= 0 ? "+" : "")\(number(delta)))"
+            }
+            return number(value)
         }
         if let flag = command.parameters["value"]?.boolValue { return flag ? "on" : "off" }
         return nil
