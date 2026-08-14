@@ -60,7 +60,7 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
     let plan = MixPlan(version: "1.0", status: "ready", actions: [
         .init(id: "a", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: [:], reason: "LLM"),
         .init(id: "b", target: .init(trackID: "channel_aux_1"), action: .setMute, parameters: ["value": .number(1)], reason: "LLM"),
-        .init(id: "c", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-3)], reason: "LLM"),
+        .init(id: "c", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-3), "current": .number(-2), "delta": .number(-1)], reason: "LLM"),
         .init(id: "d", target: .init(trackID: "channel_aux_1"), action: .setSolo, parameters: ["value": .bool(true)], reason: "LLM")
     ])
     #expect(CommandValidator().validate(plan, against: fixture()).map(\.status) == [.invalid, .invalid, .valid, .valid])
@@ -80,10 +80,32 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
         .init(id: "a", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(12)], reason: "LLM"),
         .init(id: "b", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-120)], reason: "LLM"),
         .init(id: "c", target: .init(trackID: "channel_aux_1"), action: .setPan, parameters: ["value": .number(90)], reason: "LLM"),
-        .init(id: "d", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(6)], reason: "LLM"),
-        .init(id: "e", target: .init(trackID: "channel_aux_1"), action: .setPan, parameters: ["value": .number(-64)], reason: "LLM")
+        .init(id: "d", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(6), "current": .number(-2), "delta": .number(8)], reason: "LLM"),
+        .init(id: "e", target: .init(trackID: "channel_aux_1"), action: .setPan, parameters: ["value": .number(-64), "current": .number(0), "delta": .number(-64)], reason: "LLM")
     ])
     #expect(CommandValidator().validate(plan, against: fixture()).map(\.status) == [.invalid, .invalid, .invalid, .valid, .valid])
+}
+/// LLMs reliably conflate the fader scale with measured LUFS and write "raise" while moving the control down, so a
+/// volume/pan action must prove its direction as arithmetic: `parameters.current` restates the known channel fact and
+/// `parameters.delta` is the signed move — current + delta must equal the target, and current must match the fact.
+/// Either mismatch (and a missing field) is invalid; with no known fact the arithmetic alone still pins the direction.
+@Test func validatorProvesDirectionWithCurrentAndDelta() {
+    let plan = MixPlan(version: "1.0", status: "ready", actions: [
+        .init(id: "a", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-3)], reason: "LLM"),
+        .init(id: "b", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-3), "current": .number(-2)], reason: "LLM"),
+        .init(id: "c", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-6), "current": .number(-2), "delta": .number(6)], reason: "raised to make it louder"),
+        .init(id: "d", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-3), "current": .number(0), "delta": .number(-3)], reason: "LLM"),
+        .init(id: "e", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-3), "current": .number(-2), "delta": .number(-1)], reason: "LLM"),
+        .init(id: "f", target: .init(trackID: "channel_aux_1"), action: .setPan, parameters: ["value": .number(-20), "current": .number(0), "delta": .number(-20)], reason: "LLM")
+    ])
+    #expect(CommandValidator().validate(plan, against: fixture()).map(\.status) == [.invalid, .invalid, .invalid, .invalid, .valid, .valid])
+    // No known Volume fact: current cannot be cross-checked (and is not guessed), but the arithmetic still guards the direction.
+    var blind = fixture(); blind.tracks[0].channel?.volumeDB = .unavailable
+    let arithmeticOnly = MixPlan(version: "1.0", status: "ready", actions: [
+        .init(id: "g", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-3), "current": .number(5), "delta": .number(-8)], reason: "LLM"),
+        .init(id: "h", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-3), "current": .number(5), "delta": .number(8)], reason: "LLM")
+    ])
+    #expect(CommandValidator().validate(arithmeticOnly, against: blind).map(\.status) == [.valid, .invalid])
 }
 /// Duplicated ids make individual steps ambiguous to talk about, and an empty reason is an instruction without a
 /// justification — both are malformed plan JSON, rejected as invalid rather than waved through as valid actions.
@@ -490,7 +512,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.18`"))
+    #expect(md.contains("Package schema: `2.19`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -554,6 +576,10 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(md.contains("in the language the user writes to you in"))
     #expect(md.contains("fader range −96…+6 dB"))
     #expect(md.contains("within −64…+63"))
+    // The direction proof must be taught, or the model omits current/delta and every volume/pan action fails validation.
+    #expect(md.contains("`parameters.current`"))
+    #expect(md.contains("`parameters.delta` = target − current"))
+    #expect(md.contains("never copy a loudness value into `parameters.value`"))
     #expect(md.contains("Number the questions and propose a concrete default"))
     let json = try #require(md.components(separatedBy: "```json").last?.components(separatedBy: "```").first)
     let plan = try JSONDecoder().decode(MixPlan.self, from: Data(json.utf8))
@@ -1209,7 +1235,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.18`"))
+    #expect(md.contains("Package schema: `2.19`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))

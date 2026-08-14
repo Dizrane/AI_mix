@@ -52,13 +52,28 @@ struct CommandValidator: Sendable {
         case .setVolume:
             guard let value = command.parameters["value"]?.numberValue else { return .init(command: command, status: .invalid, message: "set_volume needs a numeric parameters.value.") }
             if !Self.volumeRangeDB.contains(value) { return .init(command: command, status: .invalid, message: "set_volume value \(value) dB is outside Logic's fader range \u{2212}96\u{2026}+6 dB.") }
+            if let failure = directionFailure(command, target: value, fact: track.channel?.volumeDB.value, action: "set_volume", control: "Volume", unit: " dB") { return failure }
         case .setPan:
             guard let value = command.parameters["value"]?.numberValue else { return .init(command: command, status: .invalid, message: "set_pan needs a numeric parameters.value.") }
             if !Self.panRange.contains(value) { return .init(command: command, status: .invalid, message: "set_pan value \(value) is outside Logic's pan range \u{2212}64\u{2026}+63.") }
+            if let failure = directionFailure(command, target: value, fact: track.channel?.pan.value, action: "set_pan", control: "Pan", unit: "") { return failure }
         case .setMute, .setSolo, .setPluginBypass: if command.parameters["value"]?.boolValue == nil { return .init(command: command, status: .invalid, message: "\(command.action.rawValue) needs a boolean parameters.value.") }
         default: break
         }
         if command.action == .setPluginParameter || command.action == .setPluginBypass { guard let plugin = (track.channel?.plugins ?? []).first(where: { $0.id == command.target.pluginID || $0.name.value == command.target.pluginName }) else { return .init(command: command, status: .requiresProbe, message: "Plugin requires an inspect_plugin probe.") }; if command.action == .setPluginParameter { guard let parameter = plugin.parameters.first(where: { $0.id == command.target.parameterID || $0.name == command.target.parameterName }), let value = command.parameters["value"]?.numberValue else { return .init(command: command, status: .requiresProbe, message: "Parameter/value requires inspect_plugin_parameters probe.") }; if let range = parameter.range, !range.contains(value) { return .init(command: command, status: .invalid, message: "Value is outside reported parameter range.") } } }
         return .init(command: command, status: .valid, message: "Technically valid against current snapshot.")
     } }
+    /// The direction proof for the two fader-style actions. LLMs reliably conflate the fader scale with the measured
+    /// LUFS numbers and write "raise" while moving the control down, so the plan must restate where the control stands
+    /// (`parameters.current`) and the signed move (`parameters.delta`), and both are checked as arithmetic, not prose:
+    /// current + delta must equal the target, and current must equal the known channel fact when one exists. A track
+    /// whose fact is unavailable is not guessed — the arithmetic alone still pins the stated direction to the value.
+    /// Tolerance 0.05 matches the 0.1-precision the user can actually set on Logic's controls.
+    private func directionFailure(_ command: MixCommand, target: Double, fact: Double?, action: String, control: String, unit: String) -> ValidatedCommand? {
+        guard let current = command.parameters["current"]?.numberValue else { return .init(command: command, status: .invalid, message: "\(action) needs a numeric parameters.current restating the track's current known \(control) fact — it proves the plan knows where the control stands.") }
+        guard let delta = command.parameters["delta"]?.numberValue else { return .init(command: command, status: .invalid, message: "\(action) needs a numeric parameters.delta = target \u{2212} current (signed) — it proves the intended direction of the move.") }
+        if abs(current + delta - target) > 0.05 { return .init(command: command, status: .invalid, message: "Direction arithmetic does not add up: current \(current)\(unit) + delta \(delta)\(unit) \u{2260} target \(target)\(unit) — the stated move and the written value disagree.") }
+        if let fact, abs(current - fact) > 0.05 { return .init(command: command, status: .invalid, message: "parameters.current \(current)\(unit) does not match the known \(control) fact \(fact)\(unit) for this track.") }
+        return nil
+    }
 }
