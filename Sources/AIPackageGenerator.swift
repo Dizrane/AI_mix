@@ -8,7 +8,7 @@ enum PackageDelivery: Sendable { case markdownOnly, fullPackage }
 
 /// Provider-neutral export of normalized, evidence-based DAW facts for any external LLM.
 struct AIPackageGenerator: Sendable {
-    static let schemaVersion = "2.11"
+    static let schemaVersion = "2.12"
     func make(snapshot: NormalizedSnapshot, sessionID: String, audio: [AudioAsset] = [], plugins: [PluginInventoryItem] = [], probes: [ProbeType] = ProbeType.allCases, delivery: PackageDelivery = .fullPackage, exportSettings: ExportSettingsFacts? = nil, mix: MixBounceAsset? = nil) -> String {
         let readiness = PackageReadiness.evaluate(snapshot: snapshot, assets: audio)
         var out: [String] = []
@@ -167,6 +167,7 @@ struct AIPackageGenerator: Sendable {
         out += ["", "- File: known: \(mix.relativePath)" + (delivery == .fullPackage ? "" : " (the file is not part of this delivery — the measurements below are the mix evidence available to you)"), "- Duration: \(render(mix.durationSeconds, unit: " s"))", "- Sample rate: \(render(mix.sampleRate, unit: " Hz"))", "- Channels: \(render(mix.channels))", "- Bit depth: \(render(mix.bitDepth))", "- Format: \(render(mix.format))"]
         if let s = mix.bounceSettings {
             out += [fact("Bounce dialog format", s.format), fact("Bounce dialog bit depth", s.bitDepth), fact("Bounce dialog Normalize", s.normalize)]
+            if let formats = s.formats.value { out += ["- Bounce dialog formats (read from Logic's own format table; a bounce with no uncompressed PCM format checked is cancelled): known: \(formats.caption)"] }
             out += s.normalize.value.map { ["- Normalize was read as \($0) off Logic's own bounce dialog (any other value cancels the bounce), so the file carries the mix's real level."] } ?? ["- Normalize was not readable on the bounce dialog, so whether the bounced level was rewritten is unverified."]
         } else {
             out += ["- Bounce dialog settings: unavailable — this session did not observe Logic's bounce dialog for this file, so whether Normalize altered its level is unverified."]

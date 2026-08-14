@@ -38,10 +38,22 @@ struct AudioExtractionSummary: Codable, Sendable { var logicTracks: Int; var aud
 /// a recorded value is either "Off" or honestly missing.
 struct ExportSettingsFacts: Codable, Sendable {
     var format: Fact<String>; var bitDepth: Fact<String>; var normalize: Fact<String>
+    /// The bounce dialog's format table (which format checkboxes were checked when the bounce was launched); the track
+    /// export dialog has a single format pop-up instead, so there this fact is honestly `unavailable`.
+    var formats: Fact<[FormatSelection]> = .unavailable
     init(settings: ExportDialogSettings) {
         format = settings.format.map { .known($0, source: "export dialog format pop-up") } ?? .unavailable
         bitDepth = settings.bitDepth.map { .known($0, source: "export dialog bit-depth pop-up") } ?? .unavailable
         normalize = settings.normalize.map { .known($0, source: "export dialog Normalize control") } ?? .unavailable
+        formats = settings.formats.map { .known($0, source: "bounce dialog format table") } ?? .unavailable
+    }
+    enum CodingKeys: String, CodingKey { case format, bitDepth, normalize, formats }
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        format = try container.decode(Fact<String>.self, forKey: .format)
+        bitDepth = try container.decode(Fact<String>.self, forKey: .bitDepth)
+        normalize = try container.decode(Fact<String>.self, forKey: .normalize)
+        formats = try container.decodeIfPresent(Fact<[FormatSelection]>.self, forKey: .formats) ?? .unavailable
     }
 }
 
@@ -74,8 +86,13 @@ struct MixBounceAsset: Codable, Sendable {
     }
 }
 
+extension [FormatSelection] {
+    /// One human- and LLM-readable line for a read format table: every row with its own checked state, facts only.
+    var caption: String { map { "\($0.name): \($0.enabled ? "checked" : "unchecked")" }.joined(separator: " · ") }
+}
+
 struct AudioManifest: Codable, Sendable {
-    var schemaVersion = "1.3"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
+    var schemaVersion = "1.4"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
     /// Nil when this session never observed Logic's export dialog (manual export, or the app was restarted since).
     var exportSettings: ExportSettingsFacts?
     /// The bounced Stereo Out mix; nil when no bounce file exists — its absence is stated, never papered over.
@@ -101,6 +118,7 @@ extension AudioManifest {
         }
         if let mix {
             out += ["- Mix (Stereo Out): \(mix.relativePath) — the bounced sum through the master chain; per-track WAVs do not contain it."]
+            if let formats = mix.bounceSettings?.formats.value { out += ["- Bounce dialog formats (read from Logic's own format table when the bounce was launched): \(formats.caption)"] }
         } else {
             out += ["- Mix (Stereo Out): none — no bounced mix file exists, so the sum (overall loudness, balance, masking) is not part of this delivery."]
         }
