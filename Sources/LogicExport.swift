@@ -32,10 +32,11 @@ struct LogicExportAutomator: Sendable {
     func exportAllTracks(destination: URL) -> ExportOutcome {
         guard AXIsProcessTrusted() else { return .triggerFailed(step: "accessibility", detail: "Accessibility permission is not granted to AI Mix Assistant.") }
         guard let app = runningLogic() else { return .triggerFailed(step: "logic_running", detail: "Logic Pro is not running.") }
-        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        let pid = app.processIdentifier
+        let appElement = AXUIElementCreateApplication(pid)
         app.activate(); usleep(400_000)
         // Close any stale export/go-to dialogs left over from a previous run.
-        for _ in 0..<3 where findExportDialog(appElement) != nil { postKey(53, []); usleep(350_000) }
+        for _ in 0..<3 where findExportDialog(appElement) != nil { postKey(53, [], to: pid); usleep(350_000) }
 
         let item: String
         switch pressAllTracksMenu(appElement) {
@@ -46,16 +47,17 @@ struct LogicExportAutomator: Sendable {
         let format = firstDescendant(dialog) { self.role($0) == "AXPopUpButton" && (self.string($0, kAXValueAttribute) ?? "").uppercased().contains("WAV") }.flatMap { self.string($0, kAXValueAttribute) } ?? "unknown"
 
         // Destination via the standard Go-to-Folder field (AX-set is ignored by the panel, so paste real text).
-        // The user's text clipboard is saved first and restored on every exit path — the automation must not eat what they had copied.
-        let savedClipboard = NSPasteboard.general.string(forType: .string)
-        defer { if let savedClipboard { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(savedClipboard, forType: .string) } }
+        // The user's clipboard is snapshotted completely first — every item with all its representations, not just plain
+        // text — and restored on every exit path: the automation must not eat what they had copied, whatever it was.
+        let savedClipboard = Self.clipboardSnapshot()
+        defer { Self.restoreClipboard(savedClipboard) }
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(destination.path, forType: .string)
-        postKey(5, [.maskCommand, .maskShift]); usleep(700_000) // ⌘⇧G
+        postKey(5, [.maskCommand, .maskShift], to: pid); usleep(700_000) // ⌘⇧G
         guard let sheet = firstDescendant(dialog, { self.role($0) == "AXSheet" }), let field = firstDescendant(sheet, { ["AXComboBox", "AXTextField"].contains(self.role($0)) }) else { return .navigationFailed(step: "goto_sheet", detail: "Go-to-folder field not found after ⌘⇧G.") }
-        postKey(9, [.maskCommand]); usleep(450_000) // ⌘V
+        postKey(9, [.maskCommand], to: pid); usleep(450_000) // ⌘V
         let pasted = string(field, kAXValueAttribute) ?? ""
         guard pasted.contains(destination.path) else { return .navigationFailed(step: "paste_path", detail: "Destination did not paste into the go-to field (got: \(pasted)).") }
-        postKey(36, []); usleep(1_000_000) // Return accepts the path
+        postKey(36, [], to: pid); usleep(1_000_000) // Return accepts the path
 
         let confirmed = waitForExportDialog(appElement, timeout: 3) ?? dialog
         let whereValue = firstDescendant(confirmed) { self.role($0) == "AXPopUpButton" && self.string($0, kAXTitleAttribute) == "Where:" }.flatMap { self.string($0, kAXValueAttribute) }
@@ -72,15 +74,16 @@ struct LogicExportAutomator: Sendable {
     func ensureMixerVisible() -> MixerEnsureOutcome {
         guard AXIsProcessTrusted() else { return .failed(step: "accessibility", detail: "Accessibility permission is not granted to AI Mix Assistant.") }
         guard let app = runningLogic() else { return .failed(step: "logic_running", detail: "Logic Pro is not running.") }
-        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        let pid = app.processIdentifier
+        let appElement = AXUIElementCreateApplication(pid)
         app.activate(); usleep(400_000)
         guard let menuBar = copyElement(appElement, kAXMenuBarAttribute) else { return .failed(step: "menu_bar", detail: "AXMenuBar attribute is unavailable.") }
         guard let viewItem = childByTitle(menuBar, "View") else { return .failed(step: "view_menu", detail: "View menu not found. Menus: \(childTitles(menuBar)). \(englishUIHint)") }
         _ = press(viewItem); usleep(400_000) // open View so Logic validates & populates the submenu
-        guard let viewMenu = firstMenu(of: viewItem), let mixerItem = childContaining(viewMenu, "mixer") else { postKey(53, []); return .failed(step: "mixer_item", detail: "No Mixer item found in the View menu.") }
+        guard let viewMenu = firstMenu(of: viewItem), let mixerItem = childContaining(viewMenu, "mixer") else { postKey(53, [], to: pid); return .failed(step: "mixer_item", detail: "No Mixer item found in the View menu.") }
         let title = string(mixerItem, kAXTitleAttribute) ?? "Mixer"
-        if title.localizedCaseInsensitiveContains("hide") { postKey(53, []); usleep(250_000); return .alreadyVisible } // already visible; just close the menu
-        guard press(mixerItem) else { postKey(53, []); return .failed(step: "press", detail: "AXPress on \u{2018}\(title)\u{2019} did not succeed.") }
+        if title.localizedCaseInsensitiveContains("hide") { postKey(53, [], to: pid); usleep(250_000); return .alreadyVisible } // already visible; just close the menu
+        guard press(mixerItem) else { postKey(53, [], to: pid); return .failed(step: "press", detail: "AXPress on \u{2018}\(title)\u{2019} did not succeed.") }
         usleep(800_000) // give Logic a moment to lay the Mixer out before the read-only scan
         return .opened(item: title)
     }
@@ -111,11 +114,39 @@ struct LogicExportAutomator: Sendable {
         return .pressed(leafTitle)
     }
 
+    // MARK: clipboard preservation
+    /// The complete state of a pasteboard: every item with the data of every representation it carries (files, images,
+    /// rich text — not just a plain string), so "your clipboard is restored" is true whatever the user had copied.
+    /// A type whose data cannot be materialized (an unfulfilled promise) is skipped; everything readable survives.
+    static func clipboardSnapshot(of pasteboard: NSPasteboard = .general) -> [[NSPasteboard.PasteboardType: Data]] {
+        (pasteboard.pasteboardItems ?? []).map { item in
+            var entry: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types { if let data = item.data(forType: type) { entry[type] = data } }
+            return entry
+        }
+    }
+    /// Writes a snapshot back. An empty snapshot restores an empty clipboard — the borrowed destination path is
+    /// removed either way, never left behind just because the user had nothing copied.
+    static func restoreClipboard(_ snapshot: [[NSPasteboard.PasteboardType: Data]], to pasteboard: NSPasteboard = .general) {
+        pasteboard.clearContents()
+        let items = snapshot.compactMap { entry -> NSPasteboardItem? in
+            guard !entry.isEmpty else { return nil }
+            let item = NSPasteboardItem()
+            for (type, data) in entry { item.setData(data, forType: type) }
+            return item
+        }
+        if !items.isEmpty { pasteboard.writeObjects(items) }
+    }
+
     // MARK: helpers
     private func runningLogic() -> NSRunningApplication? { NSWorkspace.shared.runningApplications.first { !$0.isTerminated && ($0.bundleIdentifier.map(supportedBundleIDs.contains) == true || $0.localizedName == "Logic Pro") } }
     private func findExportDialog(_ app: AXUIElement) -> AXUIElement? { windows(app).first { firstDescendant($0, { self.role($0) == "AXButton" && self.string($0, kAXTitleAttribute) == "Export" }) != nil } }
     private func waitForExportDialog(_ app: AXUIElement, timeout: TimeInterval) -> AXUIElement? { let deadline = Date().addingTimeInterval(timeout); while Date() < deadline { if let d = findExportDialog(app) { return d }; usleep(250_000) }; return nil }
-    private func postKey(_ code: CGKeyCode, _ flags: CGEventFlags) { let src = CGEventSource(stateID: .hidSystemState); let down = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: true); down?.flags = flags; down?.post(tap: .cghidEventTap); usleep(40_000); let up = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: false); up?.flags = flags; up?.post(tap: .cghidEventTap) }
+    /// Keystrokes are posted to Logic's process directly (postToPid), never to the system-wide HID tap: a global event
+    /// lands in whatever application happens to have focus, so a user who switches apps mid-automation would get the
+    /// destination path ⌘V-pasted into their chat instead of Logic's go-to-folder sheet. Addressed to the pid, the keys
+    /// reach Logic and only Logic no matter where the focus is.
+    private func postKey(_ code: CGKeyCode, _ flags: CGEventFlags, to pid: pid_t) { let src = CGEventSource(stateID: .hidSystemState); let down = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: true); down?.flags = flags; down?.postToPid(pid); usleep(40_000); let up = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: false); up?.flags = flags; up?.postToPid(pid) }
     private func firstDescendant(_ element: AXUIElement, _ match: (AXUIElement) -> Bool, _ depth: Int = 0) -> AXUIElement? { if match(element) { return element }; guard depth < 20 else { return nil }; for child in children(element) { if let found = firstDescendant(child, match, depth + 1) { return found } }; return nil }
     private func copyElement(_ element: AXUIElement, _ attribute: String) -> AXUIElement? { var value: CFTypeRef?; guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }; return (value as! AXUIElement) }
     private func children(_ element: AXUIElement) -> [AXUIElement] { var value: CFTypeRef?; guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value) == .success else { return [] }; return value as? [AXUIElement] ?? [] }

@@ -26,6 +26,10 @@ struct ApplicationLauncher: Sendable {
     private var metricsCache: [String: AudioMetrics] = [:]
     private let storeInitFailure: String?
     init() {
+        // Folder-name catch-up first, before anything derives paths from Bundle.main: an install updated by an app
+        // version that did not rename the shell folder yet still sits in AI_Mix_<old tag>. On a successful rename
+        // this relaunches from the renamed folder and never returns; otherwise it changes nothing.
+        AppUpdater.adoptVersionedShellName()
         do { store = try SessionStore(); storeInitFailure = nil } catch { store = nil; storeInitFailure = error.localizedDescription }
         refreshConnection()
         startConnectionMonitor()
@@ -104,12 +108,20 @@ struct ApplicationLauncher: Sendable {
             }
         }
     }
+    /// Installing an update while the app is mid-work would sabotage that work: the swap renames the folder and
+    /// relaunches the app, killing a running scan or the WAV-detection polling, and Logic would keep exporting into
+    /// a destination path whose folder name just changed. The buttons disable on this and the guard tells the reason.
+    var updateBlockedByWork: Bool { analyzerState == .scanning || exportPhase == .exporting }
     /// User-requested in-place update: download the release ZIP, verify the new bundle, swap it in next to the
     /// untouched Data/, relaunch the new version and quit this one. Any failure is reported and leaves the current
     /// installation working; a translocated (quarantined read-only) copy must be repaired first, because its real
     /// bundle location is not what is running.
     func installUpdate() {
         guard let update = updateAvailable, !updateInProgress else { return }
+        if updateBlockedByWork {
+            updateStatus = "An analysis or Logic export is running — finish or cancel it first, then install the update."
+            return
+        }
         if TranslocationRepair.isActive {
             updateStatus = "The app is running from a translocated read-only copy. Click \u{201C}Fix and Relaunch\u{201D} first, then update."
             return

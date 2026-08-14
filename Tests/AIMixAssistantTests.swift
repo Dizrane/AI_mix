@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import AVFoundation
+import AppKit
 @testable import AIMixAssistant
 
 // MARK: - Fixtures
@@ -522,6 +523,34 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     if case .repaired = TranslocationRepair.dequarantineOriginal() { Issue.record("dequarantine must refuse when the app is not translocated") }
 }
 
+// MARK: - Export clipboard preservation
+
+@Test func exportClipboardSnapshotRoundTripsEveryRepresentation() {
+    let pasteboard = NSPasteboard(name: NSPasteboard.Name("aimix-test-\(UUID().uuidString)"))
+    defer { pasteboard.releaseGlobally() }
+    pasteboard.clearContents()
+    let custom = NSPasteboard.PasteboardType("com.aimix.test.payload")
+    let item = NSPasteboardItem()
+    item.setData(Data("what the user had copied".utf8), forType: .string)
+    item.setData(Data([0xDE, 0xAD, 0xBE, 0xEF]), forType: custom) // a non-text representation must survive too
+    pasteboard.writeObjects([item])
+    let snapshot = LogicExportAutomator.clipboardSnapshot(of: pasteboard)
+    pasteboard.clearContents(); pasteboard.setString("/tmp/borrowed-destination", forType: .string) // the automation borrows the clipboard
+    LogicExportAutomator.restoreClipboard(snapshot, to: pasteboard)
+    #expect(pasteboard.string(forType: .string) == "what the user had copied")
+    #expect(pasteboard.pasteboardItems?.first?.data(forType: custom) == Data([0xDE, 0xAD, 0xBE, 0xEF]))
+}
+@Test func exportClipboardRestoresEmptinessInsteadOfLeavingThePath() {
+    let pasteboard = NSPasteboard(name: NSPasteboard.Name("aimix-test-\(UUID().uuidString)"))
+    defer { pasteboard.releaseGlobally() }
+    pasteboard.clearContents()
+    let snapshot = LogicExportAutomator.clipboardSnapshot(of: pasteboard) // the user had nothing copied
+    pasteboard.setString("/tmp/borrowed-destination", forType: .string)
+    LogicExportAutomator.restoreClipboard(snapshot, to: pasteboard)
+    #expect(pasteboard.string(forType: .string) == nil)
+    #expect(pasteboard.pasteboardItems?.isEmpty == true)
+}
+
 // MARK: - Local DSP audio metrics (facts about the WAV file, synthesized fixtures)
 
 /// Float32 WAV writer for metric fixtures: exact sample values, no quantization noise. The analyzer under test never writes; only fixtures do.
@@ -767,4 +796,40 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let updater = AppUpdater()
     #expect(updater.validate(bundle: app, expectedTag: "v0.9.9") == nil)
     #expect(updater.validate(bundle: app, expectedTag: "v1.0.0") != nil) // version mismatch is refused, not installed
+}
+@Test func updaterRenamesOnlyVersionedShellFolderNames() {
+    #expect(AppUpdater.shellRename(folderName: "AI_Mix_v0.2.10", installedVersion: "v0.2.11") == "AI_Mix_v0.2.11")
+    #expect(AppUpdater.shellRename(folderName: "AI_Mix_v0.2.10", installedVersion: "0.2.11") == "AI_Mix_v0.2.11") // Info.plist versions carry no leading v
+    #expect(AppUpdater.shellRename(folderName: "AI_Mix_0.2.10", installedVersion: "v0.2.11") == "AI_Mix_v0.2.11") // a drifted format without v is normalized
+    #expect(AppUpdater.shellRename(folderName: "AI_Mix_v1", installedVersion: "v0.2.11") == "AI_Mix_v0.2.11") // the manually created example folder follows the scheme too
+    #expect(AppUpdater.shellRename(folderName: "AI_Mix_v0.2.11", installedVersion: "v0.2.11") == nil) // already correct: nothing to rename
+    #expect(AppUpdater.shellRename(folderName: "My Mix Tools", installedVersion: "v0.2.11") == nil) // a custom name is never touched
+    #expect(AppUpdater.shellRename(folderName: "AI_Mix_beta", installedVersion: "v0.2.11") == nil) // not a version suffix, so not the release scheme
+    #expect(AppUpdater.shellRename(folderName: "AI_Mix_v0.2.10", installedVersion: "garbage") == nil) // a malformed version can never drive a rename
+}
+@Test func updaterRenamesTheShellFolderOnDiskAndKeepsDataInside() throws {
+    let base = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: base) }
+    let app = base.appendingPathComponent("AI_Mix_v0.2.10/AI Mix Assistant.app")
+    try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: base.appendingPathComponent("AI_Mix_v0.2.10/Data"), withIntermediateDirectories: true)
+    let renamed = AppUpdater.renameShell(around: app, toMatch: "v0.2.11")
+    #expect(renamed.path == base.appendingPathComponent("AI_Mix_v0.2.11/AI Mix Assistant.app").path)
+    #expect(FileManager.default.fileExists(atPath: renamed.path))
+    #expect(FileManager.default.fileExists(atPath: base.appendingPathComponent("AI_Mix_v0.2.11/Data").path)) // Data/ travels with the folder
+    #expect(!FileManager.default.fileExists(atPath: base.appendingPathComponent("AI_Mix_v0.2.10").path))
+    #expect(AppUpdater.renameShell(around: renamed, toMatch: "v0.2.11") == renamed) // a second call finds the name correct and does nothing
+}
+@Test func updaterKeepsTheShellWhenTheTargetNameIsTakenOrCustom() throws {
+    let base = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: base) }
+    let versionedApp = base.appendingPathComponent("AI_Mix_v0.2.10/AI Mix Assistant.app")
+    try FileManager.default.createDirectory(at: versionedApp, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: base.appendingPathComponent("AI_Mix_v0.2.11"), withIntermediateDirectories: true) // a sibling already owns the target name
+    #expect(AppUpdater.renameShell(around: versionedApp, toMatch: "v0.2.11") == versionedApp)
+    #expect(FileManager.default.fileExists(atPath: versionedApp.path)) // nothing moved
+    let customApp = base.appendingPathComponent("My Mix Tools/AI Mix Assistant.app")
+    try FileManager.default.createDirectory(at: customApp, withIntermediateDirectories: true)
+    #expect(AppUpdater.renameShell(around: customApp, toMatch: "v0.2.11") == customApp) // a user-chosen folder name is never renamed
+    #expect(FileManager.default.fileExists(atPath: customApp.path))
 }

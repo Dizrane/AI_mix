@@ -86,11 +86,11 @@ struct SettingsView: View {
             HStack { Text("Settings").font(.system(.title2, design: .rounded).weight(.semibold)); Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
             Card {
                 Text("Updates").font(.headline)
-                Text("The app updates itself in place from this project's GitHub Releases: the new AI Mix Assistant.app replaces the current one inside the same folder, and Data/ with your analyses stays untouched.").font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text("The app updates itself in place from this project's GitHub Releases: the new AI Mix Assistant.app replaces the current one inside the same folder, and Data/ with your analyses stays untouched. A folder still named after the old version (AI_Mix_<version>) is renamed to the new one; a folder you named yourself is never touched.").font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 10) {
                     Button("Check for Updates") { model.checkForUpdates(userInitiated: true) }.disabled(model.updateInProgress)
                     if let update = model.updateAvailable {
-                        Button(model.updateInProgress ? "Updating\u{2026}" : "Install \(update.tag)") { model.installUpdate() }.buttonStyle(.borderedProminent).disabled(model.updateInProgress)
+                        Button(model.updateInProgress ? "Updating\u{2026}" : "Install \(update.tag)") { model.installUpdate() }.buttonStyle(.borderedProminent).disabled(model.updateInProgress || model.updateBlockedByWork)
                     }
                 }
                 if !model.updateStatus.isEmpty { Text(model.updateStatus).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
@@ -119,7 +119,7 @@ struct SettingsView: View {
             }
             Spacer()
         }
-        .padding(24).frame(width: 500, height: 610)
+        .padding(24).frame(width: 500, height: 640)
         .confirmationDialog("Clear Temporary Project Files?", isPresented: $confirmingClear, titleVisibility: .visible) {
             Button("Clear Data", role: .destructive) { model.clearProjectData() }
             Button("Cancel", role: .cancel) {}
@@ -172,7 +172,7 @@ struct Sidebar: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Button { model.installUpdate() } label: {
                         HStack(spacing: 6) { Image(systemName: "arrow.down.circle.fill").font(.system(size: 12)); Text(model.updateInProgress ? "Updating\u{2026}" : "Update to \(update.tag)").font(.system(size: 12, weight: .semibold)); Spacer() }.contentShape(Rectangle())
-                    }.buttonStyle(.borderedProminent).controlSize(.small).disabled(model.updateInProgress)
+                    }.buttonStyle(.borderedProminent).controlSize(.small).disabled(model.updateInProgress || model.updateBlockedByWork)
                     if !model.updateStatus.isEmpty { Text(model.updateStatus).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
                 }.padding(.top, 8)
             }
