@@ -90,7 +90,7 @@ struct SettingsView: View {
                 HStack(spacing: 10) {
                     Button("Check for Updates") { model.checkForUpdates(userInitiated: true) }.disabled(model.updateInProgress)
                     if let update = model.updateAvailable {
-                        Button(model.updateInProgress ? "Updating\u{2026}" : "Install \(update.tag)") { model.installUpdate() }.buttonStyle(.borderedProminent).disabled(model.updateInProgress)
+                        Button(model.updateInProgress ? "Updating\u{2026}" : "Install \(update.tag)") { model.installUpdate() }.buttonStyle(.borderedProminent).disabled(model.updateInProgress || model.updateBlockedByWork)
                     }
                 }
                 if !model.updateStatus.isEmpty { Text(model.updateStatus).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
@@ -172,7 +172,7 @@ struct Sidebar: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Button { model.installUpdate() } label: {
                         HStack(spacing: 6) { Image(systemName: "arrow.down.circle.fill").font(.system(size: 12)); Text(model.updateInProgress ? "Updating\u{2026}" : "Update to \(update.tag)").font(.system(size: 12, weight: .semibold)); Spacer() }.contentShape(Rectangle())
-                    }.buttonStyle(.borderedProminent).controlSize(.small).disabled(model.updateInProgress)
+                    }.buttonStyle(.borderedProminent).controlSize(.small).disabled(model.updateInProgress || model.updateBlockedByWork)
                     if !model.updateStatus.isEmpty { Text(model.updateStatus).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
                 }.padding(.top, 8)
             }

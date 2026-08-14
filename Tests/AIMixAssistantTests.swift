@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import AVFoundation
+import AppKit
 @testable import AIMixAssistant
 
 // MARK: - Fixtures
@@ -520,6 +521,34 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(!TranslocationRepair.isActive)
     #expect(TranslocationRepair.originalBundleURL() == nil)
     if case .repaired = TranslocationRepair.dequarantineOriginal() { Issue.record("dequarantine must refuse when the app is not translocated") }
+}
+
+// MARK: - Export clipboard preservation
+
+@Test func exportClipboardSnapshotRoundTripsEveryRepresentation() {
+    let pasteboard = NSPasteboard(name: NSPasteboard.Name("aimix-test-\(UUID().uuidString)"))
+    defer { pasteboard.releaseGlobally() }
+    pasteboard.clearContents()
+    let custom = NSPasteboard.PasteboardType("com.aimix.test.payload")
+    let item = NSPasteboardItem()
+    item.setData(Data("what the user had copied".utf8), forType: .string)
+    item.setData(Data([0xDE, 0xAD, 0xBE, 0xEF]), forType: custom) // a non-text representation must survive too
+    pasteboard.writeObjects([item])
+    let snapshot = LogicExportAutomator.clipboardSnapshot(of: pasteboard)
+    pasteboard.clearContents(); pasteboard.setString("/tmp/borrowed-destination", forType: .string) // the automation borrows the clipboard
+    LogicExportAutomator.restoreClipboard(snapshot, to: pasteboard)
+    #expect(pasteboard.string(forType: .string) == "what the user had copied")
+    #expect(pasteboard.pasteboardItems?.first?.data(forType: custom) == Data([0xDE, 0xAD, 0xBE, 0xEF]))
+}
+@Test func exportClipboardRestoresEmptinessInsteadOfLeavingThePath() {
+    let pasteboard = NSPasteboard(name: NSPasteboard.Name("aimix-test-\(UUID().uuidString)"))
+    defer { pasteboard.releaseGlobally() }
+    pasteboard.clearContents()
+    let snapshot = LogicExportAutomator.clipboardSnapshot(of: pasteboard) // the user had nothing copied
+    pasteboard.setString("/tmp/borrowed-destination", forType: .string)
+    LogicExportAutomator.restoreClipboard(snapshot, to: pasteboard)
+    #expect(pasteboard.string(forType: .string) == nil)
+    #expect(pasteboard.pasteboardItems?.isEmpty == true)
 }
 
 // MARK: - Local DSP audio metrics (facts about the WAV file, synthesized fixtures)
