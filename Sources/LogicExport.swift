@@ -34,6 +34,14 @@ struct ExportDialogSettings: Sendable, Equatable, Codable {
     var formats: [FormatSelection]? = nil
     var pcmFormatCheckedByApp: String? = nil
     var formatsUncheckedByApp: [String]? = nil
+    /// The state of Logic's transport Cycle control when the bounce was launched, after the automation ensured it is
+    /// off ("Off" when proven; nil when no Cycle control could be read — never a guess). Cycle constrains File ▸ Bounce
+    /// to the cycle section, so a proven "Off" is what makes the bounce range the whole project. Only the bounce reads
+    /// it; the track export ignores Cycle entirely and this stays nil there.
+    var cycle: String? = nil
+    /// "On" when Cycle was on and the app switched it off (verified by re-reading) before opening the bounce dialog —
+    /// the third deliberate write; nil when Cycle was already off, unreadable, or never had to be touched.
+    var cycleSwitchedFrom: String? = nil
 }
 
 /// Outcome of the one-click mix bounce (Logic's File ▸ Bounce). Mirrors `ExportOutcome`: it never claims a file was
@@ -43,6 +51,7 @@ enum BounceOutcome: Sendable {
     case bounced(item: String, settings: ExportDialogSettings) // menu launched, destination set, Bounce pressed
     case blockedByNormalize(value: String, detail: String) // Normalize would rewrite levels and could not be switched to Off — cancelled, nothing bounced
     case blockedByFormat(selected: [FormatSelection], detail: String) // no uncompressed PCM format is checked and the app could not check it — cancelled, nothing bounced
+    case blockedByCycle(detail: String) // Cycle mode is provably on (the bounce would cover only the cycle section) and could not be switched off — cancelled, nothing bounced
     case triggerFailed(step: String, detail: String)     // could not launch the bounce menu item
     case navigationFailed(step: String, detail: String)  // dialog opened but settings/destination could not be driven
 }
@@ -65,8 +74,10 @@ enum MixerEnsureOutcome: Sendable { case alreadyVisible, opened(item: String), f
 /// so the automation switches that control to Off itself (the same documented AXPress mechanism as every
 /// button), verifies the switch by re-reading the control, and records the original value as a fact. Only when
 /// the switch demonstrably fails is the export cancelled — never silently exported with rewritten levels.
-/// The bounce (`bounceMix`) has one more such exception: its format table is set to uncompressed PCM alone by
-/// the same mechanism, with the same verification and the same honest cancellation on failure.
+/// The bounce (`bounceMix`) has two more such exceptions, each with the same verification and the same honest
+/// cancellation on failure: its format table is set to uncompressed PCM alone, and an enabled transport Cycle is
+/// switched off before the bounce dialog opens — Logic bounces only the cycle section while Cycle is on, which
+/// would silently truncate the one file the whole analysis treats as the full-project reference.
 struct LogicExportAutomator: Sendable {
     private let supportedBundleIDs: Set<String> = ["com.apple.logic10", "com.apple.mobilelogic"]
     /// Shown when a top-level menu title does not match: the automation relies on English menu names by design.
@@ -276,7 +287,7 @@ struct LogicExportAutomator: Sendable {
     /// Result of the second deliberate dialog write: the format table set to PCM alone, or an honest failure.
     private enum FormatSwitch { case adjusted(pcmChecked: String?, unchecked: [String]), failed(detail: String) }
     /// Sets the bounce dialog's format table to uncompressed PCM alone — the same documented AXPress mechanism as
-    /// every button, and (with Normalize) one of only two settings the automation ever changes: the bounced mix must
+    /// every button, and (with Normalize and Cycle) one of only three settings the automation ever changes: the bounced mix must
     /// be exactly one measurable PCM file, so the PCM row (found by the same caption grammar `formatsBlockBounce`
     /// trusts) is checked and every checked non-PCM row is unchecked. Proof over trust, weighted by what each press
     /// protects: the checked PCM row is the evidence itself — when the re-read table does not prove it, the bounce is
@@ -313,6 +324,53 @@ struct LogicExportAutomator: Sendable {
         let stillChecked = Self.nonPCMChecked(table)
         return .adjusted(pcmChecked: pcm.enabled ? nil : pcm.name, unchecked: pressedOff.filter { !stillChecked.contains($0) })
     }
+    /// The caption grammar of Logic's transport Cycle control: the control names itself "Cycle" (or "Cycle Mode").
+    /// Strict whole-caption equality on purpose — a control merely containing the word ("Cycle Recording", a window
+    /// command like "Cycle Through Windows") must never be read as the transport Cycle, let alone pressed. Pure and testable.
+    static func isCycleCaption(_ caption: String?) -> Bool {
+        guard let caption = caption?.trimmingCharacters(in: .whitespacesAndNewlines), !caption.isEmpty else { return false }
+        return ["cycle", "cycle mode"].contains(caption.localizedLowercase)
+    }
+    /// Logic's transport Cycle control, discovered from the live windows by strict evidence: an AXCheckBox whose own
+    /// caption IS the Cycle caption and whose value reads as a switch position ("0"/"1"). The main window is searched
+    /// first (the control bar lives there), breadth-first and bounded — the control bar is a shallow child while the
+    /// Tracks area holds thousands of deep elements, so BFS reaches it in few reads and the cap bounds the worst case.
+    /// Nil when no such control is exposed — honest absence, never a guess.
+    private func cycleControl(_ appElement: AXUIElement) -> AXUIElement? {
+        var roots: [AXUIElement] = []
+        if let main = copyElement(appElement, kAXMainWindowAttribute) { roots.append(main) }
+        if let focused = copyElement(appElement, kAXFocusedWindowAttribute) { roots.append(focused) }
+        roots += windows(appElement)
+        for root in roots {
+            if let found = firstShallowDescendant(of: root, { element in
+                self.role(element) == "AXCheckBox"
+                    && (Self.isCycleCaption(self.string(element, kAXTitleAttribute)) || Self.isCycleCaption(self.string(element, kAXDescriptionAttribute)))
+                    && ["0", "1"].contains(self.string(element, kAXValueAttribute) ?? "")
+            }) { return found }
+        }
+        return nil
+    }
+    /// Result of ensuring Cycle is off before a bounce: the proven Off state (and whether the app switched it),
+    /// an honest "could not read", or a proven-On Cycle that refused to switch.
+    private enum CycleEnsure { case off(switchedFromOn: Bool), unreadable, failed(detail: String) }
+    /// Reads the transport Cycle control and switches it off when it is provably on — the same documented AXPress
+    /// mechanism as every button, verified by re-reading the control. Runs BEFORE the bounce dialog opens, because the
+    /// dialog captures its Start/End range from the cycle at open time. An absent or unreadable control is `unreadable`
+    /// and never blocks; only a Cycle that provably reads On and cannot be switched off is a failure, because bouncing
+    /// then provably yields a section, not the project.
+    private func ensureCycleOff(_ appElement: AXUIElement) -> CycleEnsure {
+        guard let control = cycleControl(appElement), let before = string(control, kAXValueAttribute) else { return .unreadable }
+        if before == "0" { return .off(switchedFromOn: false) }
+        guard press(control) else { return .failed(detail: "AXPress on the Cycle control did not succeed.") }
+        // Proof over trust: the switch counts only when the control itself re-reads as off.
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            usleep(150_000)
+            if string(control, kAXValueAttribute) == "0" { return .off(switchedFromOn: true) }
+        }
+        return .failed(detail: "Cycle still reads On after pressing its control.")
+    }
+
     /// The caption grammar of Logic's own format rows: the PCM row is titled "PCM" (older dialogs) or "Uncompressed"
     /// and its file types are the WAV/AIFF/CAF family. A caption naming none of these is not PCM — never a guess.
     static func isUncompressedPCM(_ name: String) -> Bool {
@@ -322,9 +380,11 @@ struct LogicExportAutomator: Sendable {
 
     /// Full one-click bounce of the mix (Logic's Stereo Out) to `destination` via File ▸ Bounce — the sum through the
     /// whole master chain, which no per-track export contains. Same discipline as the track export: every element is
-    /// discovered at runtime, settings are read as facts and only two are ever changed, each towards the one state the
-    /// evidence needs (a level-rewriting Normalize is switched to Off, the format table is set to uncompressed PCM
-    /// alone — both verified by re-reading; the bounce is cancelled only when such a switch demonstrably fails), the
+    /// discovered at runtime, settings are read as facts and only three are ever changed, each towards the one state
+    /// the evidence needs (an enabled transport Cycle is switched off before the dialog opens so the bounce covers the
+    /// whole project rather than the cycle section, a level-rewriting Normalize is switched to Off, the format table is
+    /// set to uncompressed PCM alone — all verified by re-reading; the bounce is cancelled only when such a switch
+    /// demonstrably fails), the
     /// destination is driven through the standard save-panel keys and verified before the final press,
     /// and the user's clipboard is snapshotted and restored. Logic's bounce dialog ships in two shapes — a settings
     /// window whose confirm opens a separate name/destination panel, or one combined window — and both are handled by
@@ -337,6 +397,21 @@ struct LogicExportAutomator: Sendable {
         app.activate(); usleep(400_000)
         // Close any stale bounce windows left over from a previous run.
         closeWindows(while: { self.firstBounceWindow(appElement) }, applicationPid: pid)
+
+        // Cycle first, BEFORE the bounce menu: Logic documents that File ▸ Bounce covers only the cycle section while
+        // Cycle mode is on, and the dialog captures its Start/End range the moment it opens — a stale cycle from
+        // earlier work silently truncates the one file the analysis treats as the full-project reference. So Cycle is
+        // the third and last deliberate write: the transport Cycle control is read, switched off when it is provably
+        // on (verified by re-reading, recorded as a fact), and a proven-On Cycle that cannot be switched off cancels
+        // the bounce honestly. An unreadable control never blocks — the truncation check on the finished file is the
+        // safety net there.
+        var cycleValue: String? = nil
+        var cycleSwitchedFrom: String? = nil
+        switch ensureCycleOff(appElement) {
+        case .off(let switchedFromOn): cycleValue = "Off"; if switchedFromOn { cycleSwitchedFrom = "On" }
+        case .unreadable: cycleValue = nil
+        case .failed(let detail): return .blockedByCycle(detail: detail)
+        }
 
         let item: String
         switch pressBounceMenu(appElement) {
@@ -374,6 +449,8 @@ struct LogicExportAutomator: Sendable {
                 return .blockedByFormat(selected: settings.formats ?? [], detail: detail)
             }
         }
+        settings.cycle = cycleValue
+        settings.cycleSwitchedFrom = cycleSwitchedFrom
         // The name/destination panel: the dialog itself when it already carries the save-panel controls, otherwise the
         // panel that appears after the settings window is confirmed.
         let panel: AXUIElement
@@ -570,6 +647,20 @@ struct LogicExportAutomator: Sendable {
         return nil
     }
     private func firstDescendant(_ element: AXUIElement, _ match: (AXUIElement) -> Bool, _ depth: Int = 0) -> AXUIElement? { if match(element) { return element }; guard depth < 20 else { return nil }; for child in children(element) { if let found = firstDescendant(child, match, depth + 1) { return found } }; return nil }
+    /// Breadth-first search with a visit cap, for controls that sit shallow in a huge window (the transport bar in the
+    /// project window): DFS would drown in the thousands of Tracks-area elements before reaching a sibling toolbar,
+    /// while BFS finds a shallow control in few AX reads and the cap bounds the worst case when it does not exist.
+    private func firstShallowDescendant(of root: AXUIElement, limit: Int = 6000, _ match: (AXUIElement) -> Bool) -> AXUIElement? {
+        var queue: [AXUIElement] = [root]
+        var visited = 0
+        while !queue.isEmpty && visited < limit {
+            let element = queue.removeFirst()
+            visited += 1
+            if match(element) { return element }
+            queue.append(contentsOf: children(element))
+        }
+        return nil
+    }
     private func collectDescendants(_ element: AXUIElement, into result: inout [AXUIElement], _ depth: Int = 0) { result.append(element); guard depth < 20 else { return }; for child in children(element) { collectDescendants(child, into: &result, depth + 1) } }
     /// The element's on-screen frame from its documented AXPosition/AXSize attributes; nil when either is unreadable.
     private func frame(_ element: AXUIElement) -> CGRect? {

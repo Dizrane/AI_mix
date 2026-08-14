@@ -429,6 +429,10 @@ struct ApplicationLauncher: Sendable {
                 mixPhase = .failed("normalize")
                 mixStatus = "Bounce stopped: Logic's bounce dialog has Normalize set to ‘\(value)’, which would rewrite the mix level, and the app could not switch it to Off (\(detail)) Set Normalize to Off in the bounce dialog once, then bounce again."
                 log.append("Logic bounce blocked: Normalize is ‘\(value)’ and switching it to Off failed (\(detail)) — the dialog was cancelled and nothing was bounced.")
+            case .blockedByCycle(let detail):
+                mixPhase = .failed("cycle")
+                mixStatus = "Bounce stopped: Logic's Cycle mode is on, so the bounce would cover only the cycle section instead of the whole project, and the app could not switch it off (\(detail)) Turn Cycle off in Logic (press C or click the cycle button in the control bar), then bounce again."
+                log.append("Logic bounce blocked: Cycle mode is on and switching it off failed (\(detail)) — the bounce was cancelled and nothing was bounced.")
             case .blockedByFormat(let selected, let detail):
                 mixPhase = .failed("format")
                 let checked = selected.filter(\.enabled).map(\.name)
@@ -440,6 +444,8 @@ struct ApplicationLauncher: Sendable {
                 log.append("Logic bounce dialog automation failed at \(step): \(detail)")
                 await pollForMixBounce(mixDir: mixDir, settings: nil) // still detect if the user completes it manually
             case .bounced(let item, let settings):
+                if let from = settings.cycleSwitchedFrom { log.append("Logic's Cycle mode was ‘\(from)’ — the app switched it off (and verified) before opening the bounce dialog, so the whole project is bounced rather than the cycle section. Press C in Logic to turn Cycle back on if you need it.") }
+                if settings.cycle == nil { log.append("Logic exposed no readable Cycle control before the bounce — whether a cycle range constrains this bounce is unverified; the finished file's duration is checked against the exported tracks instead.") }
                 if let from = settings.normalizeSwitchedFrom { log.append("Logic's bounce dialog had Normalize set to ‘\(from)’ — the app switched it to Off before bouncing, so the file keeps the mix's real level.") }
                 if let row = settings.pcmFormatCheckedByApp { log.append("Logic's bounce dialog had no uncompressed PCM format checked — the app checked ‘\(row)’ before bouncing, so a real PCM mix file is written.") }
                 if let rows = settings.formatsUncheckedByApp { log.append("Logic's bounce dialog also had \(rows.joined(separator: ", ")) checked — the app unchecked \(rows.count == 1 ? "it" : "them") before bouncing, so exactly one PCM mix file is written.") }
@@ -471,6 +477,17 @@ struct ApplicationLauncher: Sendable {
             if !current.isEmpty, current == previous {
                 let resolved = await Task.detached(priority: .userInitiated) { MixBounceAsset.resolve(in: mixDir, settings: settings) }.value
                 if let resolved {
+                    // The bounce is the full-project reference, so a file whose audible content provably ends before the
+                    // longest exported track's content is rejected here, not discovered later as a package ISSUE: Logic
+                    // bounced a section (a cycle range, selected regions, or a manual Start/End range), and accepting it
+                    // would gate the AI Package on a mix that measures only part of the song. Compared by measured
+                    // content, never file length, so a bounce padded with trailing silence is never falsely accused.
+                    if let cut = MixBounceAsset.provenTruncation(mix: resolved, against: audioAssets) {
+                        mixPhase = .failed("truncated")
+                        mixStatus = String(format: "The bounce covers only part of the project: its audible content ends at %.1f s while ‘%@’ runs to %.1f s. Logic bounced a section — a cycle range, selected regions, or a manual Start/End range in the bounce dialog. Turn Cycle off, click an empty spot in the Tracks area to deselect regions, then Bounce Mix from Logic again.", cut.mixContentEnd, cut.trackName, cut.trackContentEnd)
+                        log.append(String(format: "Mix bounce rejected as truncated: audible content %.1f s vs ‘%@’ %.1f s (trailing silence excluded on both sides). The file stays in mix/ but is not used as the mix.", cut.mixContentEnd, cut.trackName, cut.trackContentEnd))
+                        return
+                    }
                     mixAsset = resolved
                     mixPhase = .done
                     mixStatus = "Mix bounced: \((resolved.relativePath as NSString).lastPathComponent)" + (resolved.metrics?.integratedLoudnessLUFS.value.map { String(format: " · %.1f LUFS integrated", $0) } ?? "")
