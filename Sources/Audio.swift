@@ -45,13 +45,45 @@ struct ExportSettingsFacts: Codable, Sendable {
     }
 }
 
+/// The bounced mix — Logic's Stereo Out captured through File ▸ Bounce: the sum through the whole master chain, the
+/// reference the per-track WAVs are judged against (overall loudness, balance and masking exist only in the sum).
+/// Deliberately NOT an `AudioAsset`: it maps to no Logic track, so it stays outside track provenance and readiness.
+/// Every field is a fact about the real file found on disk; the asset exists only when such a file was validated.
+struct MixBounceAsset: Codable, Sendable {
+    var relativePath: String // "mix/<actual file name>" — the file proven on disk
+    var durationSeconds: Fact<Double>; var sampleRate: Fact<Double>; var channels: Fact<Int>; var bitDepth: Fact<Int>; var format: Fact<String>
+    /// The bounce dialog's level-affecting settings when THIS app launched the bounce; nil for a bounce it did not observe.
+    var bounceSettings: ExportSettingsFacts?
+    /// Locally computed DSP facts about the bounced file — same analyzer, same honesty as the per-track metrics.
+    var metrics: AudioMetrics?
+
+    /// The one real audio file in the mix folder, probed and measured. The newest readable file wins, so a leftover
+    /// from an older bounce never shadows the file just written; an unreadable (mid-write) file is skipped, and with
+    /// no readable audio at all the answer is nil — a mix bounce is never fabricated from directory contents.
+    static func resolve(in directory: URL, settings: ExportSettingsFacts?, probe: AudioFileProbe = AudioFileProbe(), metricsAnalyzer: AudioMetricsAnalyzer = AudioMetricsAnalyzer()) -> MixBounceAsset? {
+        let manager = FileManager.default
+        guard let names = try? manager.contentsOfDirectory(atPath: directory.path) else { return nil }
+        func modified(_ name: String) -> Date { (try? manager.attributesOfItem(atPath: directory.appendingPathComponent(name).path))?[.modificationDate] as? Date ?? .distantPast }
+        let candidates = names.filter { ["wav", "aif", "aiff", "caf"].contains(($0 as NSString).pathExtension.lowercased()) }.sorted { (modified($0), $0) > (modified($1), $1) }
+        for name in candidates {
+            let url = directory.appendingPathComponent(name)
+            guard let meta = probe.read(url) else { continue }
+            return MixBounceAsset(relativePath: "mix/\(name)", durationSeconds: .known(meta.durationSeconds), sampleRate: .known(meta.sampleRate), channels: .known(meta.channels), bitDepth: meta.bitDepth.map { .known($0) } ?? .unavailable, format: .known(meta.format), bounceSettings: settings, metrics: metricsAnalyzer.analyze(fileAt: url))
+        }
+        return nil
+    }
+}
+
 struct AudioManifest: Codable, Sendable {
-    var schemaVersion = "1.2"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
+    var schemaVersion = "1.3"; var generatedAt = Date(); var assets: [AudioAsset]; var summary: AudioExtractionSummary
     /// Nil when this session never observed Logic's export dialog (manual export, or the app was restarted since).
     var exportSettings: ExportSettingsFacts?
-    init(assets: [AudioAsset], exportSettings: ExportSettingsFacts? = nil) {
+    /// The bounced Stereo Out mix; nil when no bounce file exists — its absence is stated, never papered over.
+    var mix: MixBounceAsset?
+    init(assets: [AudioAsset], exportSettings: ExportSettingsFacts? = nil, mix: MixBounceAsset? = nil) {
         self.assets = assets
         self.exportSettings = exportSettings
+        self.mix = mix
         self.summary = AudioExtractionSummary(logicTracks: assets.count, audioRegions: assets.reduce(0) { $0 + $1.regions.count }, assets: assets.count, exported: assets.filter { $0.status == .exported }.count, requiresUserExport: assets.filter { $0.status == .requiresUserExport }.count, failed: assets.filter { $0.status == .failed }.count)
     }
 }
@@ -66,6 +98,11 @@ extension AudioManifest {
             if s.normalize.value == nil { out += ["- Normalize could not be read from the dialog, so whether the exported levels were rewritten is unverified — treat relative loudness between the WAVs with care unless the user confirms Normalize was Off."] }
         } else {
             out += ["- Export dialog settings: unavailable — this session did not observe Logic's export dialog, so whether Normalize altered the exported levels is unverified."]
+        }
+        if let mix {
+            out += ["- Mix (Stereo Out): \(mix.relativePath) — the bounced sum through the master chain; per-track WAVs do not contain it."]
+        } else {
+            out += ["- Mix (Stereo Out): none — no bounced mix file exists, so the sum (overall loudness, balance, masking) is not part of this delivery."]
         }
         for asset in assets {
             out += ["", "## \(asset.audioID)", "", "- Logic Track: \(asset.trackName.value ?? "unknown")", "- logicalTrackID: \(asset.logicalTrackID)", "- WAV: \(asset.actualExportedPath.value ?? asset.expectedExportPath)", "- Status: \(asset.status.rawValue)", "- Regions: \(asset.regionCount)"]

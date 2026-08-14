@@ -352,7 +352,7 @@ struct AudioScreen: View {
                 if !model.audioStatus.isEmpty { Text(model.audioStatus).font(.callout).foregroundStyle(.secondary) }
             }
             HStack(spacing: 10) {
-                Button("Export Tracks from Logic", action: model.requestExport).buttonStyle(.borderedProminent).disabled(model.normalized == nil || model.exportPhase == .exporting)
+                Button("Export Tracks from Logic", action: model.requestExport).buttonStyle(.borderedProminent).disabled(model.normalized == nil || model.exportPhase == .exporting || model.mixPhase == .exporting)
                 Button("Refresh Export Status", action: model.refreshExportStatus).disabled(model.audioAssets.isEmpty)
                 Button("Open Audio Folder", action: model.openAudioFolder).disabled(model.audioAssets.isEmpty)
                 Button("Copy Audio Manifest", action: model.copyAudioManifest).disabled(model.audioAssets.isEmpty)
@@ -370,6 +370,18 @@ struct AudioScreen: View {
                 } }
             }
             Text("Export Tracks from Logic launches Logic's own File \u{25B8} Export \u{25B8} All Tracks as Audio Files\u{2026} (one WAV per track, regions kept in place). AI Mix Assistant only triggers the export and never changes mix settings; it then detects the real WAVs and matches them to logicalTrackID.").font(.caption).foregroundStyle(.secondary)
+            Card {
+                HStack(spacing: 10) { StatusDot(state: mixIndicator.0); Text("Mix (Stereo Out)").font(.system(size: 13, weight: .semibold)); Spacer(); Text(mixIndicator.1).font(.caption.weight(.semibold)).foregroundStyle(mixIndicator.0.color) }
+                if let mix = model.mixAsset {
+                    Text(mixSummary(mix)).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                }
+                if !model.mixStatus.isEmpty { Text(model.mixStatus).font(.callout).foregroundStyle(.secondary) }
+                HStack(spacing: 10) {
+                    Button("Bounce Mix from Logic", action: model.requestMixBounce).disabled(model.normalized == nil || model.mixPhase == .exporting || model.exportPhase == .exporting)
+                    Button("Open Mix Folder", action: model.openMixFolder).disabled(model.mixAsset == nil)
+                }
+                Text("Bounces the whole project through the master chain via Logic's own File \u{25B8} Bounce dialog into the app's mix folder, then measures the file. The sum is the reference for overall loudness and balance — per-track WAVs never contain it. Bounce settings are only read, never changed; a Normalize other than Off cancels the bounce.").font(.caption).foregroundStyle(.secondary)
+            }
             StageFooter(title: "Continue to AI Package", enabled: model.isAvailable(.aiPackage)) { model.go(to: .aiPackage) }
         }
         .onAppear { if model.normalized != nil && model.audioAssets.isEmpty { model.prepareAudioExport() } }
@@ -377,9 +389,22 @@ struct AudioScreen: View {
             Button("Export") { model.confirmExport() }
             Button("Cancel", role: .cancel) {}
         } message: { Text("Logic Pro will export every track of the current project as one WAV file per track, using its own File \u{25B8} Export \u{25B8} All Tracks as Audio Files\u{2026} dialog. AI Mix Assistant drives that dialog into its audio folder automatically — don't touch Logic until the export starts. No mix settings are changed, and your clipboard is restored afterwards.") }
+        .confirmationDialog("Bounce the mix from Logic Pro?", isPresented: $model.showBounceConfirm, titleVisibility: .visible) {
+            Button("Bounce") { model.confirmMixBounce() }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("Logic Pro will bounce the whole project (Stereo Out) using its own File \u{25B8} Bounce dialog. AI Mix Assistant drives that dialog into its mix folder automatically — don't touch Logic until the bounce starts. A realtime bounce plays the song once; bounce settings are only read, never changed, and your clipboard is restored afterwards.") }
     }
     private var exportIndicator: (IndicatorState, String) {
         switch model.exportPhase { case .idle: return (.idle, "Ready"); case .exporting: return (.warn, "Exporting\u{2026}"); case .done: return (.ok, "Exported"); case .failed(let step): return (.error, "Failed: \(step)") }
+    }
+    private var mixIndicator: (IndicatorState, String) {
+        switch model.mixPhase { case .idle: return (.idle, model.mixAsset == nil ? "Not bounced" : "Bounced"); case .exporting: return (.warn, "Bouncing\u{2026}"); case .done: return (.ok, "Bounced"); case .failed(let step): return (.error, "Failed: \(step)") }
+    }
+    private func mixSummary(_ mix: MixBounceAsset) -> String {
+        var parts = [mix.relativePath]
+        if let lufs = mix.metrics?.integratedLoudnessLUFS.value { parts.append(String(format: "%.1f LUFS integrated", lufs)) }
+        if let peak = mix.metrics?.truePeakDBTP.value { parts.append(String(format: "%.1f dBTP true peak", peak)) }
+        return parts.joined(separator: " · ")
     }
     private func metric(_ label: String, _ value: String) -> some View { VStack(alignment: .leading, spacing: 2) { Text(value).font(.system(.title2, design: .rounded).weight(.semibold)); Text(label).font(.caption).foregroundStyle(.secondary) } }
     private func audioState(_ s: AudioExtractionStatus) -> IndicatorState { switch s { case .exported: .ok; case .requiresUserExport: .warn; case .failed: .error; case .unavailable: .warn } }

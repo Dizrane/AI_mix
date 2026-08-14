@@ -24,13 +24,13 @@ actor SessionStore {
     /// Revealing in Finder is AppKit UI work and belongs on the main actor: called straight from this actor it would run on a
     /// background executor, the same off-main AppKit use that kills the process elsewhere. The store only decides which URL.
     nonisolated func reveal(url: URL) { Task { @MainActor in NSWorkspace.shared.activateFileViewerSelecting([url]) } }
-    /// Clears only audio files inside the app-owned current/audio working folder before a fresh export. Never touches other locations.
-    func clearAudioFiles() { let dir = folderURL("audio"); let manager = FileManager.default; guard let files = try? manager.contentsOfDirectory(atPath: dir.path) else { return }; for file in files where ["wav", "aif", "aiff", "caf"].contains((file as NSString).pathExtension.lowercased()) { try? manager.removeItem(at: dir.appendingPathComponent(file)) } }
+    /// Clears only audio files inside one app-owned working folder (current/audio, current/mix) before a fresh export/bounce. Never touches other locations.
+    func clearAudioFiles(folder: String = "audio") { let dir = folderURL(folder); let manager = FileManager.default; guard let files = try? manager.contentsOfDirectory(atPath: dir.path) else { return }; for file in files where ["wav", "aif", "aiff", "caf"].contains((file as NSString).pathExtension.lowercased()) { try? manager.removeItem(at: dir.appendingPathComponent(file)) } }
     /// Assembles current/package with the markdown, JSON snapshots and the REAL exported WAVs, then best-effort zips it. Never fabricates files.
     /// Each exported asset is resolved against the confirmed audio directory (current/audio) at copy time — `actualExportedPath` if it still
     /// exists, otherwise re-resolved via the extractor — validated with AVAudioFile, copied, and the destination is verified. `copiedWAVs`
     /// counts only files that were actually written; `missing` names any exported asset whose WAV could not be resolved/validated/copied.
-    func savePackage(projectName: String, markdown: String, snapshot: NormalizedSnapshot, audioManifest: AudioManifest, packageManifest: PackageManifest, assets: [AudioAsset], audioExtractor: AudioAssetExtractor, probe: AudioFileProbe) throws -> (folder: URL, zip: URL?, copiedWAVs: Int, missing: [String]) {
+    func savePackage(projectName: String, markdown: String, snapshot: NormalizedSnapshot, audioManifest: AudioManifest, packageManifest: PackageManifest, assets: [AudioAsset], mix: MixBounceAsset?, audioExtractor: AudioAssetExtractor, probe: AudioFileProbe) throws -> (folder: URL, zip: URL?, copiedWAVs: Int, missing: [String]) {
         let manager = FileManager.default
         let audioDir = folderURL("audio") // the confirmed source directory: current/audio
         let pkg = sessionURL.appendingPathComponent("package", isDirectory: true)
@@ -59,6 +59,15 @@ actor SessionStore {
             do { try manager.copyItem(at: realFile, to: destination) } catch { missing.append("\(label): copy failed (\(error.localizedDescription))"); continue }
             if manager.fileExists(atPath: destination.path) { copied += 1 } else { missing.append("\(label): destination missing after copy") }
         }
+        // The bounced mix ships under package/mix/ — validated and verified like every track WAV, never fabricated.
+        if let mix {
+            let source = sessionURL.appendingPathComponent(mix.relativePath)
+            if manager.fileExists(atPath: source.path), probe.read(source) != nil {
+                try manager.createDirectory(at: pkg.appendingPathComponent("mix"), withIntermediateDirectories: true)
+                let destination = pkg.appendingPathComponent("mix").appendingPathComponent(source.lastPathComponent)
+                do { try manager.copyItem(at: source, to: destination); if !manager.fileExists(atPath: destination.path) { missing.append("Mix (Stereo Out): destination missing after copy") } } catch { missing.append("Mix (Stereo Out): copy failed (\(error.localizedDescription))") }
+            } else { missing.append("Mix (Stereo Out): \(mix.relativePath) is gone or unreadable — bounce again") }
+        }
         let safeName = projectName.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: ":", with: "_")
         let zipURL = sessionURL.appendingPathComponent("AI_Mix_Analysis_\(safeName.isEmpty ? "project" : safeName).zip")
         if manager.fileExists(atPath: zipURL.path) { try? manager.removeItem(at: zipURL) }
@@ -69,7 +78,7 @@ actor SessionStore {
         let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto"); process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", source.path, dest.path]
         try process.run(); process.waitUntilExit(); return process.terminationStatus == 0
     }
-    private static func createStructure(at current: URL) throws { for folder in ["raw", "normalized", "audio", "metadata", "prompts", "responses", "logs", "temporary"] { try FileManager.default.createDirectory(at: current.appendingPathComponent(folder), withIntermediateDirectories: true) } }
+    private static func createStructure(at current: URL) throws { for folder in ["raw", "normalized", "audio", "mix", "metadata", "prompts", "responses", "logs", "temporary"] { try FileManager.default.createDirectory(at: current.appendingPathComponent(folder), withIntermediateDirectories: true) } }
     private static func dataRoot() -> URL {
         let bundleURL = Bundle.main.bundleURL
         if bundleURL.pathExtension == "app" { return bundleURL.deletingLastPathComponent().appendingPathComponent("Data", isDirectory: true) }
