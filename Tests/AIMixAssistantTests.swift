@@ -512,7 +512,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.20`"))
+    #expect(md.contains("Package schema: `2.21`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -612,6 +612,10 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(md.contains("Plan composition rules:"))
     #expect(md.contains("Account for every ISSUE"))
     #expect(md.contains("no `set_solo` action unless the user explicitly asked"))
+    // A non-known current value has a defined path — ask the user in QUESTIONS — instead of a bare prohibition the
+    // model resolves by guessing; the validator cannot catch a guessed `current` when no known fact exists to compare.
+    #expect(md.contains("Ask in QUESTIONS for the value Logic's channel strip shows"))
+    #expect(md.contains("the user's answer then becomes `parameters.current`"))
 }
 /// The golden path between stage 4 and stage 5: a reply written exactly as the generated package instructs — prose around
 /// a `MIX PLAN` fenced JSON block plus MANUAL STEPS, with `current` copied from the package's own table — pastes into the
@@ -1289,7 +1293,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.20`"))
+    #expect(md.contains("Package schema: `2.21`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
