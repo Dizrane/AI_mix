@@ -72,6 +72,29 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
     ])
     #expect(CommandValidator().validate(plan, against: fixture()).map(\.status) == [.invalid, .valid])
 }
+/// The plan is the user's manual instruction sheet, so a value the user could not set on Logic's control is malformed:
+/// the fader stops at −96 and +6 dB and the pan knob at −64…+63 — the validator rejects anything outside instead of
+/// previewing it as applicable, while the exact boundary values stay valid.
+@Test func validatorRejectsValuesOutsideLogicControlRanges() {
+    let plan = MixPlan(version: "1.0", status: "ready", actions: [
+        .init(id: "a", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(12)], reason: "LLM"),
+        .init(id: "b", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-120)], reason: "LLM"),
+        .init(id: "c", target: .init(trackID: "channel_aux_1"), action: .setPan, parameters: ["value": .number(90)], reason: "LLM"),
+        .init(id: "d", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(6)], reason: "LLM"),
+        .init(id: "e", target: .init(trackID: "channel_aux_1"), action: .setPan, parameters: ["value": .number(-64)], reason: "LLM")
+    ])
+    #expect(CommandValidator().validate(plan, against: fixture()).map(\.status) == [.invalid, .invalid, .invalid, .valid, .valid])
+}
+/// Duplicated ids make individual steps ambiguous to talk about, and an empty reason is an instruction without a
+/// justification — both are malformed plan JSON, rejected as invalid rather than waved through as valid actions.
+@Test func validatorRejectsDuplicateIDsAndEmptyReasons() {
+    let plan = MixPlan(version: "1.0", status: "ready", actions: [
+        .init(id: "same", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-3)], reason: "LLM"),
+        .init(id: "same", target: .init(trackID: "channel_aux_1"), action: .setPan, parameters: ["value": .number(10)], reason: "LLM"),
+        .init(id: "blank", target: .init(trackID: "channel_aux_1"), action: .setVolume, parameters: ["value": .number(-3)], reason: "   ")
+    ])
+    #expect(CommandValidator().validate(plan, against: fixture()).map(\.status) == [.invalid, .invalid, .invalid])
+}
 /// The document tells the model to deliver the plan as one JSON code block, so the Review paste must accept exactly
 /// that: the fenced block, the block inside a larger reply, or the bare object — never fail on the fence itself.
 @Test func planPasteAcceptsFencedAndBareJSON() throws {
@@ -467,7 +490,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.17`"))
+    #expect(md.contains("Package schema: `2.18`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -518,6 +541,29 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(md.contains("NO action that adds a plug-in"))
     #expect(md.contains("Plug-in recommendations are PROSE for the user"))
     #expect(md.contains("`set_mute` and `set_solo` take a boolean `parameters.value`"))
+}
+/// Stage 6 must come back in a shape the user can walk straight into the Review stage with: one JSON block for the
+/// Review screen plus MANUAL STEPS for everything the schema cannot encode, absolute target values inside Logic's
+/// real control ranges, prose in the user's language — the document must define all of it, or the model invents a
+/// format whose answer needs manual repair before it can be used.
+@Test func packageDefinesTheStageSixFormat() throws {
+    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t")
+    #expect(md.contains("`MIX PLAN` — exactly one JSON code block"))
+    #expect(md.contains("`MANUAL STEPS` — a numbered list"))
+    #expect(md.contains("absolute target setting"))
+    #expect(md.contains("in the language the user writes to you in"))
+    #expect(md.contains("fader range −96…+6 dB"))
+    #expect(md.contains("within −64…+63"))
+    #expect(md.contains("Number the questions and propose a concrete default"))
+    let json = try #require(md.components(separatedBy: "```json").last?.components(separatedBy: "```").first)
+    let plan = try JSONDecoder().decode(MixPlan.self, from: Data(json.utf8))
+    #expect(plan.version == "1.0")
+    #expect(plan.status == "ready") // the example must model the documented contract, not a drifted status caption
+    #expect(plan.actions.allSatisfy { !$0.reason.isEmpty })
+    // The printed example must survive the app's own validator end to end (fixture has no "track_2", so retarget).
+    var retargeted = plan
+    retargeted.actions = plan.actions.map { action in var a = action; a.target.trackID = "channel_aux_1"; return a }
+    #expect(CommandValidator().validate(retargeted, against: fixture()).allSatisfy { $0.status == .valid })
 }
 /// The AX meter section is empty by nature (Logic publishes no numeric meters), and next to per-file LUFS/peak numbers a bare
 /// "LUFS: unavailable" reads as "no loudness data at all". It says which kind of reading it is and where the real numbers are.
@@ -1182,7 +1228,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.17`"))
+    #expect(md.contains("Package schema: `2.18`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))

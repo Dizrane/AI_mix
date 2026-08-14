@@ -30,13 +30,31 @@ enum ValidationStatus: String, Codable, Sendable { case valid, invalid, requires
 struct ValidatedCommand: Identifiable, Sendable { var command: MixCommand; var status: ValidationStatus; var message: String; var id: String { command.id } }
 struct CommandValidator: Sendable {
     let implemented: Set<MixAction> = [.setVolume, .setPan, .setMute, .setSolo, .setPluginBypass, .setPluginParameter]
-    func validate(_ plan: MixPlan, against snapshot: NormalizedSnapshot) -> [ValidatedCommand] { plan.actions.map { command in
+    /// Logic's own control ranges, the same scale as the channel facts: the fader travels −96…+6 dB (silencing is
+    /// `set_mute`, never a giant negative volume) and the pan knob −64…+63 (0 = centre). A value the user could not
+    /// physically set on the control is a malformed instruction, not a musical judgement — the validator rejects it.
+    static let volumeRangeDB: ClosedRange<Double> = -96...6
+    static let panRange: ClosedRange<Double> = -64...63
+    func validate(_ plan: MixPlan, against snapshot: NormalizedSnapshot) -> [ValidatedCommand] {
+        // Action ids are how the user and the model talk about individual steps; a duplicated id makes that reference
+        // ambiguous, so every occurrence of one is rejected rather than silently letting two steps share a name.
+        let duplicateIDs = Set(Dictionary(grouping: plan.actions, by: \.id).filter { $0.value.count > 1 }.keys)
+        return plan.actions.map { command in
         guard implemented.contains(command.action) else { return .init(command: command, status: .unsupported, message: "Executor does not implement \(command.action.rawValue).") }
+        if duplicateIDs.contains(command.id) { return .init(command: command, status: .invalid, message: "Action id \u{2018}\(command.id)\u{2019} is not unique within the plan.") }
+        // The reason is the user's justification for the move they will apply by hand; an action without one is not
+        // an instruction, so it is rejected as malformed rather than executed on faith.
+        if command.reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return .init(command: command, status: .invalid, message: "Every action needs a non-empty reason tying it to the evidence.") }
         guard let track = snapshot.tracks.first(where: { $0.id == command.target.trackID || ($0.name.value != nil && $0.name.value == command.target.trackName) }) else { return .init(command: command, status: .requiresProbe, message: "Track is not present in current normalized facts.") }
         // Every implemented action carries a typed `parameters.value`; a plan that omits or mistypes it is malformed,
         // not merely unproven — "technically valid" must mean the value can actually be applied.
         switch command.action {
-        case .setVolume, .setPan: if command.parameters["value"]?.numberValue == nil { return .init(command: command, status: .invalid, message: "\(command.action.rawValue) needs a numeric parameters.value.") }
+        case .setVolume:
+            guard let value = command.parameters["value"]?.numberValue else { return .init(command: command, status: .invalid, message: "set_volume needs a numeric parameters.value.") }
+            if !Self.volumeRangeDB.contains(value) { return .init(command: command, status: .invalid, message: "set_volume value \(value) dB is outside Logic's fader range \u{2212}96\u{2026}+6 dB.") }
+        case .setPan:
+            guard let value = command.parameters["value"]?.numberValue else { return .init(command: command, status: .invalid, message: "set_pan needs a numeric parameters.value.") }
+            if !Self.panRange.contains(value) { return .init(command: command, status: .invalid, message: "set_pan value \(value) is outside Logic's pan range \u{2212}64\u{2026}+63.") }
         case .setMute, .setSolo, .setPluginBypass: if command.parameters["value"]?.boolValue == nil { return .init(command: command, status: .invalid, message: "\(command.action.rawValue) needs a boolean parameters.value.") }
         default: break
         }
