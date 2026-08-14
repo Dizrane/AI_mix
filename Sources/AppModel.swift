@@ -342,12 +342,13 @@ struct ApplicationLauncher: Sendable {
                 audioStatus = "Logic export dialog could not be automated at ‘\(step)’: \(detail) You can finish Logic's dialog manually into the audio folder, then Refresh Export Status."
                 log.append("Logic export dialog automation failed at \(step): \(detail)")
                 await pollForExports(audioDir: audioDir) // still detect if the user completes it manually
-            case .blockedByNormalize(let value):
+            case .blockedByNormalize(let value, let detail):
                 exportPhase = .failed("normalize")
-                audioStatus = "Export stopped: Logic's export dialog has Normalize set to ‘\(value)’, which would rewrite the exported levels and falsify the relative-loudness evidence. Set Normalize to Off in File ▸ Export ▸ All Tracks as Audio Files… once, then export again."
-                log.append("Logic export blocked: Normalize is ‘\(value)’, not Off — the dialog was cancelled and nothing was exported.")
+                audioStatus = "Export stopped: Logic's export dialog has Normalize set to ‘\(value)’, which would rewrite the exported levels, and the app could not switch it to Off (\(detail)) Set Normalize to Off in File ▸ Export ▸ All Tracks as Audio Files… once, then export again."
+                log.append("Logic export blocked: Normalize is ‘\(value)’ and switching it to Off failed (\(detail)) — the dialog was cancelled and nothing was exported.")
             case .exported(let item, let format, let settings):
                 exportSettings = ExportSettingsFacts(settings: settings)
+                if let from = settings.normalizeSwitchedFrom { log.append("Logic's export dialog had Normalize set to ‘\(from)’ — the app switched it to Off before exporting, so the WAVs keep the project's real levels.") }
                 audioStatus = "Logic is exporting via ‘\(item)’ (\(format)). Detecting files…"
                 log.append("Logic export launched via \(item), format=\(format), bit depth=\(settings.bitDepth ?? "unread"), normalize=\(settings.normalize ?? "unread").")
                 await pollForExports(audioDir: audioDir)
@@ -423,10 +424,10 @@ struct ApplicationLauncher: Sendable {
                 mixPhase = .failed(step)
                 mixStatus = "Could not launch Logic's bounce at ‘\(step)’: \(detail)"
                 log.append("Logic bounce trigger failed at \(step): \(detail)")
-            case .blockedByNormalize(let value):
+            case .blockedByNormalize(let value, let detail):
                 mixPhase = .failed("normalize")
-                mixStatus = "Bounce stopped: Logic's bounce dialog has Normalize set to ‘\(value)’, which would rewrite the mix level and falsify the loudness evidence. Set Normalize to Off in the bounce dialog once, then bounce again."
-                log.append("Logic bounce blocked: Normalize is ‘\(value)’, not Off — the dialog was cancelled and nothing was bounced.")
+                mixStatus = "Bounce stopped: Logic's bounce dialog has Normalize set to ‘\(value)’, which would rewrite the mix level, and the app could not switch it to Off (\(detail)) Set Normalize to Off in the bounce dialog once, then bounce again."
+                log.append("Logic bounce blocked: Normalize is ‘\(value)’ and switching it to Off failed (\(detail)) — the dialog was cancelled and nothing was bounced.")
             case .blockedByFormat(let selected):
                 mixPhase = .failed("format")
                 let checked = selected.filter(\.enabled).map(\.name)
@@ -438,6 +439,7 @@ struct ApplicationLauncher: Sendable {
                 log.append("Logic bounce dialog automation failed at \(step): \(detail)")
                 await pollForMixBounce(mixDir: mixDir, settings: nil) // still detect if the user completes it manually
             case .bounced(let item, let settings):
+                if let from = settings.normalizeSwitchedFrom { log.append("Logic's bounce dialog had Normalize set to ‘\(from)’ — the app switched it to Off before bouncing, so the file keeps the mix's real level.") }
                 mixStatus = "Logic is bouncing via ‘\(item)’. Waiting for the file…"
                 log.append("Logic bounce launched via \(item), format=\(settings.format ?? "unread"), normalize=\(settings.normalize ?? "unread").")
                 await pollForMixBounce(mixDir: mixDir, settings: ExportSettingsFacts(settings: settings))

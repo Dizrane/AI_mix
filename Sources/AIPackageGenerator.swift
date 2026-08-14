@@ -8,7 +8,7 @@ enum PackageDelivery: Sendable { case markdownOnly, fullPackage }
 
 /// Provider-neutral export of normalized, evidence-based DAW facts for any external LLM.
 struct AIPackageGenerator: Sendable {
-    static let schemaVersion = "2.12"
+    static let schemaVersion = "2.13"
     func make(snapshot: NormalizedSnapshot, sessionID: String, audio: [AudioAsset] = [], plugins: [PluginInventoryItem] = [], probes: [ProbeType] = ProbeType.allCases, delivery: PackageDelivery = .fullPackage, exportSettings: ExportSettingsFacts? = nil, mix: MixBounceAsset? = nil) -> String {
         let readiness = PackageReadiness.evaluate(snapshot: snapshot, assets: audio)
         var out: [String] = []
@@ -137,11 +137,13 @@ struct AIPackageGenerator: Sendable {
         let regionTotal = assets.reduce(0) { $0 + $1.regions.count }
         out += ["", "- Logic audio tracks: \(assets.count) • Audio regions: \(regionTotal) • Assets (WAV targets): \(assets.count)", "- Exported: \(assets.filter { $0.status == .exported }.count) • Requires user export: \(assets.filter { $0.status == .requiresUserExport }.count) • Failed: \(assets.filter { $0.status == .failed }.count)"]
         // Whether the WAVs are level evidence hinges on Logic's export Normalize: the automation reads the dialog's own
-        // controls and cancels any export whose Normalize is not Off, so a known value here is always level-preserving.
-        // An export the app did not launch (or observe) is stated as exactly that — never assumed to have been safe.
+        // controls, switches a level-rewriting Normalize to Off itself (verified by re-reading the control) and cancels
+        // the export only when that switch fails, so a known value here is always level-preserving. An export the app
+        // did not launch (or observe) is stated as exactly that — never assumed to have been safe.
         if let s = exportSettings {
             out += [fact("Export dialog format", s.format), fact("Export dialog bit depth", s.bitDepth), fact("Export dialog Normalize", s.normalize)]
-            out += s.normalize.value.map { ["- Normalize was read as \($0) off Logic's own export dialog (any other value cancels the export), so the WAVs carry the project's real relative levels."] } ?? ["- Normalize was not readable on the dialog, so whether the exported levels were rewritten is unverified — treat relative loudness between the WAVs with care."]
+            if let from = s.normalizeSwitchedFrom.value { out += ["- Normalize showed \u{201C}\(from)\u{201D} when the dialog opened; the app switched it to Off and verified the switch before exporting."] }
+            out += s.normalize.value.map { ["- Normalize was read as \($0) off Logic's own export dialog (a level-rewriting value is switched to Off by the app, and an unswitchable one cancels the export), so the WAVs carry the project's real relative levels."] } ?? ["- Normalize was not readable on the dialog, so whether the exported levels were rewritten is unverified — treat relative loudness between the WAVs with care."]
         } else {
             out += ["- Export dialog settings: unavailable — this session did not observe Logic's export dialog (the WAVs were exported manually, or the app was restarted since), so whether Normalize altered the exported levels is unverified."]
         }
@@ -167,8 +169,9 @@ struct AIPackageGenerator: Sendable {
         out += ["", "- File: known: \(mix.relativePath)" + (delivery == .fullPackage ? "" : " (the file is not part of this delivery — the measurements below are the mix evidence available to you)"), "- Duration: \(render(mix.durationSeconds, unit: " s"))", "- Sample rate: \(render(mix.sampleRate, unit: " Hz"))", "- Channels: \(render(mix.channels))", "- Bit depth: \(render(mix.bitDepth))", "- Format: \(render(mix.format))"]
         if let s = mix.bounceSettings {
             out += [fact("Bounce dialog format", s.format), fact("Bounce dialog bit depth", s.bitDepth), fact("Bounce dialog Normalize", s.normalize)]
+            if let from = s.normalizeSwitchedFrom.value { out += ["- Normalize showed \u{201C}\(from)\u{201D} when the dialog opened; the app switched it to Off and verified the switch before the bounce."] }
             if let formats = s.formats.value { out += ["- Bounce dialog formats (read from Logic's own format table; a bounce with no uncompressed PCM format checked is cancelled): known: \(formats.caption)"] }
-            out += s.normalize.value.map { ["- Normalize was read as \($0) off Logic's own bounce dialog (any other value cancels the bounce), so the file carries the mix's real level."] } ?? ["- Normalize was not readable on the bounce dialog, so whether the bounced level was rewritten is unverified."]
+            out += s.normalize.value.map { ["- Normalize was read as \($0) off Logic's own bounce dialog (a level-rewriting value is switched to Off by the app, and an unswitchable one cancels the bounce), so the file carries the mix's real level."] } ?? ["- Normalize was not readable on the bounce dialog, so whether the bounced level was rewritten is unverified."]
         } else {
             out += ["- Bounce dialog settings: unavailable — this session did not observe Logic's bounce dialog for this file, so whether Normalize altered its level is unverified."]
         }

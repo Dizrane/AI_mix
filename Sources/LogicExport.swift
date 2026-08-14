@@ -6,7 +6,7 @@ import CoreGraphics
 /// Outcome of the full one-click export. Never claims files were written — that is verified separately from disk.
 enum ExportOutcome: Sendable {
     case exported(item: String, format: String, settings: ExportDialogSettings) // menu launched, destination set, Export pressed
-    case blockedByNormalize(value: String)               // dialog read, Normalize would rewrite levels — cancelled, nothing exported
+    case blockedByNormalize(value: String, detail: String) // Normalize would rewrite levels and could not be switched to Off — cancelled, nothing exported
     case triggerFailed(step: String, detail: String)     // could not launch the export menu item
     case navigationFailed(step: String, detail: String)  // dialog opened but destination/confirm could not be driven
 }
@@ -17,14 +17,17 @@ struct FormatSelection: Sendable, Equatable, Codable { var name: String; var ena
 
 /// The level-affecting settings Logic's export dialog showed when the export was launched, read from the dialog's own
 /// labelled controls before Export is pressed. Each value is the control's own caption; a control the dialog does not
-/// expose stays nil — the setting is then honestly unknown, never assumed. The automation only READS these controls
-/// (the contract of never changing Logic's export settings stands); a harmful value cancels the export instead.
+/// expose stays nil — the setting is then honestly unknown, never assumed. Normalize is the one control the automation
+/// is allowed to change, and only in one direction: a level-rewriting value is switched to Off before the export, the
+/// switch is verified by re-reading the control, and `normalizeSwitchedFrom` records the value the dialog showed before
+/// (nil when Normalize was already Off, unreadable, or never had to be touched). Format and bit depth are never changed.
 /// `formats` is the bounce dialog's format table (the track-export dialog has a single format pop-up instead, so it
 /// stays nil there); nil also when the table could not be read at all.
 struct ExportDialogSettings: Sendable, Equatable, Codable {
     var format: String?
     var bitDepth: String?
     var normalize: String?
+    var normalizeSwitchedFrom: String? = nil
     var formats: [FormatSelection]? = nil
 }
 
@@ -33,7 +36,7 @@ struct ExportDialogSettings: Sendable, Equatable, Codable {
 /// writing long after the dialog is confirmed.
 enum BounceOutcome: Sendable {
     case bounced(item: String, settings: ExportDialogSettings) // menu launched, destination set, Bounce pressed
-    case blockedByNormalize(value: String)               // dialog read, Normalize would rewrite levels — cancelled, nothing bounced
+    case blockedByNormalize(value: String, detail: String) // Normalize would rewrite levels and could not be switched to Off — cancelled, nothing bounced
     case blockedByFormat(selected: [FormatSelection])    // dialog read, no uncompressed PCM format is checked — cancelled, nothing bounced
     case triggerFailed(step: String, detail: String)     // could not launch the bounce menu item
     case navigationFailed(step: String, detail: String)  // dialog opened but settings/destination could not be driven
@@ -51,9 +54,12 @@ enum MixerEnsureOutcome: Sendable { case alreadyVisible, opened(item: String), f
 /// filename pattern "Track Name", and buttons "Cancel"/"Export"). It ONLY: presses menu items, posts the
 /// standard file-panel keys (⌘⇧G to go-to-folder, ⌘V to paste the destination, Return to accept) and presses
 /// the "Export" button. It never changes volume/pan/mute/solo/plug-ins/sends/routing/automation/regions or
-/// project/export settings (format, bit depth, normalize are left exactly as the dialog shows them). The dialog's
-/// level-affecting settings ARE read as facts, and a Normalize other than Off cancels the export: normalized WAVs
-/// would silently falsify every relative-level fact the exported files are supposed to prove.
+/// the dialog's format and bit depth (left exactly as the dialog shows them). The dialog's level-affecting
+/// settings ARE read as facts, and Normalize is the ONE deliberate exception to read-only: a Normalize other
+/// than Off would silently falsify every relative-level fact the exported files are supposed to prove, so the
+/// automation switches that control to Off itself (the same documented AXPress mechanism as every button),
+/// verifies the switch by re-reading the control, and records the original value as a fact. Only when the
+/// switch demonstrably fails is the export cancelled — never silently exported with rewritten levels.
 struct LogicExportAutomator: Sendable {
     private let supportedBundleIDs: Set<String> = ["com.apple.logic10", "com.apple.mobilelogic"]
     /// Shown when a top-level menu title does not match: the automation relies on English menu names by design.
@@ -76,11 +82,17 @@ struct LogicExportAutomator: Sendable {
         }
         guard let dialog = waitForExportDialog(appElement, timeout: 8) else { return .navigationFailed(step: "export_dialog", detail: "Export dialog did not appear after launching \u{2018}\(item)\u{2019}.") }
         // Read the dialog's level-affecting settings first: a Normalize other than Off would rewrite the exported
-        // levels, so the export is cancelled (Escape closes the dialog this automation opened) before anything else.
-        let settings = dialogSettings(dialog)
+        // levels, so the automation switches it to Off itself before anything else — and cancels the export only
+        // when that switch demonstrably fails (Escape then closes the dialog this automation opened).
+        var settings = dialogSettings(dialog)
         if let normalize = settings.normalize, Self.normalizeBlocksExport(normalize) == true {
-            closeWindows(while: { self.findExportDialog(appElement) }, applicationPid: pid)
-            return .blockedByNormalize(value: normalize)
+            switch switchNormalizeOff(dialog, applicationPid: pid) {
+            case .switched(let from):
+                settings = dialogSettings(dialog); settings.normalizeSwitchedFrom = from
+            case .failed(let detail):
+                closeWindows(while: { self.findExportDialog(appElement) }, applicationPid: pid)
+                return .blockedByNormalize(value: normalize, detail: detail)
+            }
         }
         let format = settings.format ?? "unknown"
 
@@ -119,35 +131,81 @@ struct LogicExportAutomator: Sendable {
     private func dialogSettings(_ dialog: AXUIElement) -> ExportDialogSettings {
         var elements: [AXUIElement] = []
         collectDescendants(dialog, into: &elements)
-        func labelled(_ needle: String, roles: Set<String>) -> AXUIElement? {
-            elements.first { roles.contains(self.role($0)) && (self.string($0, kAXTitleAttribute) ?? "").localizedCaseInsensitiveContains(needle) }
+        let formatControl = settingControl(in: elements, needle: "format", roles: ["AXPopUpButton"]) ?? elements.first { self.role($0) == "AXPopUpButton" && (self.string($0, kAXValueAttribute) ?? "").uppercased().contains("WAV") }
+        let normalize = settingControl(in: elements, needle: "normalize", roles: ["AXPopUpButton", "AXCheckBox"]).flatMap(normalizeCaption)
+        return ExportDialogSettings(format: formatControl.flatMap { self.string($0, kAXValueAttribute) }, bitDepth: settingControl(in: elements, needle: "bit depth", roles: ["AXPopUpButton"]).flatMap { self.string($0, kAXValueAttribute) }, normalize: normalize)
+    }
+    /// The control a caption names, found by the control's own title first and by row geometry second (see `rowControlIndex`).
+    private func settingControl(in elements: [AXUIElement], needle: String, roles: Set<String>) -> AXUIElement? {
+        if let titled = elements.first(where: { roles.contains(self.role($0)) && (self.string($0, kAXTitleAttribute) ?? "").localizedCaseInsensitiveContains(needle) }) { return titled }
+        // A static text is a caption when its own text names the setting; its control is matched purely by row geometry.
+        let labels = elements.filter { element in
+            guard self.role(element) == "AXStaticText" else { return false }
+            let texts = [self.string(element, kAXValueAttribute), self.string(element, kAXTitleAttribute)].compactMap { $0 }
+            return texts.contains { $0.localizedCaseInsensitiveContains(needle) }
         }
-        func geometryLabelled(_ needle: String, roles: Set<String>) -> AXUIElement? {
-            // A static text is a caption when its own text names the setting; its control is matched purely by row geometry.
-            let labels = elements.filter { element in
-                guard self.role(element) == "AXStaticText" else { return false }
-                let texts = [self.string(element, kAXValueAttribute), self.string(element, kAXTitleAttribute)].compactMap { $0 }
-                return texts.contains { $0.localizedCaseInsensitiveContains(needle) }
-            }
-            let candidates: [(control: AXUIElement, frame: CGRect)] = elements.compactMap { element in
-                guard roles.contains(self.role(element)), let controlFrame = self.frame(element) else { return nil }
-                return (element, controlFrame)
-            }
-            for label in labels {
-                guard let labelFrame = frame(label) else { continue }
-                if let index = Self.rowControlIndex(labelFrame: labelFrame, controlFrames: candidates.map(\.frame)) { return candidates[index].control }
-            }
-            return nil
+        let candidates: [(control: AXUIElement, frame: CGRect)] = elements.compactMap { element in
+            guard roles.contains(self.role(element)), let controlFrame = self.frame(element) else { return nil }
+            return (element, controlFrame)
         }
-        func setting(_ needle: String, roles: Set<String>) -> AXUIElement? { labelled(needle, roles: roles) ?? geometryLabelled(needle, roles: roles) }
-        let formatControl = setting("format", roles: ["AXPopUpButton"]) ?? elements.first { self.role($0) == "AXPopUpButton" && (self.string($0, kAXValueAttribute) ?? "").uppercased().contains("WAV") }
-        var normalize: String? = nil
-        if let control = setting("normalize", roles: ["AXPopUpButton", "AXCheckBox"]) {
-            let value = string(control, kAXValueAttribute)
-            // A checkbox exposes a switch position, and here the caption of that position is documented by the control itself: 1 is On, 0 is Off.
-            normalize = role(control) == "AXCheckBox" ? value.flatMap { $0 == "1" ? "On" : ($0 == "0" ? "Off" : nil) } : value
+        for label in labels {
+            guard let labelFrame = frame(label) else { continue }
+            if let index = Self.rowControlIndex(labelFrame: labelFrame, controlFrames: candidates.map(\.frame)) { return candidates[index].control }
         }
-        return ExportDialogSettings(format: formatControl.flatMap { self.string($0, kAXValueAttribute) }, bitDepth: setting("bit depth", roles: ["AXPopUpButton"]).flatMap { self.string($0, kAXValueAttribute) }, normalize: normalize)
+        return nil
+    }
+    /// The Normalize control's caption as the dialog itself documents it. A checkbox exposes a switch position whose
+    /// captions are documented by the control: 1 is On, 0 is Off; a pop-up carries its selected item's own caption.
+    private func normalizeCaption(_ control: AXUIElement) -> String? {
+        let value = string(control, kAXValueAttribute)
+        return role(control) == "AXCheckBox" ? value.flatMap { $0 == "1" ? "On" : ($0 == "0" ? "Off" : nil) } : value
+    }
+
+    /// Result of the one deliberate dialog write this automation performs: Normalize switched to Off, or an honest failure.
+    private enum NormalizeSwitch { case switched(from: String), failed(detail: String) }
+    /// Switches the dialog's Normalize control to Off — the same documented AXPress mechanism as every button press,
+    /// and the only setting the automation ever changes: any other value rewrites the exported levels and falsifies
+    /// the relative-loudness evidence, and asking the user to flip it by hand was the one manual step left. A pop-up
+    /// is opened and its literal "Off" item pressed (strict title match, so nothing else can be selected); a checkbox
+    /// is toggled off. The switch is only believed when re-reading the control proves the new value no longer blocks;
+    /// anything short of that proof is a failure and the caller cancels the export instead of trusting a blind press.
+    private func switchNormalizeOff(_ dialog: AXUIElement, applicationPid: pid_t) -> NormalizeSwitch {
+        var elements: [AXUIElement] = []
+        collectDescendants(dialog, into: &elements)
+        guard let control = settingControl(in: elements, needle: "normalize", roles: ["AXPopUpButton", "AXCheckBox"]) else { return .failed(detail: "The Normalize control could not be found on the dialog again.") }
+        guard let before = normalizeCaption(control) else { return .failed(detail: "The Normalize control's value could not be read.") }
+        if Self.normalizeBlocksExport(before) != true { return .switched(from: before) } // already harmless — nothing to change
+        if role(control) == "AXCheckBox" {
+            guard press(control) else { return .failed(detail: "AXPress on the Normalize checkbox did not succeed.") }
+        } else {
+            guard press(control) else { return .failed(detail: "AXPress on the Normalize pop-up did not succeed.") }
+            var menuItems: [AXUIElement] = []
+            let menuDeadline = Date().addingTimeInterval(2)
+            while Date() < menuDeadline {
+                usleep(150_000)
+                if let menu = firstDescendant(control, { self.role($0) == "AXMenu" }) { menuItems = children(menu); break }
+            }
+            guard !menuItems.isEmpty else { return .failed(detail: "The Normalize pop-up did not open its menu.") }
+            let titles = menuItems.map { self.string($0, kAXTitleAttribute) ?? "" }
+            guard let index = Self.offMenuItemIndex(titles) else {
+                postKey(53, [], via: .pid(Self.ownerPid(of: control) ?? applicationPid)) // close the menu this attempt opened
+                return .failed(detail: "The Normalize menu has no \u{2018}Off\u{2019} item (items: \(titles.filter { !$0.isEmpty }.joined(separator: ", "))).")
+            }
+            guard press(menuItems[index]) else { return .failed(detail: "AXPress on the Normalize menu's \u{2018}Off\u{2019} item did not succeed.") }
+        }
+        // Proof over trust: the switch counts only when the control itself re-reads as a non-blocking value.
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            usleep(150_000)
+            if let after = normalizeCaption(control), Self.normalizeBlocksExport(after) == false { return .switched(from: before) }
+        }
+        return .failed(detail: "Normalize still reads \u{2018}\(normalizeCaption(control) ?? "unreadable")\u{2019} after selecting Off.")
+    }
+    /// The index of the pop-up menu item that selects Off: the item whose own trimmed title IS "Off", case-insensitively.
+    /// Strict equality on purpose — a title merely containing the letters ("Overload Protection Only" contains none, but
+    /// a hypothetical "Offset" does) must never be pressed. Pure and testable; nil when no such item exists.
+    static func offMenuItemIndex(_ titles: [String]) -> Int? {
+        titles.firstIndex { $0.trimmingCharacters(in: .whitespacesAndNewlines).localizedCaseInsensitiveCompare("Off") == .orderedSame }
     }
 
     /// The control a caption labels, by dialog geometry alone: on the same row as the label (their vertical extents
@@ -202,8 +260,9 @@ struct LogicExportAutomator: Sendable {
 
     /// Full one-click bounce of the mix (Logic's Stereo Out) to `destination` via File ▸ Bounce — the sum through the
     /// whole master chain, which no per-track export contains. Same discipline as the track export: every element is
-    /// discovered at runtime, settings are only READ (a Normalize other than Off cancels the bounce instead of being
-    /// changed), the destination is driven through the standard save-panel keys and verified before the final press,
+    /// discovered at runtime, settings are read as facts and only Normalize is ever changed (a level-rewriting value
+    /// is switched to Off and verified; the bounce is cancelled only when that switch demonstrably fails), the
+    /// destination is driven through the standard save-panel keys and verified before the final press,
     /// and the user's clipboard is snapshotted and restored. Logic's bounce dialog ships in two shapes — a settings
     /// window whose confirm opens a separate name/destination panel, or one combined window — and both are handled by
     /// looking for the panel's own "Where:" pop-up rather than assuming a shape.
@@ -222,15 +281,22 @@ struct LogicExportAutomator: Sendable {
         case .pressed(let title): item = title
         }
         guard let dialog = waitForBounceWindow(appElement, timeout: 8) else { return .navigationFailed(step: "bounce_dialog", detail: "Bounce dialog did not appear after launching \u{2018}\(item)\u{2019}.") }
-        // Level-affecting settings first: a Normalize other than Off would rewrite the bounced level, so the bounce
-        // is cancelled (Escape closes what this automation opened) before any destination work. The format table is
-        // read the same way: a bounce whose checked formats contain no uncompressed PCM would produce a lossy file
-        // that is not level evidence (and would not even be detected as the mix), so it is cancelled too.
+        // Level-affecting settings first: a Normalize other than Off would rewrite the bounced level, so the
+        // automation switches it to Off itself and cancels the bounce only when that switch demonstrably fails
+        // (Escape then closes what this automation opened). The format table is read as facts: a bounce whose
+        // checked formats contain no uncompressed PCM would produce a lossy file that is not level evidence (and
+        // would not even be detected as the mix), so it is cancelled — checkbox rows are never toggled.
         var settings = dialogSettings(dialog)
         settings.formats = formatSelections(dialog)
         if let normalize = settings.normalize, Self.normalizeBlocksExport(normalize) == true {
-            closeWindows(while: { self.firstBounceWindow(appElement) }, applicationPid: pid)
-            return .blockedByNormalize(value: normalize)
+            switch switchNormalizeOff(dialog, applicationPid: pid) {
+            case .switched(let from):
+                let formats = settings.formats
+                settings = dialogSettings(dialog); settings.normalizeSwitchedFrom = from; settings.formats = formats
+            case .failed(let detail):
+                closeWindows(while: { self.firstBounceWindow(appElement) }, applicationPid: pid)
+                return .blockedByNormalize(value: normalize, detail: detail)
+            }
         }
         if Self.formatsBlockBounce(settings.formats) {
             closeWindows(while: { self.firstBounceWindow(appElement) }, applicationPid: pid)
