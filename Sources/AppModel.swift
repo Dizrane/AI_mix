@@ -119,7 +119,7 @@ struct ApplicationLauncher: Sendable {
     /// Installing an update while the app is mid-work would sabotage that work: the swap renames the folder and
     /// relaunches the app, killing a running scan or the WAV-detection polling, and Logic would keep exporting into
     /// a destination path whose folder name just changed. The buttons disable on this and the guard tells the reason.
-    var updateBlockedByWork: Bool { analyzerState == .scanning || exportPhase == .exporting || mixPhase == .exporting || executionRunning }
+    var updateBlockedByWork: Bool { analyzerState == .scanning || exportPhase == .exporting || mixPhase == .exporting || executionRunning || verificationRunning }
     /// User-requested in-place update: download the release ZIP, verify the new bundle, swap it in next to the
     /// untouched Data/, relaunch the new version and quit this one. Any failure is reported and leaves the current
     /// installation working; a translocated (quarantined read-only) copy must be repaired first, because its real
@@ -180,7 +180,7 @@ struct ApplicationLauncher: Sendable {
             do {
                 try await store.resetForNewAnalysis()
                 analysisSessionID = "analysis_\(ISO8601DateFormatter().string(from: Date()))"
-                raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; resetExecutionState(); audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil; metricsCache = [:]; exportSettings = nil; mixAsset = nil; mixStatus = ""; mixPhase = .idle; showBounceConfirm = false
+                raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; resetExecutionState(); resetVerificationState(); audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil; metricsCache = [:]; exportSettings = nil; mixAsset = nil; mixStatus = ""; mixPhase = .idle; showBounceConfirm = false
                 log.append("Previous AI Mix Assistant analysis data removed. Starting a clean read-only scan.")
                 let exporter = exporter
                 let mixerOutcome = await Task.detached(priority: .userInitiated) { exporter.ensureMixerVisible() }.value
@@ -216,7 +216,7 @@ struct ApplicationLauncher: Sendable {
     @Published var packageFolderURL: URL?; @Published var packageZipURL: URL?
     var packageReadiness: PackageReadiness { PackageReadiness.evaluate(snapshot: normalized, assets: audioAssets) }
     func ensurePluginInventory() { if availablePlugins.isEmpty { availablePlugins = pluginInventory.discoverAvailable() } }
-    func generateAIPackage() { guard let snapshot = normalized else { aiPackageStatus = "Run a full analysis first."; return }; ensurePluginInventory(); aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: audioAssets, plugins: availablePlugins, delivery: .markdownOnly, exportSettings: exportSettings, mix: mixAsset); let r = packageReadiness; aiPackageStatus = "AI package generated (\(r.overall.rawValue)) · \(availablePlugins.count) plugins available." + (r.audioTotal > 0 && r.audioExported < r.audioTotal ? " Audio incomplete: \(r.audioTotal - r.audioExported) WAV missing." : "") }
+    func generateAIPackage() { guard let snapshot = normalized else { aiPackageStatus = "Run a full analysis first."; return }; ensurePluginInventory(); aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: audioAssets, plugins: availablePlugins, delivery: .markdownOnly, exportSettings: exportSettings, mix: mixAsset, postApply: postApplyReport); let r = packageReadiness; aiPackageStatus = "AI package generated (\(r.overall.rawValue)\(postApplyVerifiedAt != nil ? ", post-apply" : "")) · \(availablePlugins.count) plugins available." + (r.audioTotal > 0 && r.audioExported < r.audioTotal ? " Audio incomplete: \(r.audioTotal - r.audioExported) WAV missing." : "") }
     func savePackage() {
         guard let snapshot = normalized, let raw, let store else { aiPackageStatus = "Run a full analysis first."; return }
         ensurePluginInventory()
@@ -229,8 +229,8 @@ struct ApplicationLauncher: Sendable {
             audioAssets = freshAssets
             // Two readers, two deliveries: the folder/ZIP ships the JSON and WAVs next to the document, while the on-screen text is
             // what "Copy for AI" puts on the clipboard — Markdown alone, so it must say so instead of pointing at files.
-            let markdown = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .fullPackage, exportSettings: exportSettings, mix: mixAsset)
-            aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .markdownOnly, exportSettings: exportSettings, mix: mixAsset)
+            let markdown = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .fullPackage, exportSettings: exportSettings, mix: mixAsset, postApply: postApplyReport)
+            aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: freshAssets, plugins: availablePlugins, delivery: .markdownOnly, exportSettings: exportSettings, mix: mixAsset, postApply: postApplyReport)
             let audioManifest = AudioManifest(assets: freshAssets, exportSettings: exportSettings, mix: mixAsset); let packageManifest = PackageManifest(project: project, assets: freshAssets, mix: mixAsset)
             let expected = freshAssets.filter { $0.status == .exported }.count
             do {
@@ -268,7 +268,7 @@ struct ApplicationLauncher: Sendable {
             do {
                 try await store.resetForNewAnalysis()
                 raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""
-                planText = ""; validated = []; planStatus = ""; resetExecutionState()
+                planText = ""; validated = []; planStatus = ""; resetExecutionState(); resetVerificationState()
                 audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; metricsCache = [:]; exportSettings = nil
                 mixAsset = nil; mixStatus = ""; mixPhase = .idle; showBounceConfirm = false
                 packageFolderURL = nil; packageZipURL = nil
@@ -287,13 +287,11 @@ struct ApplicationLauncher: Sendable {
     /// DRY RUN is the default and never touches Logic; LIVE must be selected deliberately and re-confirmed per run.
     @Published var executionMode: OperationMode = .dryRun
     @Published var executionResults: [ExecutionResult] = []
-    /// The fresh-scan verification after a LIVE queue: which tracks really changed, which stayed as they were.
-    @Published var executionDiff: SnapshotDiff?
     @Published var executionStatus = ""
     @Published var executionRunning = false
     @Published var showLiveConfirm = false
     var validExecutableActions: Int { validated.filter { $0.status == .valid }.count }
-    private func resetExecutionState() { executionResults = []; executionDiff = nil; executionStatus = ""; executionMode = .dryRun; showLiveConfirm = false }
+    private func resetExecutionState() { executionResults = []; executionStatus = ""; executionMode = .dryRun; showLiveConfirm = false }
     /// Preconditions + explicit confirmation before a LIVE run; a dry run needs no ceremony because it writes nothing.
     func requestExecution() {
         guard !executionRunning else { return }
@@ -312,7 +310,7 @@ struct ApplicationLauncher: Sendable {
     private func runExecution() {
         guard let snapshot = normalized else { executionStatus = "Run an analysis first."; return }
         let mode = executionMode
-        executionRunning = true; executionResults = []; executionDiff = nil
+        executionRunning = true; executionResults = []
         executionStatus = mode == .live ? "Executing the plan in Logic\u{2026}" : "Dry run \u{2014} nothing is written to Logic."
         Task {
             let commands = validated
@@ -332,26 +330,97 @@ struct ApplicationLauncher: Sendable {
                 let outcome = "\(executed)/\(results.count) actions executed" + (failed > 0 ? ", \(failed) failed" : "")
                 executionStatus = outcome + " — verifying with a fresh scan\u{2026}"
                 log.append("LIVE execution finished: \(outcome).")
-                do {
-                    let analyzer = analyzer
-                    let fresh = try await Task.detached(priority: .userInitiated) { try analyzer.fullScan() }.value
-                    ensurePluginInventory()
-                    let normalizer = normalizer; let inventory = availablePlugins
-                    let freshNormalized = await Task.detached(priority: .userInitiated) { normalizer.normalize(fresh, pluginInventory: inventory) }.value
-                    let diff = DiffEngine().compare(before: snapshot, after: freshNormalized)
-                    executionDiff = diff
-                    executionStatus = outcome + ". Fresh scan: \(plural(diff.changed.count, "track")) changed, \(diff.unchanged.count) unchanged."
-                    log.append("Post-execution scan: \(diff.changed.count) changed, \(diff.unchanged.count) unchanged.")
-                } catch {
-                    executionStatus = outcome + ", but the verification scan failed: \(error.localizedDescription)"
-                    log.append("Post-execution scan failed: \(error.localizedDescription)")
-                }
+                await runVerification(executedLive: true)
+                executionStatus = outcome + (verificationDiff.map { ". Fresh scan: \(plural($0.changed.count, "track")) changed, \($0.unchanged.count) unchanged." } ?? ", but the verification scan failed — see Verification below.")
                 NSApp.activate() // execution activated Logic; bring the user back to the results
             } else {
                 executionStatus = "Dry run finished: \(plural(validExecutableActions, "valid action")) would go to the live adapters; nothing was written to Logic."
                 log.append("Dry run finished for \(results.count) actions.")
             }
             executionRunning = false
+        }
+    }
+
+    // MARK: Post-apply verification — the closed before/after loop
+
+    /// The checks of the last verified plan against the fresh post-apply facts; kept until the next verification or a
+    /// new analysis so the post-apply AI package can carry them into the model's second round.
+    @Published var planChecks: [PlanTargetCheck] = []
+    @Published var verificationDiff: SnapshotDiff?
+    @Published var verificationStatus = ""
+    @Published var verificationRunning = false
+    @Published var postApplyVerifiedAt: Date?
+    private var postApplyExecutedLive = false
+    /// The pre-apply measurements frozen when the verification ran: control moves change the audio only after a new
+    /// export/bounce, so the files on disk at verification time still carry the state the plan reasoned from.
+    private var metricsBaseline: [MetricsBaselineEntry] = []
+    /// Live join of the frozen baseline with the current files' metrics — recomputed on every read, so a re-export or
+    /// re-bounce immediately shows its before/after rows (the metrics cache keys by file identity).
+    var metricDeltas: [MetricsDelta] { MetricsComparison.compare(baseline: metricsBaseline, assets: audioAssets, mix: mixAsset) }
+    /// Everything the post-apply AI package states about the cycle; nil until a verification ran in this analysis.
+    var postApplyReport: PostApplyReport? {
+        guard let verifiedAt = postApplyVerifiedAt else { return nil }
+        return .init(verifiedAt: verifiedAt, executedLive: postApplyExecutedLive, checks: planChecks, diff: verificationDiff ?? .init(changed: [], unchanged: [], errors: []), metricDeltas: metricDeltas)
+    }
+    private func resetVerificationState() { planChecks = []; verificationDiff = nil; verificationStatus = ""; postApplyVerifiedAt = nil; postApplyExecutedLive = false; metricsBaseline = [] }
+    /// The manual entry into the closed loop, for a plan the user applied by hand in Logic: the same fresh scan, diff,
+    /// plan-target checks and snapshot adoption that run automatically after a LIVE queue.
+    func verifyAppliedPlan() {
+        guard !verificationRunning, !executionRunning, analyzerState != .scanning else { return }
+        guard normalized != nil else { verificationStatus = "Run an analysis first."; return }
+        guard !validated.isEmpty else { verificationStatus = "Validate the plan you applied first — the checks compare its targets with the fresh facts."; return }
+        connection = analyzer.connectionStatus()
+        guard connection.found else { verificationStatus = "Logic Pro is not running — open your project first."; return }
+        guard connection.accessibilityTrusted else { verificationStatus = "Accessibility permission is required for the verification scan."; return }
+        verificationRunning = true
+        verificationStatus = "Verifying the applied plan with a fresh read-only scan\u{2026}"
+        Task {
+            await runVerification(executedLive: false)
+            verificationRunning = false
+            NSApp.activate() // the mixer step activated Logic; bring the user back to the results
+        }
+    }
+    /// One fresh read-only scan closes the loop: DiffEngine against the snapshot the plan was validated with, every
+    /// valid action's target checked against the re-read known fact (tolerance 0.05 — the validator's own), the
+    /// pre-apply metrics frozen as the before/after baseline, and the fresh snapshot ADOPTED as the current analysis —
+    /// so the next generated AI package is the post-apply second round, and a re-export/re-bounce measures the new
+    /// files against the frozen baseline. Verification never invents: a fact the fresh scan does not prove stays
+    /// unverifiable, and metrics rows exist only where both sides were really measured.
+    private func runVerification(executedLive: Bool) async {
+        guard let reference = normalized else { return }
+        verificationDiff = nil
+        do {
+            let exporter = exporter
+            let mixerOutcome = await Task.detached(priority: .userInitiated) { exporter.ensureMixerVisible() }.value
+            if case .failed(let step, let detail) = mixerOutcome { log.append("Could not confirm Logic's Mixer is visible before the verification scan (\(step)): \(detail)") }
+            let analyzer = analyzer
+            let fresh = try await Task.detached(priority: .userInitiated) { try analyzer.fullScan() }.value
+            ensurePluginInventory()
+            let normalizer = normalizer; let inventory = availablePlugins
+            let freshNormalized = await Task.detached(priority: .userInitiated) { normalizer.normalize(fresh, rawReference: "raw/accessibility_snapshot.json", pluginInventory: inventory) }.value
+            let diff = DiffEngine().compare(before: reference, after: freshNormalized)
+            let checks = PlanVerifier().verify(validated, against: freshNormalized)
+            var baseline: [MetricsBaselineEntry] = audioAssets.compactMap { asset in asset.metrics.map { MetricsBaselineEntry(id: asset.logicalTrackID, label: asset.trackName.value ?? asset.logicalTrackID, metrics: $0) } }
+            if let mixMetrics = mixAsset?.metrics { baseline.append(MetricsBaselineEntry(id: "mix", label: "Mix (Stereo Out)", metrics: mixMetrics)) }
+            metricsBaseline = baseline
+            planChecks = checks; verificationDiff = diff
+            postApplyVerifiedAt = Date(); postApplyExecutedLive = executedLive
+            raw = fresh; normalized = freshNormalized
+            if let store {
+                _ = try? await store.save(fresh, folder: "raw", name: "accessibility_snapshot.json")
+                _ = try? await store.save(freshNormalized, folder: "normalized", name: "normalized_project.json")
+                let audioDir = await store.folderURL("audio")
+                audioAssets = await analyzedAssets(raw: fresh, normalized: freshNormalized, audioDir: audioDir)
+                await saveAudioManifest()
+            }
+            let matched = checks.filter { $0.outcome == .matched }.count
+            let mismatched = checks.filter { $0.outcome == .mismatched }.count
+            verificationStatus = "Fresh scan: \(plural(diff.changed.count, "track")) changed, \(diff.unchanged.count) unchanged. Plan targets: \(matched)/\(checks.count) matched" + (mismatched > 0 ? ", \(mismatched) MISMATCHED" : "") + ". The post-apply snapshot is now the current analysis — re-export the tracks and re-bounce the mix for before/after metrics, then generate the post-apply AI package."
+            log.append("Post-apply verification: \(matched)/\(checks.count) plan targets matched; \(diff.changed.count) tracks changed.")
+            if !aiPackage.isEmpty { generateAIPackage() }
+        } catch {
+            verificationStatus = "The verification scan failed: \(error.localizedDescription)"
+            log.append("Verification scan failed: \(error.localizedDescription)")
         }
     }
     func prepareAudioExport() { rescanAudio(context: "prepared") }
