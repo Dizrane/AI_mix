@@ -195,8 +195,9 @@ struct ApplicationLauncher: Sendable {
                 scanWork = work
                 let capture = try await work.value
                 raw = capture
-                let normalizer = normalizer
-                let normalizedCapture = await Task.detached(priority: .userInitiated) { normalizer.normalize(capture, rawReference: "raw/accessibility_snapshot.json") }.value
+                ensurePluginInventory() // manufacturer facts are a cross-reference against the installed-plugin inventory
+                let normalizer = normalizer; let inventory = availablePlugins
+                let normalizedCapture = await Task.detached(priority: .userInitiated) { normalizer.normalize(capture, rawReference: "raw/accessibility_snapshot.json", pluginInventory: inventory) }.value
                 normalized = normalizedCapture
                 _ = try await store.save(capture, folder: "raw", name: "accessibility_snapshot.json")
                 _ = try await store.save(normalizedCapture, folder: "normalized", name: "normalized_project.json")

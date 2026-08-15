@@ -15,6 +15,9 @@ struct Fact<Value: Codable & Sendable>: Codable, Sendable {
 
 struct RawAccessibilityNode: Codable, Identifiable, Sendable {
     var id: String; var role: String; var subrole: String?; var title: String?; var description: String?; var value: String?; var enabled: Bool?; var position: String?; var size: String?; var supportedAttributes: [String]; var parameterizedAttributes: [String]; var actions: [String]; var children: [RawAccessibilityNode]
+    /// The control's own `AXValueDescription` / `AXMinValue` / `AXMaxValue`, captured verbatim when the element exposes
+    /// them (Logic's sliders do). Optional and defaulted, so snapshots recorded before these fields existed still decode.
+    var valueDescription: String? = nil; var minValue: String? = nil; var maxValue: String? = nil
 }
 
 struct AXDiscoveryDiagnostics: Codable, Sendable {
