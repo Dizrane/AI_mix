@@ -7,7 +7,7 @@ import SwiftUI
 
 // MARK: - Workflow model
 
-/// Only stages with a working backend are exposed. Execution / verification are not shown until a live Logic adapter exists.
+/// Only stages with a working backend are exposed. Execution lives inside Review (DRY RUN / LIVE with verification); it is not a separate stage.
 enum WorkflowStage: Int, CaseIterable, Identifiable {
     case connection, analysis, audio, aiPackage, review
     var id: Int { rawValue }
@@ -468,7 +468,7 @@ struct PackageScreen: View {
 struct ReviewScreen: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
-        Screen(title: "Review", subtitle: "Paste the MixPlan JSON returned by your LLM. It is validated against the current snapshot — nothing is written to Logic Pro.") {
+        Screen(title: "Review", subtitle: "Paste the MixPlan JSON returned by your LLM. It is validated against the current snapshot; validation writes nothing to Logic Pro.") {
             Card {
                 Text("MixPlan JSON").font(.headline)
                 TextEditor(text: $model.planText).font(.system(.callout, design: .monospaced)).frame(minHeight: 150).padding(6)
@@ -494,8 +494,61 @@ struct ReviewScreen: View {
                     }
                 }
             }
-            Text("Live execution is not available in this build. AI Mix Assistant validates and previews the plan only; it never modifies Logic Pro. A validated plan is your instruction sheet: apply each action in Logic by hand — the value shown is the absolute target setting — together with the MANUAL STEPS from the model's reply.").font(.caption).foregroundStyle(.secondary)
+            if !model.validated.isEmpty { executionCard }
+            Text("A validated plan is your instruction sheet: the value shown is the absolute target setting. DRY RUN (the default) executes nothing. LIVE — only on your explicit choice above — applies the technically valid volume, pan, mute and solo actions to Logic's channel strips itself, with before/after readback and a verification scan; everything else, and every MANUAL STEPS item from the model's reply, is still applied by hand.").font(.caption).foregroundStyle(.secondary)
         }
+        .confirmationDialog("Apply the plan to Logic Pro (LIVE)?", isPresented: $model.showLiveExecuteConfirm, titleVisibility: .visible) {
+            Button("Apply LIVE", role: .destructive) { model.confirmLiveExecution() }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("AI Mix Assistant will change your Logic project: every technically valid volume, pan, mute and solo action of the validated plan is applied to the channel strips via Accessibility, sequentially, with each control read back after the write. Faders are calibrated first and reverted when a write cannot be verified; a failed action stops the rest of the queue. Afterwards a fresh read-only scan shows exactly what changed. Undo in Logic (\u{2318}Z) still works per control.") }
+    }
+    private var executionCard: some View {
+        Card {
+            Text("Execution").font(.headline)
+            Picker("Mode", selection: $model.executionMode) {
+                Text("DRY RUN").tag(OperationMode.dryRun)
+                Text("LIVE").tag(OperationMode.live)
+            }.pickerStyle(.segmented).frame(maxWidth: 280).labelsHidden()
+            Text(model.executionMode == .live
+                 ? "LIVE applies the valid volume / pan / mute / solo actions to Logic itself — sequentially, each write verified by reading the control back, faders calibrated before the first real write and reverted when a target cannot be confirmed. A failure stops the remaining queue. Other action types have no verified live adapter and fail honestly."
+                 : "DRY RUN executes nothing and never touches Logic — it shows which actions would run.").font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                Button(model.executionMode == .live ? "Apply Plan to Logic (LIVE)" : "Run Plan (DRY RUN)", action: model.requestPlanExecution)
+                    .buttonStyle(.borderedProminent).tint(model.executionMode == .live ? .red : .accentColor)
+                    .disabled(model.executionRunning || !model.validated.contains { $0.status == .valid })
+                if model.executionRunning { ProgressView().controlSize(.small) }
+            }
+            if !model.executionStatus.isEmpty { Text(model.executionStatus).font(.callout).foregroundStyle(.secondary) }
+            if !model.executionResults.isEmpty {
+                Divider()
+                ForEach(model.executionResults) { result in
+                    HStack(spacing: 10) {
+                        StatusDot(state: resultState(result.status))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(result.actionID) · \(result.status)\(moveLabel(result).map { " · \($0)" } ?? "")").font(.system(size: 13, weight: .medium))
+                            if let error = result.error { Text(error).font(.caption).foregroundStyle(.secondary) }
+                        }
+                        Spacer()
+                    }
+                }
+            }
+            if let diff = model.executionDiff {
+                Divider()
+                Text("Verification scan (read-only, after execution)").font(.system(size: 13, weight: .semibold))
+                if diff.changed.isEmpty { Text("No track facts changed.").font(.caption).foregroundStyle(.secondary) }
+                else { ForEach(diff.changed, id: \.self) { Text($0).font(.caption).foregroundStyle(.orange) } }
+                Text("\(plural(diff.unchanged.count, "track")) unchanged.").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+    private func resultState(_ status: String) -> IndicatorState { switch status { case "executed": .ok; case "dry_run": .idle; case "failed": .error; default: .warn } }
+    /// The measured move: before → after from the adapter's own readbacks, dB/pan numbers or on/off.
+    private func moveLabel(_ result: ExecutionResult) -> String? {
+        func text(_ value: JSONValue?) -> String? {
+            switch value { case .number(let n): var t = String(format: "%.1f", n); if t.hasSuffix(".0") { t.removeLast(2) }; return t; case .bool(let b): return b ? "on" : "off"; default: return nil }
+        }
+        guard let before = text(result.before), let after = text(result.after) else { return nil }
+        return "\(before) \u{2192} \(after)"
     }
     private func targetLabel(_ target: CommandTarget) -> String {
         var parts = [target.trackName ?? target.trackID ?? "—"]

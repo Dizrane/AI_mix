@@ -22,6 +22,6 @@ The test target uses Swift Testing (`import Testing`), which ships with the Swif
 - Analyzer and probes only call AX read APIs.
 - Unknown data remains `unknown`, `unavailable`, or `requires_probe`.
 - Default mode is READ ONLY. DRY RUN never mutates Logic.
-- LIVE currently fails safely: no undocumented Logic write adapter ships in this foundation.
+- Default mode is DRY RUN, which never touches Logic. LIVE runs only on the user's explicit choice plus a confirmation, and only through the verified channel-strip adapter for volume, pan, mute and solo: AXValue/AXPress on the control the fact came from, a mandatory idempotent calibration before the first fader write, readback after every write with revert on failure, a halted queue after any failure, and a fresh read-only scan with a diff afterwards. Actions without a verified adapter still fail safely.
 
 See `Documentation/` for the architecture and schemas.

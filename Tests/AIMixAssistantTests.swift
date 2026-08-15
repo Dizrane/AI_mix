@@ -54,6 +54,75 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
 @Test func validatorChecksReportedRange() { let plan = MixPlan(version: "1.0", status: "ready", actions: [.init(id: "a", target: .init(trackID: "channel_aux_1", pluginID: "q", parameterID: "gain"), action: .setPluginParameter, parameters: ["value": .number(20)], reason: "LLM")]); #expect(CommandValidator().validate(plan, against: fixture()).first?.status == .invalid) }
 @Test func diffReportsChangedTrack() { var after = fixture(); after.tracks[0].channel?.volumeDB = .known(-3); #expect(DiffEngine().compare(before: fixture(), after: after).changed == ["Changed: Aux 1"]) }
 @Test func planJSONRoundTrip() throws { let plan = MixPlan(version: "1.0", status: "ready", actions: []); #expect(try JSONDecoder().decode(MixPlan.self, from: JSONEncoder().encode(plan)).version == "1.0") }
+
+// MARK: - Executor routing & live-adapter queue discipline
+
+/// A controllable adapter double: executes volume, fails pan, supports nothing else.
+private struct AdapterDouble: LiveActionAdapter {
+    func supports(_ action: MixAction) -> Bool { action == .setVolume || action == .setPan }
+    func execute(_ command: MixCommand, context: LiveExecutionContext) -> ExecutionResult {
+        command.action == .setVolume
+            ? .init(actionID: command.id, status: "executed", before: .number(-2), after: .number(-3), error: nil)
+            : .init(actionID: command.id, status: "failed", before: nil, after: nil, error: "double failure")
+    }
+}
+private func validCommand(_ id: String, _ action: MixAction) -> ValidatedCommand {
+    .init(command: .init(id: id, target: .init(trackID: "channel_aux_1"), action: action, parameters: ["value": .number(-3), "current": .number(-2), "delta": .number(-1)], reason: "test"), status: .valid, message: "ok")
+}
+/// DRY RUN never reaches an adapter; invalid commands are never executed in any mode.
+@Test func executorDryRunAndInvalidCommandsNeverExecute() async {
+    let executor = SafeExecutor(adapters: [AdapterDouble()])
+    let context = LiveExecutionContext(snapshot: fixture())
+    let dry = await executor.execute([validCommand("a", .setVolume)], mode: .dryRun, context: context)
+    #expect(dry.map(\.status) == ["dry_run"])
+    let invalid = ValidatedCommand(command: .init(id: "b", target: .init(trackID: "x"), action: .setVolume, parameters: [:], reason: "r"), status: .invalid, message: "bad")
+    let live = await executor.execute([invalid], mode: .live, context: context)
+    #expect(live.map(\.status) == ["not_executed"])
+}
+/// LIVE routes to the adapter, a failure halts the remaining queue with not_executed naming the failed action,
+/// and an action with no adapter fails honestly (and also halts).
+@Test func executorRoutesToAdapterAndHaltsQueueOnFailure() async {
+    let executor = SafeExecutor(adapters: [AdapterDouble()])
+    let context = LiveExecutionContext(snapshot: fixture())
+    let results = await executor.execute([validCommand("v1", .setVolume), validCommand("p1", .setPan), validCommand("v2", .setVolume)], mode: .live, context: context)
+    #expect(results.map(\.status) == ["executed", "failed", "not_executed"])
+    #expect(results[0].before == .number(-2)); #expect(results[0].after == .number(-3))
+    #expect(results[2].error?.contains("p1") == true)
+    let muted = ValidatedCommand(command: .init(id: "m1", target: .init(trackID: "channel_aux_1"), action: .setMute, parameters: ["value": .bool(true)], reason: "r"), status: .valid, message: "ok")
+    let unsupported = await executor.execute([muted, validCommand("v3", .setVolume)], mode: .live, context: context)
+    #expect(unsupported.map(\.status) == ["failed", "not_executed"])
+    #expect(unsupported[0].error == "No verified live Logic adapter is installed for this action.")
+}
+/// Without adapters LIVE keeps the historic honest refusal for every action.
+@Test func executorWithoutAdaptersRefusesLiveHonestly() async {
+    let results = await SafeExecutor().execute([validCommand("a", .setVolume)], mode: .live, context: LiveExecutionContext(snapshot: fixture()))
+    #expect(results.map(\.status) == ["failed"])
+    #expect(results[0].error == "No verified live Logic adapter is installed for this action.")
+}
+
+// MARK: - Fader calibration (pure)
+
+/// A slider whose own value equals the strip's dB readout is a dB-scale control; a raw fader value is not.
+@Test func faderCalibrationClassifiesScalesByEvidence() {
+    #expect(FaderCalibration.classify(sliderValue: -2.0, dbReadout: -2.0) == .decibels)
+    #expect(FaderCalibration.classify(sliderValue: -2.04, dbReadout: -2.0) == .decibels) // within the 0.05 user precision
+    #expect(FaderCalibration.classify(sliderValue: 173, dbReadout: -2.2) == .raw)
+}
+/// The closed-loop search settles a monotone raw→dB curve on the target using only the readback as evidence,
+/// never probes the endpoints, and honestly returns nil for an unreachable target or a failing probe.
+@Test func faderConvergenceSettlesAMonotoneCurveAndFailsHonestly() {
+    // A Logic-like nonlinear monotone curve on raw 0…255: steep near the bottom, ~0.04 dB/step near the top.
+    func curve(_ raw: Double) -> Double { -96 + 102 * pow(raw / 255, 0.5) }
+    var probed: [Double] = []
+    let settled = FaderCalibration.converge(target: -3.0, low: 0, high: 255) { raw in probed.append(raw); return curve(raw) }
+    #expect(settled != nil)
+    if let settled { #expect(abs(curve(settled) - -3.0) <= 0.05) }
+    #expect(probed.allSatisfy { $0 > 0 && $0 < 255 }) // endpoints are never slammed
+    #expect(probed.count <= 24)
+    #expect(FaderCalibration.converge(target: 20, low: 0, high: 255) { curve($0) } == nil) // above the curve's ceiling — no approximation
+    #expect(FaderCalibration.converge(target: -3.0, low: 0, high: 255) { _ in nil } == nil) // a failing readback aborts
+    #expect(FaderCalibration.converge(target: -3.0, low: 255, high: 0) { curve($0) } == nil) // an inverted bracket is refused
+}
 /// "Technically valid" must mean the value can actually be applied: an implemented action with a missing or mistyped
 /// `parameters.value` is malformed — invalid — never waved through.
 @Test func validatorRequiresTypedValuesForTrackActions() {
@@ -573,7 +642,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.25`"))
+    #expect(md.contains("Package schema: `2.26`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -689,6 +758,17 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(md.contains("with ONE exception inside the JSON: each action's `reason` is written in the user's language"))
     #expect(md.contains("Write `reason` in the language the user writes to you in"))
     #expect(md.contains("stays exactly as this document states them"))
+}
+/// With a live executor the old "the application never modifies Logic" line would be a lie. The package must state the
+/// real contract: validation itself writes nothing, the plan is applied by hand or LIVE-executed for the four fader
+/// actions at the user's explicit choice, and MANUAL STEPS are always manual — the plan's format does not change.
+@Test func packageStatesTheLiveExecutionContractHonestly() {
+    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t")
+    #expect(!md.contains("the application never modifies Logic"))
+    #expect(md.contains("validation itself executes nothing"))
+    #expect(md.contains("explicitly chooses LIVE execution"))
+    #expect(md.contains("MANUAL STEPS are always applied by hand"))
+    #expect(md.contains("executed LIVE by the application for the four fader actions (volume, pan, mute, solo) with before/after readback"))
 }
 /// A cold model without hearing reported "checked all 10 WAVs" and never said it cannot listen. The declaration is now
 /// structural in BOTH deliveries: the first paragraph of ANALYSIS must open with one explicit audio-mode line, and the
@@ -1424,7 +1504,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.25`"))
+    #expect(md.contains("Package schema: `2.26`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
