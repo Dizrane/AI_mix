@@ -573,7 +573,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.25`"))
+    #expect(md.contains("Package schema: `2.26`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -1424,7 +1424,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.25`"))
+    #expect(md.contains("Package schema: `2.26`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
@@ -1575,4 +1575,130 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     try FileManager.default.createDirectory(at: customApp, withIntermediateDirectories: true)
     #expect(AppUpdater.renameShell(around: customApp, toMatch: "v0.2.11") == customApp) // a user-chosen folder name is never renamed
     #expect(FileManager.default.fileExists(atPath: customApp.path))
+}
+
+// MARK: - Live execution: routing, queue semantics, calibration math
+
+/// A test double for the adapter contract: records what the executor really routed to it and fails on demand.
+private final class RecordingAdapter: LiveActionAdapter, @unchecked Sendable {
+    private let lock = NSLock()
+    private var routed: [String] = []
+    private let failOn: Set<String>
+    init(failOn: Set<String> = []) { self.failOn = failOn }
+    var routedIDs: [String] { lock.lock(); defer { lock.unlock() }; return routed }
+    func supports(_ action: MixAction) -> Bool { [.setVolume, .setPan, .setMute, .setSolo].contains(action) }
+    func execute(_ command: MixCommand, context: LiveExecutionContext) -> ExecutionResult {
+        lock.lock(); routed.append(command.id); lock.unlock()
+        if failOn.contains(command.id) { return .init(actionID: command.id, status: ExecutionStatus.failed, before: nil, after: nil, error: "simulated write failure") }
+        return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(0), after: .number(1), error: nil)
+    }
+}
+private func validatedCommand(_ id: String, _ action: MixAction = .setVolume, status: ValidationStatus = .valid, message: String = "Technically valid against current snapshot.") -> ValidatedCommand {
+    .init(command: .init(id: id, target: .init(trackID: "channel_aux_1"), action: action, parameters: ["value": .number(-3)], reason: "test"), status: status, message: message)
+}
+
+@Test func executorDryRunNeverTouchesAnAdapter() async {
+    let adapter = RecordingAdapter()
+    let executor = SafeExecutor(adapters: [adapter], context: .init(snapshot: fixture()))
+    let results = await executor.execute([validatedCommand("a"), validatedCommand("b", status: .invalid, message: "broken")], mode: .dryRun)
+    #expect(results.map(\.status) == [ExecutionStatus.dryRun, ExecutionStatus.notExecuted])
+    #expect(results[1].error == "broken") // the validator's own message travels with the refusal
+    #expect(adapter.routedIDs.isEmpty)
+}
+@Test func executorWithoutAdapterKeepsTheHonestLiveRefusal() async {
+    let executor = SafeExecutor(context: .init(snapshot: fixture()))
+    let results = await executor.execute([validatedCommand("a"), validatedCommand("b")], mode: .live)
+    #expect(results.map(\.status) == [ExecutionStatus.failed, ExecutionStatus.failed]) // a missing adapter refuses each action; nothing was attempted, so the queue is not halted
+    #expect(results.allSatisfy { $0.error == "No verified live Logic adapter is installed for this action." })
+}
+@Test func executorRoutesOnlyValidCommandsToTheAdapterInLiveMode() async {
+    let adapter = RecordingAdapter()
+    let executor = SafeExecutor(adapters: [adapter], context: .init(snapshot: fixture()))
+    let results = await executor.execute([validatedCommand("bad", status: .requiresProbe, message: "unproven"), validatedCommand("good", .setMute)], mode: .live)
+    #expect(results.map(\.status) == [ExecutionStatus.notExecuted, ExecutionStatus.executed])
+    #expect(results[0].error == "unproven")
+    #expect(adapter.routedIDs == ["good"]) // never the invalid one
+}
+@Test func executorHaltsTheQueueAfterACriticalFailure() async {
+    let adapter = RecordingAdapter(failOn: ["first"])
+    let executor = SafeExecutor(adapters: [adapter], context: .init(snapshot: fixture()))
+    let results = await executor.execute([validatedCommand("first"), validatedCommand("second"), validatedCommand("third")], mode: .live)
+    #expect(results.map(\.status) == [ExecutionStatus.failed, ExecutionStatus.notExecuted, ExecutionStatus.notExecuted])
+    #expect(results[1].error?.contains("first") == true) // each halted action names the failure that stopped the queue
+    #expect(adapter.routedIDs == ["first"]) // nothing after the failure reached the adapter
+}
+@Test func diffSeesMuteAndSoloChanges() {
+    var after = fixture(); after.tracks[0].channel?.mute = .known(true)
+    #expect(DiffEngine().compare(before: fixture(), after: after).changed == ["Changed: Aux 1"])
+    var soloed = fixture(); soloed.tracks[0].channel?.solo = .known(true)
+    #expect(DiffEngine().compare(before: fixture(), after: soloed).changed == ["Changed: Aux 1"])
+}
+
+/// The fader scale is proven from same-moment evidence, never assumed: a slider whose AXValue equals the displayed dB
+/// is on the dB scale; the real Logic shape (raw 173 at 0.0 dB) is raw and must go through the measured servo.
+@Test func faderScaleIsProvenNeverAssumed() {
+    #expect(FaderScale.detect(sliderValue: -3.2, displayedDB: -3.2) == .decibels)
+    #expect(FaderScale.detect(sliderValue: -3.18, displayedDB: -3.2) == .decibels) // within the 0.05 product tolerance
+    #expect(FaderScale.detect(sliderValue: 173, displayedDB: 0.0) == .raw) // the observed real Logic fader
+    #expect(FaderScale.detect(sliderValue: 0, displayedDB: -0.2) == .raw) // "roughly equal" is not proof
+}
+
+/// Simulates a fader against the servo: every `.move` is "written" and the curve's quantized reading appended, exactly
+/// like the adapter re-reads Logic's level text (which displays 0.1 dB steps).
+private func runServo(targetDB: Double, startRaw: Double = 173, range: ClosedRange<Double> = 0...255, maxLoops: Int = 30, curve: (Double) -> Double) -> (outcome: FaderServoMath.Step, points: [(raw: Double, db: Double)]) {
+    var points: [(raw: Double, db: Double)] = [(startRaw, curve(startRaw))]
+    for _ in 0..<maxLoops {
+        let step = FaderServoMath.step(points: points, targetDB: targetDB, range: range)
+        guard case .move(let raw) = step else { return (step, points) }
+        points.append((raw, curve(raw)))
+    }
+    return (.failed(reason: "test loop guard exceeded"), points)
+}
+/// A Logic-like monotone raw→dB law (−96 dB at raw 0, +6 dB at raw 255, 0.0 dB near raw 173) with the 0.1 dB display quantization.
+private func logicLikeCurve(_ raw: Double) -> Double {
+    let db = 6 - 102 * pow(1 - raw / 255, 2)
+    return (db * 10).rounded() / 10
+}
+@Test func faderServoConvergesOnARawLogicLikeFader() {
+    for target in [0.0, -10.0, -40.0, 3.0, -4.4] {
+        let run = runServo(targetDB: target, curve: logicLikeCurve)
+        #expect(run.outcome == .converged, "target \(target) dB did not converge: \(run.outcome)")
+        #expect(abs(run.points[run.points.count - 1].db - target) <= 0.05)
+        #expect(run.points.count <= 12) // within the adapter's measurement budget
+        #expect(run.points.allSatisfy { (0.0...255.0).contains($0.raw) }) // every written value stays inside the fader's travel
+    }
+}
+@Test func faderServoRefusesAFaderWhoseDisplayNeverMoves() {
+    let run = runServo(targetDB: 0, curve: { _ in -4.5 })
+    guard case .failed(let reason) = run.outcome else { #expect(Bool(false), "a dead fader must fail, got \(run.outcome)"); return }
+    #expect(reason.contains("does not behave like a fader"))
+}
+@Test func faderServoStopsAtTheTravelBoundInsteadOfOscillating() {
+    let run = runServo(targetDB: 20, curve: logicLikeCurve) // +20 dB lies above the fader's +6 dB ceiling
+    guard case .failed = run.outcome else { #expect(Bool(false), "an unreachable target must fail, got \(run.outcome)"); return }
+    #expect(run.points.allSatisfy { (0.0...255.0).contains($0.raw) })
+}
+@Test func stripGrammarMatchesWholeCaptionsAndParsesLogicNumbers() {
+    #expect(StripControlGrammar.matches("mute", "mute") && StripControlGrammar.matches(" Pan ", "pan"))
+    #expect(!StripControlGrammar.matches("expand", "pan")) // containing the word is never a match
+    #expect(!StripControlGrammar.matches("input monitoring", "input"))
+    #expect(StripControlGrammar.decimal("volume fader level, -1,5 dB") == -1.5) // comma decimals, caption noise ignored
+    #expect(StripControlGrammar.boolValue("on") == true && StripControlGrammar.boolValue("0") == false && StripControlGrammar.boolValue("maybe") == nil)
+}
+/// The plan's `parameters.current` was validated against the snapshot; a live control that no longer reads that value
+/// means the project drifted since the analysis, and the write is refused instead of applied to an unreasoned state.
+@Test func liveWriteRefusesAStalePlanCurrent() {
+    #expect(LogicChannelStripAdapter.stalenessRefusal(planCurrent: -1.0, live: -1.04, control: "Volume", unit: " dB") == nil) // within the product tolerance
+    #expect(LogicChannelStripAdapter.stalenessRefusal(planCurrent: nil, live: 5, control: "Pan", unit: "") == nil) // a plan without a current states no proof to defend
+    let refusal = LogicChannelStripAdapter.stalenessRefusal(planCurrent: -1.0, live: -3.0, control: "Volume", unit: " dB")
+    #expect(refusal?.contains("the project changed since the analysis") == true)
+    #expect(refusal?.contains("Rescan and validate the plan again") == true)
+}
+@Test func packageDescribesLiveExecutionHonestly() {
+    for delivery in [PackageDelivery.markdownOnly, .fullPackage] {
+        let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: delivery)
+        #expect(md.contains("By default (DRY RUN) the application executes nothing")) // stage-5 description matches the shipped executor
+        #expect(md.contains("By default (DRY RUN) nothing is written to Logic Pro"))
+        #expect(!md.contains("the application never modifies Logic")) // the pre-LIVE claim must be gone
+    }
 }

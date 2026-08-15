@@ -119,7 +119,7 @@ struct ApplicationLauncher: Sendable {
     /// Installing an update while the app is mid-work would sabotage that work: the swap renames the folder and
     /// relaunches the app, killing a running scan or the WAV-detection polling, and Logic would keep exporting into
     /// a destination path whose folder name just changed. The buttons disable on this and the guard tells the reason.
-    var updateBlockedByWork: Bool { analyzerState == .scanning || exportPhase == .exporting || mixPhase == .exporting }
+    var updateBlockedByWork: Bool { analyzerState == .scanning || exportPhase == .exporting || mixPhase == .exporting || executionRunning }
     /// User-requested in-place update: download the release ZIP, verify the new bundle, swap it in next to the
     /// untouched Data/, relaunch the new version and quit this one. Any failure is reported and leaves the current
     /// installation working; a translocated (quarantined read-only) copy must be repaired first, because its real
@@ -180,7 +180,7 @@ struct ApplicationLauncher: Sendable {
             do {
                 try await store.resetForNewAnalysis()
                 analysisSessionID = "analysis_\(ISO8601DateFormatter().string(from: Date()))"
-                raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil; metricsCache = [:]; exportSettings = nil; mixAsset = nil; mixStatus = ""; mixPhase = .idle; showBounceConfirm = false
+                raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; resetExecutionState(); audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil; metricsCache = [:]; exportSettings = nil; mixAsset = nil; mixStatus = ""; mixPhase = .idle; showBounceConfirm = false
                 log.append("Previous AI Mix Assistant analysis data removed. Starting a clean read-only scan.")
                 let exporter = exporter
                 let mixerOutcome = await Task.detached(priority: .userInitiated) { exporter.ensureMixerVisible() }.value
@@ -268,7 +268,7 @@ struct ApplicationLauncher: Sendable {
             do {
                 try await store.resetForNewAnalysis()
                 raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""
-                planText = ""; validated = []; planStatus = ""
+                planText = ""; validated = []; planStatus = ""; resetExecutionState()
                 audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; metricsCache = [:]; exportSettings = nil
                 mixAsset = nil; mixStatus = ""; mixPhase = .idle; showBounceConfirm = false
                 packageFolderURL = nil; packageZipURL = nil
@@ -280,7 +280,80 @@ struct ApplicationLauncher: Sendable {
     }
     func copyAIPackage() { guard !aiPackage.isEmpty else { return }; NSPasteboard.general.clearContents(); NSPasteboard.general.setString(aiPackage, forType: .string); aiPackageStatus = "AI package copied — send it to your LLM." }
     @Published var planStatus = ""
-    func validatePlan() { guard let snapshot = normalized else { planStatus = "Run an analysis first."; return }; do { let plan = try JSONDecoder().decode(MixPlan.self, from: Data(MixPlan.extractJSON(from: planText).utf8)); validated = validator.validate(plan, against: snapshot); let valid = validated.filter { $0.status == .valid }.count; planStatus = "Validated \(plural(validated.count, "action")): \(valid) technically valid."; log.append("Plan validated: \(validated.count) actions.") } catch { validated = []; planStatus = "Invalid MixPlan JSON: \(error.localizedDescription)"; log.append("Invalid plan JSON: \(error.localizedDescription)") } }
+    func validatePlan() { guard let snapshot = normalized else { planStatus = "Run an analysis first."; return }; do { let plan = try JSONDecoder().decode(MixPlan.self, from: Data(MixPlan.extractJSON(from: planText).utf8)); validated = validator.validate(plan, against: snapshot); resetExecutionState(); let valid = validated.filter { $0.status == .valid }.count; planStatus = "Validated \(plural(validated.count, "action")): \(valid) technically valid."; log.append("Plan validated: \(validated.count) actions.") } catch { validated = []; resetExecutionState(); planStatus = "Invalid MixPlan JSON: \(error.localizedDescription)"; log.append("Invalid plan JSON: \(error.localizedDescription)") } }
+
+    // MARK: Plan execution (DRY RUN default; LIVE only by explicit user choice)
+
+    /// DRY RUN is the default and never touches Logic; LIVE must be selected deliberately and re-confirmed per run.
+    @Published var executionMode: OperationMode = .dryRun
+    @Published var executionResults: [ExecutionResult] = []
+    /// The fresh-scan verification after a LIVE queue: which tracks really changed, which stayed as they were.
+    @Published var executionDiff: SnapshotDiff?
+    @Published var executionStatus = ""
+    @Published var executionRunning = false
+    @Published var showLiveConfirm = false
+    var validExecutableActions: Int { validated.filter { $0.status == .valid }.count }
+    private func resetExecutionState() { executionResults = []; executionDiff = nil; executionStatus = ""; executionMode = .dryRun; showLiveConfirm = false }
+    /// Preconditions + explicit confirmation before a LIVE run; a dry run needs no ceremony because it writes nothing.
+    func requestExecution() {
+        guard !executionRunning else { return }
+        guard !validated.isEmpty, validExecutableActions > 0 else { executionStatus = "Validate a plan with at least one technically valid action first."; return }
+        if executionMode == .live {
+            connection = analyzer.connectionStatus()
+            guard connection.found else { executionStatus = "Logic Pro is not running — open your project first."; return }
+            guard connection.accessibilityTrusted else { executionStatus = "Accessibility permission is required for live execution."; return }
+            showLiveConfirm = true
+        } else { runExecution() }
+    }
+    func confirmLiveExecution() { showLiveConfirm = false; runExecution() }
+    /// Runs the validated queue through SafeExecutor off the main thread. Only status == .valid actions can execute;
+    /// after a LIVE queue a fresh read-only scan is compared against the snapshot the plan was validated with, so the
+    /// user sees what really changed next to each action's own before/after readback.
+    private func runExecution() {
+        guard let snapshot = normalized else { executionStatus = "Run an analysis first."; return }
+        let mode = executionMode
+        executionRunning = true; executionResults = []; executionDiff = nil
+        executionStatus = mode == .live ? "Executing the plan in Logic\u{2026}" : "Dry run \u{2014} nothing is written to Logic."
+        Task {
+            let commands = validated
+            let exporter = exporter
+            if mode == .live {
+                // The adapter finds strips in the live Mixer, so make sure it is on screen — same step as the scan.
+                let mixerOutcome = await Task.detached(priority: .userInitiated) { exporter.ensureMixerVisible() }.value
+                if case .failed(let step, let detail) = mixerOutcome { log.append("Could not confirm Logic's Mixer is visible before execution (\(step)): \(detail)") }
+            }
+            let adapters: [any LiveActionAdapter] = mode == .live ? [LogicChannelStripAdapter()] : []
+            let executor = SafeExecutor(adapters: adapters, context: .init(snapshot: snapshot))
+            let results = await Task.detached(priority: .userInitiated) { await executor.execute(commands, mode: mode) }.value
+            executionResults = results
+            let executed = results.filter { $0.status == ExecutionStatus.executed }.count
+            let failed = results.filter { $0.status == ExecutionStatus.failed }.count
+            if mode == .live {
+                let outcome = "\(executed)/\(results.count) actions executed" + (failed > 0 ? ", \(failed) failed" : "")
+                executionStatus = outcome + " — verifying with a fresh scan\u{2026}"
+                log.append("LIVE execution finished: \(outcome).")
+                do {
+                    let analyzer = analyzer
+                    let fresh = try await Task.detached(priority: .userInitiated) { try analyzer.fullScan() }.value
+                    ensurePluginInventory()
+                    let normalizer = normalizer; let inventory = availablePlugins
+                    let freshNormalized = await Task.detached(priority: .userInitiated) { normalizer.normalize(fresh, pluginInventory: inventory) }.value
+                    let diff = DiffEngine().compare(before: snapshot, after: freshNormalized)
+                    executionDiff = diff
+                    executionStatus = outcome + ". Fresh scan: \(plural(diff.changed.count, "track")) changed, \(diff.unchanged.count) unchanged."
+                    log.append("Post-execution scan: \(diff.changed.count) changed, \(diff.unchanged.count) unchanged.")
+                } catch {
+                    executionStatus = outcome + ", but the verification scan failed: \(error.localizedDescription)"
+                    log.append("Post-execution scan failed: \(error.localizedDescription)")
+                }
+                NSApp.activate() // execution activated Logic; bring the user back to the results
+            } else {
+                executionStatus = "Dry run finished: \(plural(validExecutableActions, "valid action")) would go to the live adapters; nothing was written to Logic."
+                log.append("Dry run finished for \(results.count) actions.")
+            }
+            executionRunning = false
+        }
+    }
     func prepareAudioExport() { rescanAudio(context: "prepared") }
     func refreshExportStatus() { guard !audioAssets.isEmpty else { audioStatus = "Prepare track export first."; return }; rescanAudio(context: "refreshed") }
     /// Re-scans the audio folder and rebuilds the assets from the current snapshot (deterministic). File presence alone flips requires_user_export → exported.
