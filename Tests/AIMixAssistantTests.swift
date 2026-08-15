@@ -12,8 +12,8 @@ private func fixture() -> NormalizedSnapshot {
     return .init(application: .init(name: "Logic Pro", bundleIdentifier: "com.apple.logic10", pid: 1), completeness: .known("partial"), project: .empty, tracks: [track])
 }
 
-private func ax(_ role: String, id: String = "x", desc: String? = nil, title: String? = nil, value: String? = nil, _ children: [RawAccessibilityNode] = []) -> RawAccessibilityNode {
-    .init(id: id, role: role, subrole: nil, title: title, description: desc, value: value, enabled: true, position: nil, size: nil, supportedAttributes: [], parameterizedAttributes: [], actions: [], children: children)
+private func ax(_ role: String, id: String = "x", desc: String? = nil, title: String? = nil, value: String? = nil, min: String? = nil, max: String? = nil, _ children: [RawAccessibilityNode] = []) -> RawAccessibilityNode {
+    .init(id: id, role: role, subrole: nil, title: title, description: desc, value: value, enabled: true, position: nil, size: nil, supportedAttributes: [], parameterizedAttributes: [], actions: [], children: children, minValue: min, maxValue: max)
 }
 private func headerNode(_ id: String, _ desc: String) -> RawAccessibilityNode {
     ax("AXLayoutItem", id: id, desc: desc, [ax("AXCheckBox", desc: "Mute", value: "0"), ax("AXCheckBox", desc: "Solo", value: "0"), ax("AXCheckBox", desc: "Record Enable", value: "0"), ax("AXCheckBox", desc: "Input Monitoring", value: "0"), ax("AXSlider", desc: "Volume", value: "173"), ax("AXTextField", desc: "name", value: "x"), ax("AXRadioButton", desc: "Has Focus", value: "0")])
@@ -40,12 +40,12 @@ private func realStrip(_ id: String, _ name: String, output: String?, sends: [(d
     kids += [ax("AXButton", desc: "EQ", value: "off"), ax("AXButton", desc: "gain reduction meter", value: "off"), ax("AXButton", desc: "setting")]
     return ax("AXLayoutItem", id: id, desc: name, kids)
 }
-private func snapshot(headers: [RawAccessibilityNode], strips: [RawAccessibilityNode]) -> RawSnapshot {
-    let root = ax("AXApplication", id: "application", [ax("AXGroup", id: "th", desc: "Tracks header", headers), ax("AXLayoutArea", id: "mx", desc: "Mixer", strips)])
+private func snapshot(headers: [RawAccessibilityNode], strips: [RawAccessibilityNode], windows: [RawAccessibilityNode] = []) -> RawSnapshot {
+    let root = ax("AXApplication", id: "application", [ax("AXGroup", id: "th", desc: "Tracks header", headers), ax("AXLayoutArea", id: "mx", desc: "Mixer", strips)] + windows)
     return RawSnapshot(application: .init(name: "Logic Pro", bundleIdentifier: "com.apple.logic10", pid: 1), root: root)
 }
-private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilityNode]) -> NormalizedSnapshot {
-    SnapshotNormalizer().normalize(snapshot(headers: headers, strips: strips))
+private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilityNode], windows: [RawAccessibilityNode] = [], inventory: [PluginInventoryItem] = []) -> NormalizedSnapshot {
+    SnapshotNormalizer().normalize(snapshot(headers: headers, strips: strips, windows: windows), pluginInventory: inventory)
 }
 
 // MARK: - Validator / diff / plan / storage
@@ -147,6 +147,67 @@ private func normalize(headers: [RawAccessibilityNode], strips: [RawAccessibilit
 @Test func normalizerEmitsLoadedPluginAndIgnoresEmptySlots() {
     let c = normalize(headers: [headerNode("h", "Track 6 “Audio 5”")], strips: [stripNode("c", "Audio 5", plugin: "Pro-Q 4")]).tracks.first?.channel
     #expect(c?.plugins.count == 1); #expect(c?.plugins.first?.name.value == "Pro-Q 4"); #expect(c?.plugins.first?.slot == 0); #expect(c?.plugins.first?.bypass.state == .requiresProbe)
+    #expect(c?.plugins.first?.manufacturer.state == .unavailable) // no inventory given — a manufacturer is never guessed
+}
+
+// MARK: - Plug-in facts: manufacturer cross-reference & window parameters
+
+/// Manufacturer is a cross-reference against the installed-plugin inventory, not an AX fact: exactly one inventory
+/// entry with that exact name makes it known (citing the inventory identifier); a shared name stays unavailable.
+@Test func pluginManufacturerComesFromUniqueInventoryMatchOnly() {
+    let inventory = [PluginInventoryItem(name: "Pro-Q 4", manufacturer: "FabFilter", type: "Music Effect", identifier: "aufx/q4pq/FabF", version: nil)]
+    let unique = normalize(headers: [], strips: [stripNode("c", "Audio 5", plugin: "Pro-Q 4")], inventory: inventory).tracks.first?.channel?.plugins.first
+    #expect(unique?.manufacturer.state == .known); #expect(unique?.manufacturer.value == "FabFilter")
+    #expect(unique?.manufacturer.source?.contains("aufx/q4pq/FabF") == true)
+    let doubled = inventory + [PluginInventoryItem(name: "Pro-Q 4", manufacturer: "Someone Else", type: "Effect", identifier: "aufx/q4pq/Else", version: nil)]
+    let shared = normalize(headers: [], strips: [stripNode("c", "Audio 5", plugin: "Pro-Q 4")], inventory: doubled).tracks.first?.channel?.plugins.first
+    #expect(shared?.manufacturer.state == .unavailable) // two candidates — never guessed
+}
+/// Parameters come only from an OPEN plug-in window whose title names exactly one captured slot's plug-in. A parameter
+/// is a value-bearing control whose own caption is its name; range needs both AXMinValue and AXMaxValue; captionless or
+/// non-numeric controls contribute nothing, and a text field mirroring a slider's caption is deduplicated away.
+@Test func pluginWindowParametersAttachToTheUniqueMatchingSlot() {
+    let window = ax("AXWindow", id: "w1", title: "Audio 5 - Pro-Q 4", [
+        ax("AXSlider", id: "w1.g", title: "Band 2 Gain", value: "0", min: "-12", max: "12"),
+        ax("AXSlider", id: "w1.f", title: "Band 2 Frequency", value: "1000"),
+        ax("AXTextField", id: "w1.gt", title: "Band 2 Gain", value: "0"),
+        ax("AXSlider", id: "w1.n", value: "3"),
+        ax("AXButton", id: "w1.b", title: "Close"),
+        ax("AXTextField", id: "w1.t", title: "Preset", value: "Default")
+    ])
+    let plugin = normalize(headers: [], strips: [stripNode("c", "Audio 5", plugin: "Pro-Q 4")], windows: [window]).tracks.first?.channel?.plugins.first
+    #expect(plugin?.parameters.count == 2)
+    let gain = plugin?.parameters.first { $0.name == "Band 2 Gain" }
+    #expect(gain?.value.value == 0); #expect(gain?.range == -12...12); #expect(gain?.id == "w1.g") // the slider won over the mirroring text field
+    let frequency = plugin?.parameters.first { $0.name == "Band 2 Frequency" }
+    #expect(frequency?.value.value == 1000); #expect(frequency?.range == nil) // no min/max exposed — no range invented
+}
+/// Two strips loading the same plug-in: a window naming only the plug-in is ambiguous and attaches nowhere; a window
+/// also naming exactly one of the track names attaches to that track's slot alone.
+@Test func ambiguousPluginWindowsAttachNothing() {
+    let strips = [stripNode("c1", "Audio 5", plugin: "Pro-Q 4"), stripNode("c2", "Audio 7", plugin: "Pro-Q 4")]
+    let bare = ax("AXWindow", id: "w1", title: "Pro-Q 4", [ax("AXSlider", id: "w1.g", title: "Gain", value: "0")])
+    let ambiguous = normalize(headers: [], strips: strips, windows: [bare])
+    #expect(ambiguous.tracks.allSatisfy { ($0.channel?.plugins.first?.parameters.isEmpty ?? true) })
+    let titled = ax("AXWindow", id: "w2", title: "Audio 7 - Pro-Q 4", [ax("AXSlider", id: "w2.g", title: "Gain", value: "0")])
+    let resolved = normalize(headers: [], strips: strips, windows: [titled])
+    #expect(resolved.tracks.first { $0.name.value == "Audio 7" }?.channel?.plugins.first?.parameters.count == 1)
+    #expect(resolved.tracks.first { $0.name.value == "Audio 5" }?.channel?.plugins.first?.parameters.isEmpty == true)
+}
+/// The package renders captured plug-in facts: slot, name, cross-referenced manufacturer and window-read parameters
+/// with their ranges — and the validator accepts a set_plugin_parameter against those same facts.
+@Test func packageRendersCapturedPluginFactsAndValidatorAcceptsThem() {
+    let inventory = [PluginInventoryItem(name: "Pro-Q 4", manufacturer: "FabFilter", type: "Music Effect", identifier: "aufx/q4pq/FabF", version: nil)]
+    let window = ax("AXWindow", id: "w1", title: "Audio 5 - Pro-Q 4", [ax("AXSlider", id: "w1.g", title: "Band 2 Gain", value: "0", min: "-12", max: "12")])
+    let s = normalize(headers: [headerNode("h", "Track 6 “Audio 5”")], strips: [stripNode("c", "Audio 5", plugin: "Pro-Q 4")], windows: [window], inventory: inventory)
+    let md = AIPackageGenerator().make(snapshot: s, sessionID: "t")
+    #expect(md.contains("- Name: known: Pro-Q 4"))
+    #expect(md.contains("- Manufacturer: known: FabFilter"))
+    #expect(md.contains("- Bypass: requires_probe"))
+    #expect(md.contains("Band 2 Gain: known: 0; range: -12...12"))
+    let track = s.tracks.first { $0.channel?.plugins.isEmpty == false }
+    let plan = MixPlan(version: "1.0", status: "ready", actions: [.init(id: "a", target: .init(trackID: track?.logicalTrackID, pluginName: "Pro-Q 4", parameterName: "Band 2 Gain"), action: .setPluginParameter, parameters: ["value": .number(-3)], reason: "test")])
+    #expect(CommandValidator().validate(plan, against: s).first?.status == .valid)
 }
 
 // MARK: - Routing classification (structures verified against a real mixer dump)
@@ -512,7 +573,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.24`"))
+    #expect(md.contains("Package schema: `2.25`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -1363,7 +1424,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.24`"))
+    #expect(md.contains("Package schema: `2.25`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))

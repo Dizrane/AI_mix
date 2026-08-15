@@ -6,7 +6,7 @@ private struct HeaderModel: Sendable { var axPath: String; var name: String; var
 private struct ChannelModel: Sendable { var axPath: String; var name: String; var facts: ChannelFacts }
 
 struct SnapshotNormalizer: Sendable {
-    func normalize(_ raw: RawSnapshot, rawReference: String? = nil) -> NormalizedSnapshot {
+    func normalize(_ raw: RawSnapshot, rawReference: String? = nil, pluginInventory: [PluginInventoryItem] = []) -> NormalizedSnapshot {
         let all = flatten(raw.root) + raw.targets.flatMap { flatten($0.node) }
         /// A project fact is trusted only when a node's own caption (title or description) IS the label — exactly, or as a whole-word prefix ("Key Signature" for "key"). Substring search anywhere used to sign another control's value as `known` ("play" inside "Display", "key" inside "keyboard"); no confident caption means `.unavailable`, never a guess.
         /// The value must come from the control's own `AXValue`: a caption is a label, never its own value ("Key Signature: known: Key Signature"), so a matching node that carries no value is skipped in favour of the next one — Logic labels a field with one element and shows the value in another.
@@ -22,15 +22,16 @@ struct SnapshotNormalizer: Sendable {
         let headerNodes = uniqueNodes(rootNodes.filter(isTrackHeaderCandidate))
         let channelNodes = uniqueNodes(mixerStripNodes(raw.root))
         let headers = headerNodes.map { HeaderModel(axPath: $0.id, name: trackName($0.title ?? $0.description ?? $0.id), ordinal: parseOrdinal($0.title ?? $0.description), facts: makeHeaderFacts(from: $0)) }
-        let channels = channelNodes.map { ChannelModel(axPath: $0.id, name: $0.description ?? $0.id, facts: makeChannelFacts(from: $0)) }
-        let (tracks, linking) = linkTracks(headers: headers, channels: channels)
+        let channels = channelNodes.map { ChannelModel(axPath: $0.id, name: $0.description ?? $0.id, facts: makeChannelFacts(from: $0, inventory: pluginInventory)) }
+        let (linkedTracks, linking) = linkTracks(headers: headers, channels: channels)
+        let tracks = attachPluginParameters(to: linkedTracks, windows: raw.root.children.filter { $0.role == "AXWindow" })
 
         let trackCandidates = headerNodes.map { candidate($0, kind: "track_header", validation: .known, evidence: ["AXLayoutItem titled 'Track N' with header controls (name field + slider/checkbox/radio)"]) }
         let mixerCandidates = channelNodes.map { candidate($0, kind: "mixer_channel", validation: .known, evidence: ["AXLayoutItem is a direct child of the Mixer AXLayoutArea and contains a volume fader control"]) }
         let candidates = dedupe(trackCandidates + mixerCandidates)
         let diagnostics = updatedDiagnostics(raw.diagnostics, candidates: candidates, tracks: headers.count, channels: channels.count)
         let status: Fact<String> = tracks.isEmpty ? .init(state: .requiresProbe, value: nil, source: "structural discovery") : .known("\(linking.logicalTracks) logical tracks: \(linking.confirmedLinks) confirmed, \(linking.unresolvedHeaders) header-only, \(linking.unresolvedChannels) channel-only, \(linking.ambiguous) ambiguous", source: "structural linking")
-        let limitations = ["Header↔channel links are confirmed only by a unique 1:1 name correspondence; shared names stay unmerged (ambiguous). No shared Logic identifier is exposed by AX, so links are never guessed.", "Only values exposed by matching AX controls are emitted; unavailable fields are never inferred.", "Routing slots are classified only by documented structure: an occupied send is the destination-captioned AXGroup with a bypass checkbox, the output slot directly follows the group pop-up, and the input slot directly follows the channel-mode button. A destination button matching none of these rules keeps slotKind = requires_probe and is never read as a send. Send level and pan are not readable (the send knob is unitless, no pan control is exposed) and stay requires_probe."]
+        let limitations = ["Header↔channel links are confirmed only by a unique 1:1 name correspondence; shared names stay unmerged (ambiguous). No shared Logic identifier is exposed by AX, so links are never guessed.", "Only values exposed by matching AX controls are emitted; unavailable fields are never inferred.", "Routing slots are classified only by documented structure: an occupied send is the destination-captioned AXGroup with a bypass checkbox, the output slot directly follows the group pop-up, and the input slot directly follows the channel-mode button. A destination button matching none of these rules keeps slotKind = requires_probe and is never read as a send. Send level and pan are not readable (the send knob is unitless, no pan control is exposed) and stay requires_probe.", "Plug-in facts come from the strip's insert slots: a captioned 'audio plug-in' button is a loaded slot and its caption is the plug-in name. The slot exposes no bypass state over AX, so bypass stays requires_probe. Manufacturer is a cross-reference: known only when the installed-plugin inventory holds exactly one plug-in with that exact name. Parameters are read only from an open plug-in window matched to its slot by unique name evidence (the window title names the plug-in, plus the track name when several strips load it); a closed or unmatched window leaves parameters empty."]
         return .init(application: raw.application, completeness: .known("read-only AX structural discovery with track↔channel linking", source: "normalizer"), project: project, tracksStatus: status, tracks: tracks, linking: linking, candidates: candidates, audio: .unavailable, arrangement: .unavailable, probes: raw.diagnostics.probes, diagnostics: diagnostics, limitations: limitations, rawSnapshotReference: rawReference)
     }
 
@@ -104,7 +105,7 @@ struct SnapshotNormalizer: Sendable {
         let selected = exact("Has Focus").flatMap { boolValue($0.value) }.map { Fact.known($0, source: node.id) } ?? .unavailable
         return HeaderFacts(ordinal: ordinal, mute: mute, solo: solo, record: record, monitoring: monitoring, volumeRaw: volumeRaw, selected: selected)
     }
-    private func makeChannelFacts(from node: RawAccessibilityNode) -> ChannelFacts {
+    private func makeChannelFacts(from node: RawAccessibilityNode, inventory: [PluginInventoryItem] = []) -> ChannelFacts {
         func control(_ words: [String]) -> RawAccessibilityNode? { node.children.first { child in words.contains { word in ((child.title ?? child.description) ?? "").localizedCaseInsensitiveContains(word) } } }
         func exactControl(_ desc: String) -> RawAccessibilityNode? { node.children.first { ($0.description ?? "").localizedCaseInsensitiveCompare(desc) == .orderedSame } }
         let volumeText = node.children.first { ($0.description ?? "").localizedCaseInsensitiveContains("volume fader level") }
@@ -121,7 +122,7 @@ struct SnapshotNormalizer: Sendable {
         let eqEnabled = exactControl("EQ").flatMap { boolValue($0.value) }.map { Fact.known($0, source: node.id) } ?? .unavailable
         let group = control(["group"]).flatMap { $0.value }.map { Fact.known($0, source: node.id) } ?? .unavailable
         let inputGain = exactControl("input gain").flatMap { decimalValue($0.value) }.map { Fact.known($0, source: node.id) } ?? .unavailable
-        return ChannelFacts(volumeDB: volume, pan: pan, mute: mute, solo: solo, automation: automation, input: input, output: routing.output, record: record, monitoring: monitoring, channelMode: channelMode, eqEnabled: eqEnabled, group: group, inputGain: inputGain, sends: routing.sends, routingButtons: routing.unclassified, plugins: pluginSlots(in: node))
+        return ChannelFacts(volumeDB: volume, pan: pan, mute: mute, solo: solo, automation: automation, input: input, output: routing.output, record: record, monitoring: monitoring, channelMode: channelMode, eqEnabled: eqEnabled, group: group, inputGain: inputGain, sends: routing.sends, routingButtons: routing.unclassified, plugins: pluginSlots(in: node, inventory: inventory))
     }
 
     // MARK: Routing classification
@@ -162,12 +163,65 @@ struct SnapshotNormalizer: Sendable {
         }
         return result
     }
-    /// Insert slots are AXButtons described "audio plug-in". Only loaded slots (a non-empty name) are emitted; bypass and parameters require a targeted probe.
-    private func pluginSlots(in node: RawAccessibilityNode) -> [PluginFacts] {
+    /// Insert slots are AXButtons described "audio plug-in". Only loaded slots (a non-empty name) are emitted; bypass requires
+    /// a targeted probe (the slot exposes no bypass state over AX). Manufacturer is a cross-reference, not an AX fact: it is
+    /// known only when the installed-plugin inventory holds exactly one plug-in with that exact name — a shared or missing
+    /// name stays unavailable, never a guess. Parameters are attached later from an open plug-in window, when one matches.
+    private func pluginSlots(in node: RawAccessibilityNode, inventory: [PluginInventoryItem] = []) -> [PluginFacts] {
         node.children.filter { $0.role == "AXButton" && ($0.description ?? "").localizedCaseInsensitiveCompare("audio plug-in") == .orderedSame }.enumerated().compactMap { slot, child in
             guard let name = (child.title ?? child.value), !name.isEmpty else { return nil }
-            return PluginFacts(id: "\(node.id).plugin.\(slot)", slot: slot, name: .known(name, source: child.id), manufacturer: .unavailable, bypass: .init(state: .requiresProbe, value: nil, source: child.id), parameters: [])
+            let matches = inventory.filter { $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame }
+            let manufacturer: Fact<String> = matches.count == 1 ? .known(matches[0].manufacturer, source: "plugin inventory: unique exact-name match (\(matches[0].identifier))") : .unavailable
+            return PluginFacts(id: "\(node.id).plugin.\(slot)", slot: slot, name: .known(name, source: child.id), manufacturer: manufacturer, bypass: .init(state: .requiresProbe, value: nil, source: child.id), parameters: [])
         }
+    }
+    /// Attaches parameters read from OPEN plug-in windows to the strip slots that provably own them. The match is name
+    /// evidence, never position: a window is considered only when its title names exactly one captured slot's plug-in;
+    /// when several strips load that same plug-in, the title must additionally name exactly one of their track names,
+    /// otherwise nothing is attached (an ambiguous window is not evidence). Within a matched window, a parameter is a
+    /// value-bearing control (slider/incrementor/combo/text field) whose own caption is the parameter name and whose
+    /// AXValue parses as a number; its range is published only when the control exposes both AXMinValue and AXMaxValue.
+    /// Captions are deduplicated (a generic AU view often mirrors a slider in a text field) with the slider winning.
+    private func attachPluginParameters(to tracks: [TrackFacts], windows: [RawAccessibilityNode]) -> [TrackFacts] {
+        guard !windows.isEmpty else { return tracks }
+        struct SlotRef { var trackIndex: Int; var pluginIndex: Int; var pluginName: String; var trackName: String }
+        var slots: [SlotRef] = []
+        for (trackIndex, track) in tracks.enumerated() {
+            for (pluginIndex, plugin) in (track.channel?.plugins ?? []).enumerated() {
+                guard let pluginName = plugin.name.value else { continue }
+                slots.append(SlotRef(trackIndex: trackIndex, pluginIndex: pluginIndex, pluginName: pluginName, trackName: track.name.value ?? ""))
+            }
+        }
+        guard !slots.isEmpty else { return tracks }
+        var result = tracks
+        for window in windows {
+            guard let title = window.title, !title.isEmpty else { continue }
+            let byPlugin = slots.filter { title.localizedCaseInsensitiveContains($0.pluginName) }
+            let matched: SlotRef?
+            if byPlugin.count == 1 { matched = byPlugin[0] }
+            else if !byPlugin.isEmpty { let byTrack = byPlugin.filter { !$0.trackName.isEmpty && title.localizedCaseInsensitiveContains($0.trackName) }; matched = byTrack.count == 1 ? byTrack[0] : nil }
+            else { matched = nil }
+            guard let slot = matched, result[slot.trackIndex].channel?.plugins[slot.pluginIndex].parameters.isEmpty == true else { continue }
+            let parameters = pluginParameters(in: window)
+            guard !parameters.isEmpty else { continue }
+            result[slot.trackIndex].channel?.plugins[slot.pluginIndex].parameters = parameters
+        }
+        return result
+    }
+    private func pluginParameters(in window: RawAccessibilityNode) -> [PluginParameter] {
+        let valueRoles: Set<String> = ["AXSlider", "AXIncrementor", "AXComboBox", "AXTextField"]
+        let candidates = flatten(window).filter { valueRoles.contains($0.role) }
+        var parameters: [PluginParameter] = []
+        var seenCaptions = Set<String>()
+        for node in candidates.sorted(by: { ($0.role == "AXSlider" ? 0 : 1, $0.id) < ($1.role == "AXSlider" ? 0 : 1, $1.id) }) {
+            guard let caption = (node.title?.isEmpty == false ? node.title : node.description), !caption.isEmpty else { continue }
+            guard let value = decimalValue(node.value) else { continue }
+            guard seenCaptions.insert(caption.localizedLowercase).inserted else { continue }
+            var range: ClosedRange<Double>? = nil
+            if let low = decimalValue(node.minValue), let high = decimalValue(node.maxValue), low < high { range = low...high }
+            parameters.append(PluginParameter(id: node.id, name: caption, value: .known(value, source: node.id), range: range, unit: nil))
+        }
+        return parameters.sorted { $0.id < $1.id }
     }
 
     // MARK: Candidate detection & helpers
