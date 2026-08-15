@@ -12,8 +12,8 @@ private func fixture() -> NormalizedSnapshot {
     return .init(application: .init(name: "Logic Pro", bundleIdentifier: "com.apple.logic10", pid: 1), completeness: .known("partial"), project: .empty, tracks: [track])
 }
 
-private func ax(_ role: String, id: String = "x", desc: String? = nil, title: String? = nil, value: String? = nil, min: String? = nil, max: String? = nil, _ children: [RawAccessibilityNode] = []) -> RawAccessibilityNode {
-    .init(id: id, role: role, subrole: nil, title: title, description: desc, value: value, enabled: true, position: nil, size: nil, supportedAttributes: [], parameterizedAttributes: [], actions: [], children: children, minValue: min, maxValue: max)
+private func ax(_ role: String, id: String = "x", desc: String? = nil, title: String? = nil, value: String? = nil, valueDesc: String? = nil, min: String? = nil, max: String? = nil, _ children: [RawAccessibilityNode] = []) -> RawAccessibilityNode {
+    .init(id: id, role: role, subrole: nil, title: title, description: desc, value: value, enabled: true, position: nil, size: nil, supportedAttributes: [], parameterizedAttributes: [], actions: [], children: children, valueDescription: valueDesc, minValue: min, maxValue: max)
 }
 private func headerNode(_ id: String, _ desc: String) -> RawAccessibilityNode {
     ax("AXLayoutItem", id: id, desc: desc, [ax("AXCheckBox", desc: "Mute", value: "0"), ax("AXCheckBox", desc: "Solo", value: "0"), ax("AXCheckBox", desc: "Record Enable", value: "0"), ax("AXCheckBox", desc: "Input Monitoring", value: "0"), ax("AXSlider", desc: "Volume", value: "173"), ax("AXTextField", desc: "name", value: "x"), ax("AXRadioButton", desc: "Has Focus", value: "0")])
@@ -573,7 +573,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.27`"))
+    #expect(md.contains("Package schema: `2.28`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -1424,7 +1424,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.27`"))
+    #expect(md.contains("Package schema: `2.28`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
@@ -1782,4 +1782,153 @@ private func metricsFixture(lufs: Double?, truePeak: Double?, clipped: Int) -> A
     let plain = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t")
     #expect(plain.contains("- Post-apply snapshot: no"))
     #expect(!plain.contains("## Post-apply verification"))
+}
+
+// MARK: - Phase 4: send level facts on a proven scale, set_send_level / set_send_pan
+
+/// The real strip shape around one occupied send, with the knob under test injected verbatim.
+private func sendKnobStrip(_ id: String, _ name: String, destination: String, knob: RawAccessibilityNode?) -> RawAccessibilityNode {
+    var kids: [RawAccessibilityNode] = [ax("AXTextField", desc: "name", value: name), ax("AXButton", desc: "mute", value: "off"), ax("AXButton", desc: "solo", value: "off"), ax("AXSlider", desc: "volume fader", value: "173"), ax("AXTextField", desc: "volume fader level", title: "volume fader level, 0,0 dB"), ax("AXSlider", desc: "pan", value: "0"), ax("AXPopUpButton", desc: "group", title: "group"), ax("AXButton", desc: "St Out"), ax("AXGroup", desc: destination, [ax("AXCheckBox", desc: "bypass", value: "0"), ax("AXButton", desc: "list")])]
+    if let knob { kids.append(knob) }
+    return ax("AXLayoutItem", id: id, desc: name, kids)
+}
+private func firstSend(_ knob: RawAccessibilityNode?) -> SendFacts {
+    normalize(headers: [], strips: [sendKnobStrip("c1", "Aux 1", destination: "Bus 3", knob: knob)]).tracks[0].channel!.sends[0]
+}
+/// A snapshot whose one track carries one occupied send with the given level facts — the shape the validator,
+/// verifier and package tests exercise set_send_level against.
+private func sendFixture(level: Fact<Double> = .known(-6), scale: SendLevelScale? = .decibels, range: ClosedRange<Double>? = -96...6) -> NormalizedSnapshot {
+    var snap = fixture()
+    snap.tracks[0].channel?.sends = [SendFacts(id: "ax.channel.send.0", destination: .known("Bus 3"), bypass: .known(false), level: level, pan: .init(state: .requiresProbe, value: nil, source: nil), levelScale: scale, levelRange: range)]
+    return snap
+}
+
+/// The knob proves its own scale or the level stays requires_probe — no reading is ever guessed into a false known.
+@Test func sendLevelIsPublishedOnlyOnAProvenScale() {
+    // Raw scale: a numeric AXValue bounded by the knob's own AXMinValue…AXMaxValue is a true, explicitly unitless fact.
+    let raw = firstSend(ax("AXSlider", desc: "send knob", value: "168", min: "0", max: "255"))
+    #expect(raw.level.value == 168 && raw.levelScale == .raw && raw.levelRange == 0...255)
+    #expect(raw.level.source?.contains("unitless raw units") == true)
+    // dB scale: the knob's own AXValueDescription displays dB. Raw bounds are NOT published as a dB range.
+    let db = firstSend(ax("AXSlider", desc: "send knob", value: "42", valueDesc: "-6,0 dB", min: "0", max: "255"))
+    #expect(db.level.value == -6 && db.levelScale == .decibels && db.levelRange == nil)
+    // When the AXValue itself sits on the dB scale (same-moment evidence), the knob's bounds ARE the dB range.
+    let dbScale = firstSend(ax("AXSlider", desc: "send knob", value: "-6", valueDesc: "-6.0 dB", min: "-96", max: "6"))
+    #expect(dbScale.levelScale == .decibels && dbScale.levelRange == -96...6)
+    // No proof — an unbounded unitless AXValue (the shape the real dump showed) or no knob at all: requires_probe.
+    let unproven = firstSend(ax("AXSlider", desc: "send knob", value: "0"))
+    #expect(unproven.level.state == .requiresProbe && unproven.levelScale == nil && unproven.levelRange == nil)
+    let missing = firstSend(nil)
+    #expect(missing.level.state == .requiresProbe && missing.levelScale == nil)
+}
+/// set_send_level is gated on the proven scale exactly as the phase demands: valid only against a known Level fact,
+/// with the volume/pan direction proof; an unproven knob keeps the action unsupported, and set_send_pan is never
+/// executable because no send pan control exists over AX at all.
+@Test func validatorGatesSendLevelOnTheProvenScale() {
+    func cmd(_ id: String, dest: String? = "Bus 3", _ params: [String: JSONValue]) -> MixCommand {
+        .init(id: id, target: .init(trackID: "channel_aux_1", sendDestination: dest), action: .setSendLevel, parameters: params, reason: "LLM")
+    }
+    let plan = MixPlan(version: "1.0", status: "ready", actions: [
+        cmd("valid", ["value": .number(-9), "current": .number(-6), "delta": .number(-3)]),
+        cmd("noDestination", dest: nil, ["value": .number(-9), "current": .number(-6), "delta": .number(-3)]),
+        cmd("missingSend", dest: "Bus 9", ["value": .number(-9), "current": .number(-6), "delta": .number(-3)]),
+        cmd("outOfRange", ["value": .number(12), "current": .number(-6), "delta": .number(18)]),
+        cmd("badArithmetic", ["value": .number(-9), "current": .number(-6), "delta": .number(3)]),
+        cmd("wrongCurrent", ["value": .number(-9), "current": .number(0), "delta": .number(-9)]),
+    ])
+    let validated = CommandValidator().validate(plan, against: sendFixture())
+    #expect(validated.map(\.status) == [.valid, .invalid, .requiresProbe, .invalid, .invalid, .invalid], "\(validated.map { "\($0.id): \($0.status.rawValue) — \($0.message)" })")
+    // An unproven knob scale keeps the action unsupported — the state the whole action had before any send fact existed.
+    let unproven = CommandValidator().validate(MixPlan(version: "1.0", status: "ready", actions: [cmd("u", ["value": .number(-9), "current": .number(-6), "delta": .number(-3)])]), against: sendFixture(level: .init(state: .requiresProbe, value: nil, source: nil), scale: nil, range: nil))
+    #expect(unproven[0].status == .unsupported && unproven[0].message.contains("MANUAL STEPS"))
+    // A raw-scale send validates in the knob's own proven range, not in dB.
+    let raw = CommandValidator().validate(MixPlan(version: "1.0", status: "ready", actions: [cmd("r", ["value": .number(200), "current": .number(168), "delta": .number(32)]), cmd("rOut", ["value": .number(300), "current": .number(168), "delta": .number(132)])]), against: sendFixture(level: .known(168), scale: .raw, range: 0...255))
+    #expect(raw.map(\.status) == [.valid, .invalid])
+    // Two sends to one destination cannot be addressed unambiguously — rejected, never guessed.
+    var duplicated = sendFixture()
+    duplicated.tracks[0].channel?.sends.append(SendFacts(id: "ax.channel.send.1", destination: .known("Bus 3"), bypass: .known(false), level: .known(-3), pan: .init(state: .requiresProbe, value: nil, source: nil), levelScale: .decibels, levelRange: -96...6))
+    let ambiguous = CommandValidator().validate(MixPlan(version: "1.0", status: "ready", actions: [cmd("a", ["value": .number(-9), "current": .number(-6), "delta": .number(-3)])]), against: duplicated)
+    #expect(ambiguous[0].status == .invalid && ambiguous[0].message.contains("refusing to guess"))
+    // A track without occupied send facts has nothing to set.
+    let noSends = CommandValidator().validate(MixPlan(version: "1.0", status: "ready", actions: [cmd("n", ["value": .number(-9), "current": .number(-6), "delta": .number(-3)])]), against: fixture())
+    #expect(noSends[0].status == .requiresProbe)
+    // set_send_pan: no control exists over AX, so no scan can ever prove a scale — always unsupported.
+    let pan = CommandValidator().validate(MixPlan(version: "1.0", status: "ready", actions: [.init(id: "p", target: .init(trackID: "channel_aux_1", sendDestination: "Bus 3"), action: .setSendPan, parameters: ["value": .number(-10)], reason: "LLM")]), against: sendFixture())
+    #expect(pan[0].status == .unsupported && pan[0].message.contains("MANUAL STEPS"))
+}
+/// The package publishes the send level as a fact on its proven scale, collects it into the Send levels table the
+/// direction proof copies `current` from, and teaches the set_send_level / set_send_pan rules.
+@Test func packageRendersSendLevelFactsAndTeachesTheSchema() {
+    let md = AIPackageGenerator().make(snapshot: sendFixture(), sessionID: "t")
+    #expect(md.contains("- Level: known: -6 dB · proven range: -96\u{2026}6"))
+    #expect(md.contains("### Send levels (source for `parameters.current` of `set_send_level`)"))
+    #expect(md.contains("| `channel_aux_1` | Bus 3 | -6 | dB | -96\u{2026}6 |"))
+    #expect(md.contains("`set_send_level` additionally needs `target.sendDestination`"))
+    #expect(md.contains("`set_send_pan` exists in the vocabulary but always validates as unsupported"))
+    #expect(md.contains("`set_volume` / `set_pan` / `set_mute` / `set_solo` / `set_send_level` actions LIVE"))
+    // A raw-scale send names its units explicitly — the number is never sold as decibels.
+    let raw = AIPackageGenerator().make(snapshot: sendFixture(level: .known(168), scale: .raw, range: 0...255), sessionID: "t")
+    #expect(raw.contains("- Level: known: 168 (raw knob units"))
+    #expect(raw.contains("| `channel_aux_1` | Bus 3 | 168 | raw knob units | 0\u{2026}255 |"))
+    // An unproven knob keeps the honest requires_probe line and the table names the state, not a number.
+    let unproven = AIPackageGenerator().make(snapshot: sendFixture(level: .init(state: .requiresProbe, value: nil, source: nil), scale: nil, range: nil), sessionID: "t")
+    #expect(unproven.contains("- Level: requires_probe (the knob proves no scale"))
+    #expect(unproven.contains("| `channel_aux_1` | Bus 3 | requires_probe | unproven | unavailable |"))
+}
+/// The stage 4→5 contract for sends: a plan written from the package's own Send levels table validates as valid
+/// against the very snapshot the package was generated from.
+@Test func sendLevelActionSurvivesTheGoldenPath() throws {
+    let snapshot = sendFixture()
+    let md = AIPackageGenerator().make(snapshot: snapshot, sessionID: "t")
+    #expect(md.contains("| `channel_aux_1` | Bus 3 | -6 | dB | -96\u{2026}6 |")) // the reply below copies current from this row
+    let reply = """
+    MIX PLAN
+
+    ```json
+    {
+      "version": "1.0",
+      "status": "ready",
+      "actions": [
+        { "id": "send_001", "target": { "trackID": "channel_aux_1", "sendDestination": "Bus 3" }, "action": "set_send_level", "parameters": { "value": -9.0, "current": -6.0, "delta": -3.0 }, "reason": "Send level to Bus 3 is known -6 dB; the target -9 dB lowers the send 3 dB because the measured reverb tail dominates the mix bed." }
+      ]
+    }
+    ```
+    """
+    let plan = try JSONDecoder().decode(MixPlan.self, from: Data(MixPlan.extractJSON(from: reply).utf8))
+    let validated = CommandValidator().validate(plan, against: snapshot)
+    #expect(validated.map(\.status) == [.valid], "\(validated.map { "\($0.id): \($0.status.rawValue) — \($0.message)" })")
+}
+/// The post-run diff sees a send level change; a re-scan that only shifted AX-path-based ids and sources is no change.
+@Test func diffSeesSendLevelChangesButNotIdShifts() {
+    var after = sendFixture()
+    after.tracks[0].channel?.sends[0].level = .known(-9)
+    #expect(DiffEngine().compare(before: sendFixture(), after: after).changed == ["Changed: Aux 1"])
+    var rescanned = sendFixture()
+    rescanned.tracks[0].channel?.sends[0].id = "ax.other.send.0"
+    rescanned.tracks[0].channel?.sends[0].level.source = "another AX path"
+    #expect(DiffEngine().compare(before: sendFixture(), after: rescanned).changed.isEmpty)
+}
+/// The closed loop covers sends: the applied target is checked against the re-read Level fact, and a send the fresh
+/// scan does not prove (missing, ambiguous or unproven scale) is honestly unverifiable — never guessed.
+@Test func planVerifierChecksSendLevelAgainstTheFreshScan() {
+    let command = ValidatedCommand(command: .init(id: "s", target: .init(trackID: "channel_aux_1", sendDestination: "Bus 3"), action: .setSendLevel, parameters: ["value": .number(-9)], reason: "r"), status: .valid, message: "m")
+    var fresh = sendFixture()
+    fresh.tracks[0].channel?.sends[0].level = .known(-9.02)
+    #expect(PlanVerifier().verify([command], against: fresh)[0].outcome == .matched)
+    var drifted = sendFixture()
+    drifted.tracks[0].channel?.sends[0].level = .known(-6)
+    #expect(PlanVerifier().verify([command], against: drifted)[0].outcome == .mismatched)
+    let gone = PlanVerifier().verify([command], against: fixture())
+    #expect(gone[0].outcome == .unverifiable && gone[0].note.contains("no occupied send"))
+    let unproven = PlanVerifier().verify([command], against: sendFixture(level: .init(state: .requiresProbe, value: nil, source: nil), scale: nil, range: nil))
+    #expect(unproven[0].outcome == .unverifiable && unproven[0].note.contains("never guessed"))
+}
+/// The live adapter accepts send level (the write path is gated by the validator's proven-scale rules) and still
+/// refuses send pan — no control exists to write.
+@Test func liveAdapterSupportsSendLevelButNeverSendPan() {
+    let adapter = LogicChannelStripAdapter()
+    #expect(adapter.supports(.setSendLevel))
+    #expect(!adapter.supports(.setSendPan))
+    let refusal = LogicChannelStripAdapter.stalenessRefusal(planCurrent: -6.0, live: -3.0, control: "Send level", unit: " dB")
+    #expect(refusal?.contains("Send level reads -3.0 dB live") == true)
 }

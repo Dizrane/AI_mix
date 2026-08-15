@@ -43,6 +43,17 @@ struct PlanVerifier: Sendable {
         case .setPan: return numeric(command, fact: track.channel?.pan, factName: "Pan", unit: "", label: trackLabel(track))
         case .setMute: return boolean(command, fact: track.channel?.mute, factName: "Mute", label: trackLabel(track))
         case .setSolo: return boolean(command, fact: track.channel?.solo, factName: "Solo", label: trackLabel(track))
+        case .setSendLevel:
+            // A send is re-identified across scans only by its Destination fact (send ids embed AX paths, which shift);
+            // an absent or ambiguous destination is stated as such — never guessed into a comparison.
+            guard let destination = command.target.sendDestination else {
+                return .init(actionID: command.id, action: command.action.rawValue, trackLabel: trackLabel(track), planValue: planValueText(command), rereadValue: "—", outcome: .unverifiable, note: "the action names no target.sendDestination to re-identify the send by")
+            }
+            let matches = (track.channel?.sends ?? []).filter { $0.destination.value?.localizedCaseInsensitiveCompare(destination) == .orderedSame }
+            guard matches.count == 1 else {
+                return .init(actionID: command.id, action: command.action.rawValue, trackLabel: trackLabel(track), planValue: planValueText(command), rereadValue: "—", outcome: .unverifiable, note: matches.isEmpty ? "no occupied send to \u{2018}\(destination)\u{2019} exists in the fresh scan" : "the fresh scan shows \(matches.count) sends to \u{2018}\(destination)\u{2019} — ambiguous, not guessed")
+            }
+            return numeric(command, fact: matches[0].level, factName: "Send level", unit: matches[0].levelScale == .decibels ? " dB" : "", label: trackLabel(track))
         default:
             return .init(actionID: command.id, action: command.action.rawValue, trackLabel: trackLabel(track), planValue: planValueText(command), rereadValue: "—", outcome: .unverifiable, note: "no re-readable channel fact exists for this action; verify it by hand")
         }

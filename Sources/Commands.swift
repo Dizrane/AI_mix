@@ -3,7 +3,7 @@ import Foundation
 enum MixAction: String, Codable, CaseIterable, Sendable { case setVolume = "set_volume", setPan = "set_pan", setMute = "set_mute", setSolo = "set_solo", setInput = "set_input", setOutput = "set_output", setSendLevel = "set_send_level", setSendPan = "set_send_pan", setPluginBypass = "set_plugin_bypass", setPluginParameter = "set_plugin_parameter", insertPlugin = "insert_plugin", removePlugin = "remove_plugin", movePlugin = "move_plugin", createTrack = "create_track", deleteTrack = "delete_track", renameTrack = "rename_track" }
 struct MixPlan: Codable, Sendable { var version: String; var status: String; var actions: [MixCommand] }
 struct MixCommand: Codable, Identifiable, Sendable { var id: String; var target: CommandTarget; var action: MixAction; var parameters: [String: JSONValue]; var reason: String }
-struct CommandTarget: Codable, Sendable { var trackID: String?; var trackName: String?; var pluginID: String?; var pluginName: String?; var parameterID: String?; var parameterName: String? }
+struct CommandTarget: Codable, Sendable { var trackID: String?; var trackName: String?; var pluginID: String?; var pluginName: String?; var parameterID: String?; var parameterName: String?; var sendDestination: String? = nil }
 enum JSONValue: Codable, Sendable, Equatable { case string(String), number(Double), bool(Bool), object([String: JSONValue]), array([JSONValue]), null
     init(from d: Decoder) throws { let c = try d.singleValueContainer(); if c.decodeNil() { self = .null } else if let v = try? c.decode(Bool.self) { self = .bool(v) } else if let v = try? c.decode(Double.self) { self = .number(v) } else if let v = try? c.decode(String.self) { self = .string(v) } else if let v = try? c.decode([String: JSONValue].self) { self = .object(v) } else { self = .array(try c.decode([JSONValue].self)) } }
     func encode(to e: Encoder) throws { var c = e.singleValueContainer(); switch self { case .string(let x): try c.encode(x); case .number(let x): try c.encode(x); case .bool(let x): try c.encode(x); case .object(let x): try c.encode(x); case .array(let x): try c.encode(x); case .null: try c.encodeNil() } }
@@ -29,7 +29,7 @@ extension MixPlan {
 enum ValidationStatus: String, Codable, Sendable { case valid, invalid, requiresProbe = "requires_probe", unsupported }
 struct ValidatedCommand: Identifiable, Sendable { var command: MixCommand; var status: ValidationStatus; var message: String; var id: String { command.id } }
 struct CommandValidator: Sendable {
-    let implemented: Set<MixAction> = [.setVolume, .setPan, .setMute, .setSolo, .setPluginBypass, .setPluginParameter]
+    let implemented: Set<MixAction> = [.setVolume, .setPan, .setMute, .setSolo, .setSendLevel, .setSendPan, .setPluginBypass, .setPluginParameter]
     /// Logic's own control ranges, the same scale as the channel facts: the fader travels −96…+6 dB (silencing is
     /// `set_mute`, never a giant negative volume) and the pan knob −64…+63 (0 = centre). A value the user could not
     /// physically set on the control is a malformed instruction, not a musical judgement — the validator rejects it.
@@ -45,6 +45,9 @@ struct CommandValidator: Sendable {
         // The reason is the user's justification for the move they will apply by hand; an action without one is not
         // an instruction, so it is rejected as malformed rather than executed on faith.
         if command.reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return .init(command: command, status: .invalid, message: "Every action needs a non-empty reason tying it to the evidence.") }
+        // No send pan control exists over Accessibility at all, so no scan can ever prove a scale for it — the action
+        // is stated unsupported regardless of the targeted track, instead of hiding behind a track-resolution answer.
+        if command.action == .setSendPan { return .init(command: command, status: .unsupported, message: "Logic exposes no send pan control over Accessibility — its scale can never be proven, so set_send_pan is not executable. Put send pan changes in MANUAL STEPS.") }
         guard let track = snapshot.tracks.first(where: { $0.id == command.target.trackID || ($0.name.value != nil && $0.name.value == command.target.trackName) }) else { return .init(command: command, status: .requiresProbe, message: "Track is not present in current normalized facts.") }
         // Every implemented action carries a typed `parameters.value`; a plan that omits or mistypes it is malformed,
         // not merely unproven — "technically valid" must mean the value can actually be applied.
@@ -57,6 +60,21 @@ struct CommandValidator: Sendable {
             guard let value = command.parameters["value"]?.numberValue else { return .init(command: command, status: .invalid, message: "set_pan needs a numeric parameters.value.") }
             if !Self.panRange.contains(value) { return .init(command: command, status: .invalid, message: "set_pan value \(value) is outside Logic's pan range \u{2212}64\u{2026}+63.") }
             if let failure = directionFailure(command, target: value, fact: track.channel?.pan.value, action: "set_pan", control: "Pan", unit: "") { return failure }
+        case .setSendLevel:
+            // A send is addressed by its Destination fact — the one identity that survives re-scans (send ids embed
+            // AX paths). The level is validated only on the scale the knob itself proved; an unproven scale keeps the
+            // action unsupported, exactly as the whole action was before any send fact existed.
+            guard let sends = track.channel?.sends, !sends.isEmpty else { return .init(command: command, status: .requiresProbe, message: "The track has no occupied send facts in the current snapshot — nothing to set.") }
+            guard let destination = command.target.sendDestination?.trimmingCharacters(in: .whitespacesAndNewlines), !destination.isEmpty else { return .init(command: command, status: .invalid, message: "set_send_level needs target.sendDestination naming the send's Destination fact exactly (e.g. \u{201C}Bus 1\u{201D}).") }
+            let matches = sends.filter { $0.destination.value?.localizedCaseInsensitiveCompare(destination) == .orderedSame }
+            if matches.isEmpty { return .init(command: command, status: .requiresProbe, message: "No occupied send to \u{2018}\(destination)\u{2019} exists in the current facts for this track.") }
+            if matches.count > 1 { return .init(command: command, status: .invalid, message: "The track has \(matches.count) sends to \u{2018}\(destination)\u{2019} — the destination does not identify one send, refusing to guess.") }
+            let send = matches[0]
+            guard let scale = send.levelScale, send.level.value != nil else { return .init(command: command, status: .unsupported, message: "The send knob's scale is unproven (its Level fact is \(send.level.state.rawValue)) — set_send_level stays unsupported for this send until a scan proves the scale. Keep the move in MANUAL STEPS.") }
+            let unit = scale == .decibels ? " dB" : " (raw knob units)"
+            guard let value = command.parameters["value"]?.numberValue else { return .init(command: command, status: .invalid, message: "set_send_level needs a numeric parameters.value.") }
+            if let range = send.levelRange, !range.contains(value) { return .init(command: command, status: .invalid, message: "set_send_level value \(value)\(unit) is outside the send knob's proven range \(range.lowerBound)\u{2026}\(range.upperBound)\(unit).") }
+            if let failure = directionFailure(command, target: value, fact: send.level.value, action: "set_send_level", control: "Send level", unit: unit) { return failure }
         case .setMute, .setSolo, .setPluginBypass: if command.parameters["value"]?.boolValue == nil { return .init(command: command, status: .invalid, message: "\(command.action.rawValue) needs a boolean parameters.value.") }
         default: break
         }

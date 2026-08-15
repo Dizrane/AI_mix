@@ -142,11 +142,18 @@ enum RoutingDestinationKind: String, Codable, Sendable {
 /// classified only by structural evidence (its documented neighbour in the strip); a button with no such evidence keeps
 /// `slotKind = requires_probe` and must never be read as a send.
 struct RoutingButtonFacts: Codable, Identifiable, Sendable { var id: String; var destination: Fact<String>; var slotKind: Fact<String> }
+/// The scale a send knob's level fact was PROVEN to be on. `decibels` — the knob's own `AXValueDescription` displays the
+/// level as a dB number, the same kind of same-moment evidence the volume fader's level text provides. `raw` — the knob
+/// exposes no dB anywhere, but its numeric `AXValue` is bounded by its own `AXMinValue…AXMaxValue`, so the knob position on
+/// that proven scale is a true fact (explicitly unitless — never presented as dB). A knob proving neither has no scale.
+enum SendLevelScale: String, Codable, Sendable { case decibels = "dB", raw }
 /// A proven, occupied send slot. Logic renders an occupied send as an AXGroup captioned with the destination that contains a
 /// "bypass" checkbox — a shape no other strip control has (the automation group's checkbox is captioned "automation") — so the
-/// destination and bypass are facts. The adjacent "send knob" slider exposes only a unitless raw value and no pan control is
-/// exposed at all, so level and pan stay `requires_probe`.
-struct SendFacts: Codable, Identifiable, Sendable { var id: String; var destination: Fact<String>; var bypass: Fact<Bool>; var level: Fact<Double>; var pan: Fact<Double> }
+/// destination and bypass are facts. The adjacent "send knob" slider carries no level text of its own, so the level is
+/// published only on a scale the knob itself proves (`levelScale` names it, `levelRange` its proven bounds — the ranges the
+/// validator enforces); a knob proving no scale keeps level `requires_probe` and `set_send_level` stays unsupported for it.
+/// No send pan control is exposed at all, so pan stays `requires_probe` — `set_send_pan` is never executable.
+struct SendFacts: Codable, Identifiable, Sendable { var id: String; var destination: Fact<String>; var bypass: Fact<Bool>; var level: Fact<Double>; var pan: Fact<Double>; var levelScale: SendLevelScale? = nil; var levelRange: ClosedRange<Double>? = nil }
 
 enum ProbeType: String, Codable, CaseIterable, Sendable { case inspectTrack = "inspect_track", inspectPlugin = "inspect_plugin", inspectPluginParameters = "inspect_plugin_parameters", inspectChannelStrip = "inspect_channel_strip", inspectTrackRegions = "inspect_track_regions", inspectMixer = "inspect_mixer", inspectSelectedTrack = "inspect_selected_track", inspectAudioMeter = "inspect_audio_meter" }
 struct ProbeRequest: Codable, Sendable { var type: ProbeType; var trackID: String?; var trackName: String?; var pluginName: String? }

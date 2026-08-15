@@ -91,7 +91,7 @@ struct StripControlGrammar {
 
 // MARK: - The live channel-strip adapter
 
-/// The first verified live adapter: volume, pan, mute and solo on a Mixer channel strip. Discipline:
+/// The verified live adapter: volume, pan, mute, solo and send level on a Mixer channel strip. Discipline:
 /// - the strip is located from live AX evidence (the snapshot's captured AX path first, verified by the strip's own
 ///   caption; a unique-name search across the live Mixer as fallback) — never guessed, never by coordinates;
 /// - mute/solo use the documented AXPress on the strip's own captioned control and the switch is believed only after
@@ -102,7 +102,7 @@ struct StripControlGrammar {
 ///   write that does not verify is rolled back to the original position before the failure is reported;
 /// - nothing else on the strip is ever touched.
 struct LogicChannelStripAdapter: LiveActionAdapter {
-    private let supportedActions: Set<MixAction> = [.setVolume, .setPan, .setMute, .setSolo]
+    private let supportedActions: Set<MixAction> = [.setVolume, .setPan, .setMute, .setSolo, .setSendLevel]
     private let supportedBundleIDs: Set<String> = ["com.apple.logic10", "com.apple.mobilelogic"]
     /// One tolerance across the product: the validator's 0.05, matching the 0.1 precision Logic's controls display.
     static let tolerance = 0.05
@@ -134,6 +134,7 @@ struct LogicChannelStripAdapter: LiveActionAdapter {
         case .setSolo: return toggle(command, strip: strip, control: "solo")
         case .setVolume: return setVolume(command, strip: strip)
         case .setPan: return setPan(command, strip: strip)
+        case .setSendLevel: return setSendLevel(command, strip: strip)
         default: return failure("No verified live Logic adapter is installed for this action.")
         }
     }
@@ -268,23 +269,78 @@ struct LogicChannelStripAdapter: LiveActionAdapter {
         guard let rawBefore = number(slider, kAXValueAttribute) else { return failure("The volume fader's AXValue does not read as a number.") }
         guard let dbBefore = displayedDB() else { return failure("The strip's \u{2018}volume fader level\u{2019} text does not read as a dB number.") }
         if let stale = Self.stalenessRefusal(planCurrent: command.parameters["current"]?.numberValue, live: dbBefore, control: "Volume", unit: " dB") { return failure(stale, before: dbBefore) }
+        return calibratedDBWrite(command, control: "fader", slider: slider, displayed: displayedDB, rawBefore: rawBefore, dbBefore: dbBefore, target: target)
+    }
+
+    // MARK: Send level — the knob is written only on the scale the facts proved
+
+    /// Writes one send knob. The send is located by the same structural evidence the normalizer publishes the fact
+    /// from — the destination-captioned AXGroup holding a "bypass" checkbox, with the "send knob" AXSlider directly
+    /// after it — and the write runs on the scale the knob itself proves live: its AXValueDescription displaying dB
+    /// (direct write or measured servo, verified against that description), or the knob's bare AXValue on its own
+    /// bounded raw scale (the validator's range came from those bounds). A knob proving neither scale is refused.
+    private func setSendLevel(_ command: MixCommand, strip: AXUIElement) -> ExecutionResult {
+        func failure(_ message: String, before: Double? = nil) -> ExecutionResult { .init(actionID: command.id, status: ExecutionStatus.failed, before: before.map { JSONValue.number($0) }, after: nil, error: message) }
+        guard let target = command.parameters["value"]?.numberValue else { return failure("set_send_level needs a numeric parameters.value.") }
+        guard let destination = command.target.sendDestination?.trimmingCharacters(in: .whitespacesAndNewlines), !destination.isEmpty else { return failure("set_send_level needs target.sendDestination naming the send's Destination fact.") }
+        let kids = children(strip)
+        let groups = kids.enumerated().filter { _, child in
+            role(child) == "AXGroup" && StripControlGrammar.matches(string(child, kAXDescriptionAttribute), destination)
+                && children(child).contains { role($0) == "AXCheckBox" && StripControlGrammar.matches(string($0, kAXDescriptionAttribute), "bypass") }
+        }
+        guard groups.count == 1 else { return failure(groups.isEmpty ? "No occupied send to \u{2018}\(destination)\u{2019} was found on the live strip — rescan and validate the plan again." : "The live strip shows \(groups.count) sends to \u{2018}\(destination)\u{2019} — refusing to guess which knob to write.") }
+        let index = groups[0].offset
+        guard kids.indices.contains(index + 1), role(kids[index + 1]) == "AXSlider", StripControlGrammar.matches(string(kids[index + 1], kAXDescriptionAttribute) ?? string(kids[index + 1], kAXTitleAttribute), "send knob") else { return failure("The send to \u{2018}\(destination)\u{2019} exposes no \u{2018}send knob\u{2019} slider directly after its group — the knob cannot be located, refusing to write.") }
+        let knob = kids[index + 1]
+        guard let rawBefore = number(knob, kAXValueAttribute) else { return failure("The send knob's AXValue does not read as a number.") }
+        func describedDB() -> Double? {
+            guard let text = string(knob, kAXValueDescriptionAttribute), text.localizedCaseInsensitiveContains("db") else { return nil }
+            return StripControlGrammar.decimal(text)
+        }
+        if let dbBefore = describedDB() {
+            if let stale = Self.stalenessRefusal(planCurrent: command.parameters["current"]?.numberValue, live: dbBefore, control: "Send level", unit: " dB") { return failure(stale, before: dbBefore) }
+            return calibratedDBWrite(command, control: "send knob", slider: knob, displayed: describedDB, rawBefore: rawBefore, dbBefore: dbBefore, target: target)
+        }
+        // No dB is displayed anywhere on this knob, so the only proven scale is the knob's own AXValue — the exact
+        // scale the fact (and the plan's target) is on. The write mechanism is still proven idempotently first.
+        if let stale = Self.stalenessRefusal(planCurrent: command.parameters["current"]?.numberValue, live: rawBefore, control: "Send level", unit: " (raw knob units)") { return failure(stale, before: rawBefore) }
+        if abs(rawBefore - target) <= Self.tolerance { return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(rawBefore), after: .number(rawBefore), error: nil) }
+        if let refusal = proveIdempotentWrite(knob, value: rawBefore, read: { self.number(knob, kAXValueAttribute) }) { return failure(refusal, before: rawBefore) }
+        guard setNumber(knob, target) else { return failure("Writing the send level target over AXValue was rejected.", before: rawBefore) }
+        if let after = awaitValue(read: { self.number(knob, kAXValueAttribute) }, near: target) {
+            return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(rawBefore), after: .number(after), error: nil)
+        }
+        let observed = number(knob, kAXValueAttribute)
+        let restored = setNumber(knob, rawBefore) && awaitValue(read: { self.number(knob, kAXValueAttribute) }, near: rawBefore) != nil
+        return failure("The send knob reads \(observed.map { String($0) } ?? "unreadable") after writing \(target) — the value did not verify. \(restored ? "The knob was restored to its original position \(rawBefore)." : "RESTORING the original position \(rawBefore) also failed — check the strip in Logic.")", before: rawBefore)
+    }
+
+    // MARK: The shared calibrated dB write (volume fader, dB-displaying send knob)
+
+    /// Everything after the staleness gate for a dB-verified slider write: mechanism proof (idempotent read → set(the
+    /// same value) → read, with the displayed dB required unchanged), scale detection from same-moment evidence, a
+    /// direct verified write on the proven dB scale, the measured servo on the raw scale, and rollback with a named
+    /// reason on every failure. `displayed` must re-read the control's own dB display — success is only ever claimed
+    /// from that re-read, never from the written number.
+    private func calibratedDBWrite(_ command: MixCommand, control: String, slider: AXUIElement, displayed displayedDB: () -> Double?, rawBefore: Double, dbBefore: Double, target: Double) -> ExecutionResult {
+        func failure(_ message: String, before: Double? = nil) -> ExecutionResult { .init(actionID: command.id, status: ExecutionStatus.failed, before: before.map { JSONValue.number($0) }, after: nil, error: message) }
         if abs(dbBefore - target) <= Self.tolerance { return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(dbBefore), after: .number(dbBefore), error: nil) }
         // Mechanism proof before the first real write: read → set(the same value) → read, and the displayed dB must
         // not move either. A slider that rejects or distorts its own current value gets no further writes.
         if let refusal = proveIdempotentWrite(slider, value: rawBefore, read: { self.number(slider, kAXValueAttribute) }) { return failure(refusal, before: dbBefore) }
-        guard let dbAfterProof = displayedDB(), abs(dbAfterProof - dbBefore) <= Self.tolerance else { return failure("Re-writing the fader's own value moved the displayed dB — the write mechanism is not idempotent, refusing to continue.", before: dbBefore) }
+        guard let dbAfterProof = displayedDB(), abs(dbAfterProof - dbBefore) <= Self.tolerance else { return failure("Re-writing the \(control)'s own value moved the displayed dB — the write mechanism is not idempotent, refusing to continue.", before: dbBefore) }
         func rollback() -> Bool { setNumber(slider, rawBefore) && awaitValue(read: displayedDB, near: dbBefore) != nil }
         switch FaderScale.detect(sliderValue: rawBefore, displayedDB: dbBefore) {
         case .decibels:
-            guard setNumber(slider, target) else { return failure("Writing the volume target over AXValue was rejected.", before: dbBefore) }
+            guard setNumber(slider, target) else { return failure("Writing the target over AXValue was rejected.", before: dbBefore) }
             if let after = awaitValue(read: displayedDB, near: target) { return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(dbBefore), after: .number(after), error: nil) }
             let restored = rollback()
-            return failure("The fader displays \(displayedDB().map { String($0) } ?? "unreadable") dB after writing \(target) dB on the proven dB scale — the value did not verify. \(restored ? "The fader was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
+            return failure("The \(control) displays \(displayedDB().map { String($0) } ?? "unreadable") dB after writing \(target) dB on the proven dB scale — the value did not verify. \(restored ? "The \(control) was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
         case .raw:
             // Raw units (the real Logic shape: AXValue 173 at 0.0 dB). No guessed curve: the servo measures the
-            // control itself, and it needs the slider's own bounds to keep every step inside the fader's travel.
+            // control itself, and it needs the slider's own bounds to keep every step inside the control's travel.
             guard let rawMin = number(slider, kAXMinValueAttribute), let rawMax = number(slider, kAXMaxValueAttribute), rawMin < rawMax else {
-                return failure("The fader's AXValue (\(rawBefore)) is not the displayed dB (\(dbBefore)) and the slider exposes no AXMinValue/AXMaxValue to calibrate against — the scale is unproven, refusing to write.", before: dbBefore)
+                return failure("The \(control)'s AXValue (\(rawBefore)) is not the displayed dB (\(dbBefore)) and the slider exposes no AXMinValue/AXMaxValue to calibrate against — the scale is unproven, refusing to write.", before: dbBefore)
             }
             var points: [(raw: Double, db: Double)] = [(rawBefore, dbBefore)]
             while true {
@@ -293,16 +349,16 @@ struct LogicChannelStripAdapter: LiveActionAdapter {
                     return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(dbBefore), after: .number(points[points.count - 1].db), error: nil)
                 case .failed(let reason):
                     let restored = rollback()
-                    return failure("Calibrated volume write failed: \(reason). \(restored ? "The fader was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
+                    return failure("Calibrated \(control) write failed: \(reason). \(restored ? "The \(control) was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
                 case .move(let raw):
                     guard setNumber(slider, raw) else {
                         let restored = rollback()
-                        return failure("Writing raw \(raw) over AXValue was rejected mid-calibration. \(restored ? "The fader was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
+                        return failure("Writing raw \(raw) over AXValue was rejected mid-calibration. \(restored ? "The \(control) was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
                     }
                     usleep(120_000)
                     guard let rawNow = number(slider, kAXValueAttribute), let dbNow = displayedDB() else {
                         let restored = rollback()
-                        return failure("The fader stopped reading back mid-calibration. \(restored ? "The fader was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
+                        return failure("The \(control) stopped reading back mid-calibration. \(restored ? "The \(control) was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
                     }
                     points.append((rawNow, dbNow))
                 }
