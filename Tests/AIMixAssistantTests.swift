@@ -512,10 +512,24 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.23`"))
+    #expect(md.contains("Package schema: `2.24`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
+}
+/// A live run mixed the two deliveries: the user pasted the Copy-for-AI text AND attached the Save-Package ZIP. Each variant
+/// honestly asserted its own mode, so the pasted text ordered the model to ignore audio that was really there. Both variants
+/// now carry the same MIXED DELIVERY rule — each stays self-sufficient alone, and when both arrive the full package governs,
+/// because it is the delivery that matches reality.
+@Test func bothDeliveriesStateTheMixedDeliveryPriority() {
+    let full = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
+    #expect(full.contains("MIXED DELIVERY"))
+    #expect(full.contains("this document's rules govern and the other variant's delivery claims are void"))
+    #expect(!full.contains("DELIVERY: THIS DOCUMENT ONLY")) // names the other variant without impersonating its delivery line
+    let markdown = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .markdownOnly)
+    #expect(markdown.contains("MIXED DELIVERY"))
+    #expect(markdown.contains("take priority over this document's delivery claims"))
+    #expect(markdown.contains("follow the FULL PACKAGE rules in the ZIP's own `AI_MIX_ANALYSIS.md`"))
 }
 /// What "Copy for AI" hands over: no JSON, no WAVs. The document must not send the reader looking for files or invite a faked
 /// listening report — the earlier text ordered exactly that even when only the Markdown was pasted.
@@ -1349,7 +1363,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.23`"))
+    #expect(md.contains("Package schema: `2.24`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
