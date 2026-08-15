@@ -498,7 +498,7 @@ struct ReviewScreen: View {
             if !model.validated.isEmpty {
                 Card {
                     Text("Execution").font(.headline)
-                    Text("DRY RUN (default) writes nothing — it only shows which actions would reach the live adapters. LIVE really moves Logic's own controls, but only the four verified channel-strip actions (volume, pan, mute, solo), only actions the validator marked valid, and every write is calibrated against the strip's own displayed value, re-read afterwards and rolled back if it does not verify. Everything else — plug-ins, sends, MANUAL STEPS — is still applied by hand.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Text("DRY RUN (default) writes nothing — it only shows which actions would reach the live adapters. LIVE really moves Logic's own controls, but only the verified channel-strip actions (volume, pan, mute, solo, and send level on sends whose knob scale is proven), only actions the validator marked valid, and every write is calibrated against the strip's own displayed value, re-read afterwards and rolled back if it does not verify. Everything else — plug-ins, unproven sends, send pans, MANUAL STEPS — is still applied by hand.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 12) {
                         Picker("Mode", selection: $model.executionMode) {
                             Text("DRY RUN").tag(OperationMode.dryRun)
@@ -578,12 +578,12 @@ struct ReviewScreen: View {
                     }
                 }
             }
-            Text("The Review screen validates the plan against the current snapshot; LIVE execution covers only the four verified channel-strip actions after your explicit confirmation, with DRY RUN as the default. The validated plan together with the MANUAL STEPS from the model's reply remains your instruction sheet for everything the adapters do not cover — the value shown is the absolute target setting.").font(.caption).foregroundStyle(.secondary)
+            Text("The Review screen validates the plan against the current snapshot; LIVE execution covers only the verified channel-strip actions (volume, pan, mute, solo, proven send levels) after your explicit confirmation, with DRY RUN as the default. The validated plan together with the MANUAL STEPS from the model's reply remains your instruction sheet for everything the adapters do not cover — the value shown is the absolute target setting.").font(.caption).foregroundStyle(.secondary)
         }
         .alert("Execute the plan in Logic Pro?", isPresented: $model.showLiveConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Execute LIVE", role: .destructive) { model.confirmLiveExecution() }
-        } message: { Text("LIVE mode will really change \(model.validExecutableActions) control value\(model.validExecutableActions == 1 ? "" : "s") in Logic Pro (volume, pan, mute or solo only). Every write is verified by re-reading the control and rolled back when it does not verify; a failed action halts the rest of the queue. A fresh scan afterwards shows what actually changed. Actions the validator did not mark valid are never executed.") }
+        } message: { Text("LIVE mode will really change \(model.validExecutableActions) control value\(model.validExecutableActions == 1 ? "" : "s") in Logic Pro (volume, pan, mute, solo or a proven send level only). Every write is verified by re-reading the control and rolled back when it does not verify; a failed action halts the rest of the queue. A fresh scan afterwards shows what actually changed. Actions the validator did not mark valid are never executed.") }
         .confirmationDialog("Export audio tracks from Logic Pro?", isPresented: $model.showExportConfirm, titleVisibility: .visible) {
             Button("Export") { model.confirmExport() }
             Button("Cancel", role: .cancel) {}

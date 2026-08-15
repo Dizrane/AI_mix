@@ -31,7 +31,7 @@ struct SnapshotNormalizer: Sendable {
         let candidates = dedupe(trackCandidates + mixerCandidates)
         let diagnostics = updatedDiagnostics(raw.diagnostics, candidates: candidates, tracks: headers.count, channels: channels.count)
         let status: Fact<String> = tracks.isEmpty ? .init(state: .requiresProbe, value: nil, source: "structural discovery") : .known("\(linking.logicalTracks) logical tracks: \(linking.confirmedLinks) confirmed, \(linking.unresolvedHeaders) header-only, \(linking.unresolvedChannels) channel-only, \(linking.ambiguous) ambiguous", source: "structural linking")
-        let limitations = ["Header↔channel links are confirmed only by a unique 1:1 name correspondence; shared names stay unmerged (ambiguous). No shared Logic identifier is exposed by AX, so links are never guessed.", "Only values exposed by matching AX controls are emitted; unavailable fields are never inferred.", "Routing slots are classified only by documented structure: an occupied send is the destination-captioned AXGroup with a bypass checkbox, the output slot directly follows the group pop-up, and the input slot directly follows the channel-mode button. A destination button matching none of these rules keeps slotKind = requires_probe and is never read as a send. Send level and pan are not readable (the send knob is unitless, no pan control is exposed) and stay requires_probe.", "Plug-in facts come from the strip's insert slots: a captioned 'audio plug-in' button is a loaded slot and its caption is the plug-in name. The slot exposes no bypass state over AX, so bypass stays requires_probe. Manufacturer is a cross-reference: known only when the installed-plugin inventory holds exactly one plug-in with that exact name. Parameters are read only from an open plug-in window matched to its slot by unique name evidence (the window title names the plug-in, plus the track name when several strips load it); a closed or unmatched window leaves parameters empty."]
+        let limitations = ["Header↔channel links are confirmed only by a unique 1:1 name correspondence; shared names stay unmerged (ambiguous). No shared Logic identifier is exposed by AX, so links are never guessed.", "Only values exposed by matching AX controls are emitted; unavailable fields are never inferred.", "Routing slots are classified only by documented structure: an occupied send is the destination-captioned AXGroup with a bypass checkbox, the output slot directly follows the group pop-up, and the input slot directly follows the channel-mode button. A destination button matching none of these rules keeps slotKind = requires_probe and is never read as a send. A send level is published only on a scale the knob itself proves: its AXValueDescription displaying dB, or a numeric AXValue bounded by its own AXMinValue…AXMaxValue (explicitly unitless raw units); a knob proving neither keeps level requires_probe. No send pan control is exposed at all, so send pan stays requires_probe.", "Plug-in facts come from the strip's insert slots: a captioned 'audio plug-in' button is a loaded slot and its caption is the plug-in name. The slot exposes no bypass state over AX, so bypass stays requires_probe. Manufacturer is a cross-reference: known only when the installed-plugin inventory holds exactly one plug-in with that exact name. Parameters are read only from an open plug-in window matched to its slot by unique name evidence (the window title names the plug-in, plus the track name when several strips load it); a closed or unmatched window leaves parameters empty."]
         return .init(application: raw.application, completeness: .known("read-only AX structural discovery with track↔channel linking", source: "normalizer"), project: project, tracksStatus: status, tracks: tracks, linking: linking, candidates: candidates, audio: .unavailable, arrangement: .unavailable, probes: raw.diagnostics.probes, diagnostics: diagnostics, limitations: limitations, rawSnapshotReference: rawReference)
     }
 
@@ -147,8 +147,9 @@ struct SnapshotNormalizer: Sendable {
             if child.role == "AXGroup", let destination = child.description, !destination.isEmpty,
                let bypass = child.children.first(where: { $0.role == "AXCheckBox" && ($0.description ?? "").localizedCaseInsensitiveCompare("bypass") == .orderedSame }) {
                 let knob = node.children.indices.contains(index + 1) ? node.children[index + 1] : nil
-                let knobID = caption(knob, is: "send knob", role: "AXSlider") ? knob?.id : nil
-                result.sends.append(SendFacts(id: "\(node.id).send.\(result.sends.count)", destination: .known(destination, source: "\(child.id): AXGroup captioned with the destination and holding a bypass checkbox — the shape only an occupied send slot has"), bypass: boolValue(bypass.value).map { Fact.known($0, source: bypass.id) } ?? .init(state: .unknown, value: nil, source: bypass.id), level: .init(state: .requiresProbe, value: nil, source: knobID), pan: .init(state: .requiresProbe, value: nil, source: nil)))
+                let knobNode = caption(knob, is: "send knob", role: "AXSlider") ? knob : nil
+                let level = sendLevel(knobNode)
+                result.sends.append(SendFacts(id: "\(node.id).send.\(result.sends.count)", destination: .known(destination, source: "\(child.id): AXGroup captioned with the destination and holding a bypass checkbox — the shape only an occupied send slot has"), bypass: boolValue(bypass.value).map { Fact.known($0, source: bypass.id) } ?? .init(state: .unknown, value: nil, source: bypass.id), level: level.fact, pan: .init(state: .requiresProbe, value: nil, source: nil), levelScale: level.scale, levelRange: level.range))
                 continue
             }
             guard child.role == "AXButton", let destination = child.description, isDestination(destination) else { continue }
@@ -162,6 +163,25 @@ struct SnapshotNormalizer: Sendable {
             }
         }
         return result
+    }
+    /// The send knob's level, on a scale the knob itself proves — never assumed. Two kinds of proof, in order of
+    /// strength: the knob's own `AXValueDescription` displaying a dB number is the dB scale (the same same-moment
+    /// evidence the volume fader's level text provides; the range is published only when the AXValue itself is on the
+    /// dB scale, so raw bounds are never sold as dB bounds); failing that, a numeric `AXValue` bounded by the knob's
+    /// own `AXMinValue…AXMaxValue` is the knob's raw scale — the position is a true fact, explicitly unitless. A knob
+    /// proving neither keeps the level `requires_probe`, exactly as before this fact existed.
+    private func sendLevel(_ knob: RawAccessibilityNode?) -> (fact: Fact<Double>, scale: SendLevelScale?, range: ClosedRange<Double>?) {
+        guard let knob else { return (.init(state: .requiresProbe, value: nil, source: nil), nil, nil) }
+        let raw = decimalValue(knob.value)
+        let bounds: ClosedRange<Double>? = { guard let min = decimalValue(knob.minValue), let max = decimalValue(knob.maxValue), min < max else { return nil }; return min...max }()
+        if let description = knob.valueDescription, description.localizedCaseInsensitiveContains("db"), let db = decimalValue(description) {
+            let dbRange = (raw.map { abs($0 - db) <= 0.05 } == true) ? bounds : nil
+            return (.known(db, source: "\(knob.id): the send knob's own AXValueDescription displays the level in dB"), .decibels, dbRange)
+        }
+        if let raw, let bounds {
+            return (.known(raw, source: "\(knob.id): the send knob's AXValue on its own proven AXMinValue\u{2026}AXMaxValue scale — unitless raw units, Logic exposes no dB for this knob"), .raw, bounds)
+        }
+        return (.init(state: .requiresProbe, value: nil, source: knob.id), nil, nil)
     }
     /// Insert slots are AXButtons described "audio plug-in". Only loaded slots (a non-empty name) are emitted; bypass requires
     /// a targeted probe (the slot exposes no bypass state over AX). Manufacturer is a cross-reference, not an AX fact: it is
