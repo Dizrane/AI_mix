@@ -573,7 +573,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.26`"))
+    #expect(md.contains("Package schema: `2.27`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -1424,7 +1424,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.26`"))
+    #expect(md.contains("Package schema: `2.27`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
@@ -1701,4 +1701,85 @@ private func logicLikeCurve(_ raw: Double) -> Double {
         #expect(md.contains("By default (DRY RUN) nothing is written to Logic Pro"))
         #expect(!md.contains("the application never modifies Logic")) // the pre-LIVE claim must be gone
     }
+}
+
+// MARK: - Post-apply verification: plan checks, metric deltas, package marker
+
+private func planCommand(_ id: String, _ action: MixAction, value: JSONValue, status: ValidationStatus = .valid) -> ValidatedCommand {
+    .init(command: .init(id: id, target: .init(trackID: "channel_aux_1"), action: action, parameters: ["value": value], reason: "test"), status: status, message: status == .valid ? "Technically valid against current snapshot." : "not valid")
+}
+
+/// The closed loop's core arithmetic: every valid action's absolute target against the fact a fresh scan re-read,
+/// tolerance 0.05 — matched, mismatched with both values, or honestly unverifiable. Non-valid actions were never
+/// instructions and are not checked at all.
+@Test func planVerifierChecksTargetsAgainstRereadFacts() {
+    var fresh = fixture()
+    fresh.tracks[0].channel?.volumeDB = .known(-4.53)
+    fresh.tracks[0].channel?.pan = .known(-20)
+    fresh.tracks[0].channel?.mute = .known(true)
+    let checks = PlanVerifier().verify([
+        planCommand("v", .setVolume, value: .number(-4.5)),
+        planCommand("p", .setPan, value: .number(10)),
+        planCommand("m", .setMute, value: .bool(true)),
+        planCommand("s", .setSolo, value: .bool(true)),
+        planCommand("skipped", .setVolume, value: .number(0), status: .invalid),
+    ], against: fresh)
+    #expect(checks.map(\.actionID) == ["v", "p", "m", "s"]) // the invalid action was never an instruction
+    #expect(checks[0].outcome == .matched) // -4.53 vs -4.5 sits inside the validator's 0.05
+    #expect(checks[1].outcome == .mismatched)
+    #expect(checks[1].planValue == "10" && checks[1].rereadValue == "-20") // both values shown, nothing hidden
+    #expect(checks[2].outcome == .matched && checks[2].rereadValue == "on")
+    #expect(checks[3].outcome == .mismatched) // solo is known false, plan wanted on
+}
+/// Verification never invents: a fact the fresh scan does not prove stays `unverifiable` (named state), and a track
+/// missing from the fresh scan is a stated absence — no check can turn either into a false known.
+@Test func planVerifierNeverGuessesAnUnprovenFact() {
+    var fresh = fixture()
+    fresh.tracks[0].channel?.volumeDB = .init(state: .requiresProbe, value: nil, source: nil)
+    let unproven = PlanVerifier().verify([planCommand("v", .setVolume, value: .number(-3))], against: fresh)
+    #expect(unproven[0].outcome == .unverifiable)
+    #expect(unproven[0].rereadValue == "requires_probe") // the fact's own state, not a guessed number
+    #expect(unproven[0].note.contains("never guessed"))
+    let missing = PlanVerifier().verify([.init(command: .init(id: "x", target: .init(trackID: "gone"), action: .setVolume, parameters: ["value": .number(-3)], reason: "r"), status: .valid, message: "m")], against: fixture())
+    #expect(missing[0].outcome == .unverifiable && missing[0].note.contains("not present"))
+    let manual = PlanVerifier().verify([planCommand("b", .setPluginBypass, value: .bool(true))], against: fixture())
+    #expect(manual[0].outcome == .unverifiable && manual[0].note.contains("verify it by hand"))
+}
+private func metricsFixture(lufs: Double?, truePeak: Double?, clipped: Int) -> AudioMetrics {
+    AudioMetrics(integratedLoudnessLUFS: lufs.map { .known($0) } ?? .unavailable, truePeakDBTP: truePeak.map { .known($0) } ?? .unavailable, samplePeakDBFS: .unavailable, rmsDBFS: .unavailable, crestFactorDB: .unavailable, spectralBands: .unavailable, spectralCentroidHz: .unavailable, stereoCorrelation: .unavailable, midSideRatioDB: .unavailable, silenceIntervals: .unavailable, silencePercent: .unavailable, dcOffsetMean: .unavailable, clippedSampleCount: .known(clipped), analyzedFileSize: 1, analyzedFileModifiedAt: Date(timeIntervalSince1970: 0))
+}
+/// Before/after rows exist only where BOTH sides were really measured; an unchanged file keeps identical numbers
+/// (the cache keys by file identity) and is flagged as such instead of pretending the plan already changed the audio.
+@Test func metricsComparisonJoinsBaselineWithCurrentFilesByIdentity() {
+    let baseline = [
+        MetricsBaselineEntry(id: "track_1", label: "Lead", metrics: metricsFixture(lufs: -18, truePeak: -1.0, clipped: 0)),
+        MetricsBaselineEntry(id: "track_gone", label: "Deleted", metrics: metricsFixture(lufs: -20, truePeak: -2, clipped: 0)),
+        MetricsBaselineEntry(id: "mix", label: "Mix (Stereo Out)", metrics: metricsFixture(lufs: -14, truePeak: -0.8, clipped: 3)),
+    ]
+    var lead = AudioAsset(audioID: "a1", logicalTrackID: "track_1", trackName: .known("Lead"), expectedExportPath: "audio/Lead.wav", actualExportedPath: .known("audio/Lead.wav"), sourceFile: .unavailable, status: .exported, statusReason: nil, regions: [], durationSeconds: .known(10), sampleRate: .known(48000), channels: .known(2), bitDepth: .known(24), format: .known("PCM"), trackAXPath: nil)
+    lead.metrics = metricsFixture(lufs: -16.5, truePeak: -0.4, clipped: 0)
+    let mix = MixBounceAsset(relativePath: "mix/mix.wav", durationSeconds: .known(10), sampleRate: .known(48000), channels: .known(2), bitDepth: .known(24), format: .known("PCM"), bounceSettings: nil, metrics: metricsFixture(lufs: -14, truePeak: -0.8, clipped: 3))
+    let deltas = MetricsComparison.compare(baseline: baseline, assets: [lead], mix: mix)
+    #expect(deltas.map(\.id) == ["track_1", "mix"]) // the deleted track has no after-side and gets no fabricated row
+    #expect(deltas[0].changed && deltas[0].lufsBefore == -18 && deltas[0].lufsAfter == -16.5)
+    #expect(!deltas[1].changed) // identical numbers: the mix was not re-bounced
+}
+/// The second-round package: the post-apply marker, the verification lines and the before/after metrics are stated in
+/// both deliveries, and a package without a verified cycle explicitly says no plan was applied.
+@Test func packageMarksThePostApplySnapshot() {
+    let report = PostApplyReport(verifiedAt: Date(), executedLive: true, checks: [.init(actionID: "a1", action: "set_volume", trackLabel: "\u{201C}Aux 1\u{201D} (`channel_aux_1`)", planValue: "-3 dB", rereadValue: "-3 dB", outcome: .matched, note: "")], diff: .init(changed: ["Changed: Aux 1"], unchanged: ["Lead"], errors: []), metricDeltas: [.init(id: "mix", label: "Mix (Stereo Out)", lufsBefore: -18, lufsAfter: -17.2, truePeakBefore: -1.1, truePeakAfter: -0.6, clippedBefore: 0, clippedAfter: 0, changed: true)])
+    for delivery in [PackageDelivery.markdownOnly, .fullPackage] {
+        let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: delivery, postApply: report)
+        #expect(md.contains("- Post-apply snapshot: yes"))
+        #expect(md.contains("## Post-apply verification (previous plan)"))
+        #expect(md.contains("THIS IS A POST-APPLY SNAPSHOT"))
+        #expect(md.contains("SECOND ROUND"))
+        #expect(md.contains("`a1` set_volume on \u{201C}Aux 1\u{201D} (`channel_aux_1`): plan -3 dB vs re-read -3 dB — matched"))
+        #expect(md.contains("Track diff against the pre-apply snapshot: 1 changed, 1 unchanged: Changed: Aux 1."))
+        #expect(md.contains("LUFS -18 \u{2192} -17.2 (\u{0394} +0.8)"))
+        #expect(md.contains("true peak -1.1 \u{2192} -0.6 dBTP (\u{0394} +0.5)"))
+    }
+    let plain = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t")
+    #expect(plain.contains("- Post-apply snapshot: no"))
+    #expect(!plain.contains("## Post-apply verification"))
 }

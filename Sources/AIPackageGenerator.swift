@@ -8,16 +8,17 @@ enum PackageDelivery: Sendable { case markdownOnly, fullPackage }
 
 /// Provider-neutral export of normalized, evidence-based DAW facts for any external LLM.
 struct AIPackageGenerator: Sendable {
-    static let schemaVersion = "2.26"
-    func make(snapshot: NormalizedSnapshot, sessionID: String, audio: [AudioAsset] = [], plugins: [PluginInventoryItem] = [], probes: [ProbeType] = ProbeType.allCases, delivery: PackageDelivery = .fullPackage, exportSettings: ExportSettingsFacts? = nil, mix: MixBounceAsset? = nil) -> String {
+    static let schemaVersion = "2.27"
+    func make(snapshot: NormalizedSnapshot, sessionID: String, audio: [AudioAsset] = [], plugins: [PluginInventoryItem] = [], probes: [ProbeType] = ProbeType.allCases, delivery: PackageDelivery = .fullPackage, exportSettings: ExportSettingsFacts? = nil, mix: MixBounceAsset? = nil, postApply: PostApplyReport? = nil) -> String {
         let readiness = PackageReadiness.evaluate(snapshot: snapshot, assets: audio)
         var out: [String] = []
         out += ["# AI Mix Analysis", ""]
         out += primaryInstruction(delivery)
-        out += ["", "## Package", "", "- Package schema: `\(Self.schemaVersion)`", "- Analysis ID: `\(sessionID)`", "- Generated: `\(ISO8601DateFormatter().string(from: Date()))`", "- Project: \(render(snapshot.project.name))", "- Logical tracks: \(snapshot.tracks.count)", "- Audio assets: \(audio.count)", "- Exported: \(readiness.audioExported)", "- Requires export: \(audio.count - readiness.audioExported)"]
+        out += ["", "## Package", "", "- Package schema: `\(Self.schemaVersion)`", "- Analysis ID: `\(sessionID)`", "- Generated: `\(ISO8601DateFormatter().string(from: Date()))`", "- Project: \(render(snapshot.project.name))", "- Logical tracks: \(snapshot.tracks.count)", "- Audio assets: \(audio.count)", "- Exported: \(readiness.audioExported)", "- Requires export: \(audio.count - readiness.audioExported)", "- Post-apply snapshot: " + (postApply != nil ? "yes — captured after the previous Mix Plan was applied (see Post-apply verification)" : "no — no plan has been applied and verified in this analysis")]
         out += purposeAndRules(delivery)
         out += ["", "## Project metadata", "", fact("Project name", snapshot.project.name), fact("Tempo", snapshot.project.tempo, unit: " BPM"), fact("Time signature", snapshot.project.timeSignature), fact("Key signature", snapshot.project.keySignature), fact("Sample rate", snapshot.project.sampleRate, unit: " Hz"), fact("Transport", snapshot.project.transportState), fact("Snapshot completeness", snapshot.completeness)]
         out += readinessSection(readiness)
+        out += postApplySection(postApply)
         out += trackLinkingSection(snapshot)
         out += signalFlowSection(snapshot)
         out += audioAssetsSection(audio, delivery: delivery, exportSettings: exportSettings, mix: mix)
@@ -58,6 +59,33 @@ struct AIPackageGenerator: Sendable {
         var out = ["", "## Package readiness", "", "- Logic analysis: \(flag(r.logicAnalysis))", "- Track discovery: \(flag(r.trackDiscovery))", "- Audio assets: \(r.audioTotal == 0 ? "INCOMPLETE (none prepared)" : "\(r.audioExported)/\(r.audioTotal) exported")", "- Provenance: \(flag(r.provenanceOK))", "- AI Package: \(r.overall.rawValue.uppercased())", "", "Audio readiness counts ONLY Logic audio tracks that are audio export assets. When the package is ready, every Logic audio track represented in Audio Assets has a real, readable WAV; Aux / Bus / Master / Output channel-only objects are not audio assets and never block readiness."]
         if r.audioTotal > 0 && r.audioExported < r.audioTotal { out += ["", "Audio analysis incomplete — \(plural(r.audioTotal - r.audioExported, "WAV file")) missing. Export the missing tracks and Refresh Export Status for a complete analysis."] }
         if !r.errors.isEmpty { out += ["", "Integrity errors (do not rely on this package until fixed):"] + r.errors.map { "- \($0)" } }
+        return out
+    }
+    /// The second-round marker and its evidence. The section exists only when a previously delivered plan was really
+    /// applied and verified by a fresh scan; it never speculates about what a plan "should" have done — every line is
+    /// either a re-read fact, a diff of two real snapshots, or a measurement of a real file.
+    private func postApplySection(_ report: PostApplyReport?) -> [String] {
+        guard let report else { return [] }
+        var out = ["", "## Post-apply verification (previous plan)", "", "THIS IS A POST-APPLY SNAPSHOT: a previously delivered Mix Plan was applied " + (report.executedLive ? "by the application (LIVE execution with per-write readback)" : "by the user by hand") + " and every fact in this document was captured by a fresh read-only scan AFTER that (verified \(ISO8601DateFormatter().string(from: report.verifiedAt))). Treat this package as the SECOND ROUND of the workflow: first assess what the applied plan actually achieved, using the verification below together with the fresh facts and metrics, then run the standard workflow (stages 1\u{2013}6) on this document alone. Do not re-deliver the previous plan; every `parameters.current` in a new plan must come from THIS document's Current control values table, and only moves the fresh evidence still justifies belong in it.", "", "Each applied action's absolute target was checked against the re-read known fact (tolerance 0.05, the validator's own): `matched` — the fresh fact equals the target; `mismatched` — it does not (both values shown; investigate before planning on top of it); `unverifiable` — the fresh scan exposes no known fact for the control, which is stated honestly and never guessed into a result.", ""]
+        out += report.checks.isEmpty ? ["- No valid actions were available to verify."] : report.checks.map { check in
+            "- `\(check.actionID)` \(check.action) on \(check.trackLabel): plan \(check.planValue) vs re-read \(check.rereadValue) — \(check.outcome.rawValue)" + (check.note.isEmpty ? "" : " (\(check.note))")
+        }
+        out += ["", "Track diff against the pre-apply snapshot: \(report.diff.changed.count) changed, \(report.diff.unchanged.count) unchanged" + (report.diff.changed.isEmpty ? "." : ": " + report.diff.changed.joined(separator: "; ") + ".")]
+        out += ["", "### Audio metrics before / after", ""]
+        if report.metricDeltas.isEmpty {
+            out += ["- No before/after comparison is available: no pre-apply measurement matches a currently measured file. Re-export the tracks and re-bounce the mix, then regenerate this package to compare LUFS / true peak / clipping against the pre-apply state."]
+        } else {
+            out += ["\u{201C}Before\u{201D} numbers are the measurements of the files as they stood when the plan was verified; \u{201C}after\u{201D} are the current files'. Identical numbers mean the file was NOT re-exported after the plan was applied — control moves change the audio only after a new export/bounce, so judge the plan's sonic effect only from rows that were really re-measured.", ""]
+            out += report.metricDeltas.map { delta in
+                func pair(_ label: String, _ before: Double?, _ after: Double?, unit: String) -> String {
+                    guard let before, let after else { return "\(label) \(before.map { decimalString($0) + unit } ?? "unavailable") \u{2192} \(after.map { decimalString($0) + unit } ?? "unavailable")" }
+                    let deltaValue = after - before
+                    return "\(label) \(decimalString(before)) \u{2192} \(decimalString(after))\(unit) (\u{0394} \(deltaValue >= 0 ? "+" : "")\(decimalString(deltaValue)))"
+                }
+                let clipped = "clipped \(delta.clippedBefore.map(String.init) ?? "unavailable") \u{2192} \(delta.clippedAfter.map(String.init) ?? "unavailable")"
+                return "- \(delta.label): " + [pair("LUFS", delta.lufsBefore, delta.lufsAfter, unit: ""), pair("true peak", delta.truePeakBefore, delta.truePeakAfter, unit: " dBTP"), clipped].joined(separator: " \u{00B7} ") + (delta.changed ? "" : " — unchanged file")
+            }
+        }
         return out
     }
     private func provenanceSection(_ assets: [AudioAsset]) -> [String] {

@@ -525,17 +525,55 @@ struct ReviewScreen: View {
                         }
                     }
                 }
-                if let diff = model.executionDiff {
-                    Card {
-                        Text("After execution — fresh scan").font(.headline)
-                        Text("A new read-only scan was compared against the snapshot this plan was validated with.").font(.caption).foregroundStyle(.secondary)
+                Card {
+                    Text("Verification — before / after").font(.headline)
+                    Text("The closed loop: a fresh read-only scan re-reads Logic's facts, compares them against the snapshot the plan was validated with, and checks every valid action's target against the re-read fact (tolerance 0.05). It runs automatically after a LIVE queue; press the button when you applied the plan by hand. The fresh snapshot becomes the current analysis, so the next generated AI package is the post-apply second round for your LLM.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 12) {
+                        Button("Verify Applied Plan (Fresh Scan)") { model.verifyAppliedPlan() }
+                            .disabled(model.verificationRunning || model.executionRunning || model.validated.isEmpty)
+                        if model.verificationRunning { ProgressView().controlSize(.small) }
+                    }
+                    if !model.verificationStatus.isEmpty { Text(model.verificationStatus).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+                    if !model.planChecks.isEmpty {
+                        Divider()
+                        Text("Plan targets vs re-read facts").font(.system(size: 13, weight: .semibold))
+                        ForEach(model.planChecks) { check in
+                            HStack(spacing: 10) {
+                                StatusDot(state: check.outcome == .matched ? .ok : (check.outcome == .mismatched ? .error : .warn))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("\(check.actionID) · \(check.action) · \(check.trackLabel) — plan \(check.planValue) vs re-read \(check.rereadValue) · \(check.outcome.rawValue)").font(.system(size: 13, weight: .medium))
+                                    if !check.note.isEmpty { Text(check.note).font(.caption).foregroundStyle(.secondary) }
+                                }
+                                Spacer()
+                            }
+                            if check.id != model.planChecks.last?.id { Divider() }
+                        }
+                    }
+                    if let diff = model.verificationDiff {
+                        Divider()
                         StatusRow("Changed", diff.changed.isEmpty ? "No tracks changed" : "\(diff.changed.count)", diff.changed.isEmpty ? .idle : .ok)
                         ForEach(diff.changed, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
-                        Divider()
                         StatusRow("Unchanged", "\(diff.unchanged.count) tracks", .idle)
                         if !diff.errors.isEmpty {
-                            Divider()
                             ForEach(diff.errors, id: \.self) { Label($0, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.red) }
+                        }
+                    }
+                    if model.postApplyVerifiedAt != nil {
+                        Divider()
+                        Text("Audio metrics before / after").font(.system(size: 13, weight: .semibold))
+                        Text("Control moves change the audio only after a new export/bounce. Re-export the tracks and re-bounce the mix, then compare the new measurements against the pre-apply baseline below; a row marked \u{201C}unchanged file\u{201D} was not re-exported yet.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 10) {
+                            Button("Re-export Tracks", action: model.requestExport).disabled(model.exportPhase == .exporting || model.mixPhase == .exporting || model.verificationRunning)
+                            Button("Re-bounce Mix", action: model.requestMixBounce).disabled(model.exportPhase == .exporting || model.mixPhase == .exporting || model.verificationRunning)
+                        }
+                        if model.exportPhase == .exporting, !model.audioStatus.isEmpty { Text(model.audioStatus).font(.caption).foregroundStyle(.secondary) }
+                        if model.mixPhase == .exporting, !model.mixStatus.isEmpty { Text(model.mixStatus).font(.caption).foregroundStyle(.secondary) }
+                        ForEach(model.metricDeltas) { delta in
+                            HStack(spacing: 10) {
+                                StatusDot(state: delta.changed ? .ok : .idle)
+                                Text(deltaLabel(delta)).font(.system(.caption, design: .monospaced)).foregroundStyle(delta.changed ? .primary : .secondary)
+                                Spacer()
+                            }
                         }
                     }
                 }
@@ -546,6 +584,22 @@ struct ReviewScreen: View {
             Button("Cancel", role: .cancel) {}
             Button("Execute LIVE", role: .destructive) { model.confirmLiveExecution() }
         } message: { Text("LIVE mode will really change \(model.validExecutableActions) control value\(model.validExecutableActions == 1 ? "" : "s") in Logic Pro (volume, pan, mute or solo only). Every write is verified by re-reading the control and rolled back when it does not verify; a failed action halts the rest of the queue. A fresh scan afterwards shows what actually changed. Actions the validator did not mark valid are never executed.") }
+        .confirmationDialog("Export audio tracks from Logic Pro?", isPresented: $model.showExportConfirm, titleVisibility: .visible) {
+            Button("Export") { model.confirmExport() }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("Logic Pro will export every track of the current project as one WAV file per track, using its own File \u{25B8} Export \u{25B8} All Tracks as Audio Files\u{2026} dialog. AI Mix Assistant drives that dialog into its audio folder automatically — don't touch Logic until the export starts. No mix settings are changed (only a level-rewriting Normalize is switched to Off), and your clipboard is restored afterwards.") }
+        .confirmationDialog("Bounce the mix from Logic Pro?", isPresented: $model.showBounceConfirm, titleVisibility: .visible) {
+            Button("Bounce") { model.confirmMixBounce() }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("Logic Pro will bounce the whole project (Stereo Out) using its own File \u{25B8} Bounce dialog. AI Mix Assistant drives that dialog into its mix folder automatically — don't touch Logic until the bounce starts. A realtime bounce plays the song once; only three things are ever changed — an enabled Cycle is switched off (so the whole project is bounced, not the cycle section), a level-rewriting Normalize is switched to Off, and the format table is set to PCM (Uncompressed) alone — nothing else, and your clipboard is restored afterwards.") }
+    }
+    /// One monospaced before/after row: LUFS, true peak and clipping, each side a real measurement or an honest "—".
+    private func deltaLabel(_ delta: MetricsDelta) -> String {
+        func number(_ value: Double?) -> String { value.map { var s = String(format: "%.1f", $0); if s.hasSuffix(".0") { s.removeLast(2) }; return s } ?? "—" }
+        let lufs = "LUFS \(number(delta.lufsBefore)) \u{2192} \(number(delta.lufsAfter))"
+        let peak = "TP \(number(delta.truePeakBefore)) \u{2192} \(number(delta.truePeakAfter)) dBTP"
+        let clipped = "clipped \(delta.clippedBefore.map(String.init) ?? "—") \u{2192} \(delta.clippedAfter.map(String.init) ?? "—")"
+        return "\(delta.label): \(lufs) · \(peak) · \(clipped)" + (delta.changed ? "" : " · unchanged file")
     }
     private func executionState(_ status: String) -> IndicatorState { switch status { case ExecutionStatus.executed: .ok; case ExecutionStatus.failed: .error; case ExecutionStatus.dryRun: .idle; default: .warn } }
     private func executionLabel(_ status: String) -> String { switch status { case ExecutionStatus.executed: "executed"; case ExecutionStatus.failed: "failed"; case ExecutionStatus.dryRun: "dry run — not written"; default: "not executed" } }
