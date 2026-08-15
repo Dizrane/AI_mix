@@ -20,19 +20,31 @@ enum FaderScale: Equatable, Sendable {
 /// The dB↔raw mapping for a raw-scale fader, built from measurements instead of a guessed formula: Logic documents no
 /// AXValue curve for its fader, so the only honest mapping is the one measured on the very control being written.
 /// `step` is a pure function deciding the next raw position from the (raw, displayed dB) pairs measured so far — a
-/// secant iteration on the measured points, bounded and capped — and it converges only when the control itself
-/// displays the target dB within tolerance. Every reading the caller feeds in must be a real re-read; the function
-/// never extrapolates a result it did not measure, and it gives up with a named reason instead of oscillating.
+/// secant iteration on the measured points, bounded — and it converges only when the control itself displays the
+/// target dB within tolerance. The live fader also CLAMPS each write to a small step toward the written value
+/// (observed ≈0.1 dB per write), so a long drive is many legitimate measurements: the give-up is progress-based —
+/// a stagnation window with no movement toward the target fails with a named reason — never a fixed write count.
+/// Every reading the caller feeds in must be a real re-read; the function never extrapolates a result it did not
+/// measure.
 struct FaderServoMath {
     enum Step: Equatable, Sendable { case converged; case move(raw: Double); case failed(reason: String) }
     /// The displayed level text quantizes to 0.1 dB, so two nearby raw positions can legally display the same dB; a
     /// slope is therefore computed only from a pair of points whose displayed values actually differ.
-    static func step(points: [(raw: Double, db: Double)], targetDB: Double, range: ClosedRange<Double>, tolerance: Double = 0.05, maxMeasurements: Int = 12) -> Step {
+    static func step(points: [(raw: Double, db: Double)], targetDB: Double, range: ClosedRange<Double>, tolerance: Double = 0.05, maxMeasurements: Int = 1200, stagnationWindow: Int = 8) -> Step {
         guard let last = points.last else { return .failed(reason: "no measurement was taken before stepping") }
         if abs(last.db - targetDB) <= tolerance { return .converged }
         let span = range.upperBound - range.lowerBound
         guard span > 0 else { return .failed(reason: "the slider reports an empty AXMinValue…AXMaxValue range") }
         if points.count >= maxMeasurements { return .failed(reason: "the fader did not reach \(targetDB) dB within \(maxMeasurements) verified measurements (last displayed value: \(last.db) dB)") }
+        // The live Logic fader applies each AXValue write only as a bounded step toward the written value (~0.1 dB per
+        // write), so a long drive is many legitimate measurements — the honest give-up is not a fixed count but the
+        // display no longer progressing toward the target.
+        if points.count > stagnationWindow {
+            let then = points[points.count - 1 - stagnationWindow].db
+            if abs(last.db - targetDB) > abs(then - targetDB) - tolerance {
+                return .failed(reason: "the fader stopped at \(last.db) dB without progressing toward \(targetDB) dB across \(stagnationWindow) verified measurements")
+            }
+        }
         let minimalMove = span * 0.001
         // A fader whose displayed dB never changed across real raw travel is not behaving like a fader — stop instead
         // of walking it further.
@@ -50,8 +62,11 @@ struct FaderServoMath {
             let maxJump = span * 0.25 // a locally flat curve must not fling the fader across its travel
             next = min(max(next, last.raw - maxJump), last.raw + maxJump)
             next = min(max(next, range.lowerBound), range.upperBound)
-            if abs(next - last.raw) <= minimalMove {
-                return .failed(reason: "the servo stalled at raw \(last.raw) (displayed \(last.db) dB) without reaching \(targetDB) dB — the target may lie outside the fader's travel")
+            // A correction smaller than minimalMove is still a real move — on a steep stretch of the curve the last
+            // 0.1 dB legitimately needs a tiny raw step, and a fader that cannot represent it stops progressing and
+            // fails by stagnation above. Only a fader pinned at a travel bound has nowhere left to go.
+            if next == last.raw {
+                return .failed(reason: "the servo cannot move past raw \(last.raw) (displayed \(last.db) dB) toward \(targetDB) dB — the target may lie outside the fader's travel")
             }
             return .move(raw: next)
         }
@@ -243,13 +258,13 @@ struct LogicChannelStripAdapter: LiveActionAdapter {
             // The pan facts (and the validator's −64…+63 range) come from this control's own AXValue, so the scale is
             // the fact scale by construction — but the write mechanism is still proven idempotently before moving it.
             if let refusal = proveIdempotentWrite(slider, value: before, read: { self.number(slider, kAXValueAttribute) }) { return failure(refusal, before: before) }
-            guard setNumber(slider, target) else { return failure("Writing the pan target over AXValue was rejected.", before: before) }
-            if let after = awaitValue(read: { self.number(slider, kAXValueAttribute) }, near: target) {
+            switch driveValue(slider, target: target, read: { self.number(slider, kAXValueAttribute) }) {
+            case .reached(let after):
                 return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(before), after: .number(after), error: nil)
+            case .failed(let reason):
+                let restored = driveValue(slider, target: before, read: { self.number(slider, kAXValueAttribute) }).succeeded
+                return failure("The pan write did not verify: \(reason). \(restored ? "The knob was restored to its original position \(before)." : "RESTORING the original position \(before) also failed — check the strip in Logic.")", before: before)
             }
-            let observed = number(slider, kAXValueAttribute)
-            let restored = setNumber(slider, before) && awaitValue(read: { self.number(slider, kAXValueAttribute) }, near: before) != nil
-            return failure("The pan control reads \(observed.map { String($0) } ?? "unreadable") after writing \(target) — the value did not verify. \(restored ? "The knob was restored to its original position \(before)." : "RESTORING the original position \(before) also failed — check the strip in Logic.")", before: before)
         }
     }
 
@@ -306,13 +321,13 @@ struct LogicChannelStripAdapter: LiveActionAdapter {
         if let stale = Self.stalenessRefusal(planCurrent: command.parameters["current"]?.numberValue, live: rawBefore, control: "Send level", unit: " (raw knob units)") { return failure(stale, before: rawBefore) }
         if abs(rawBefore - target) <= Self.tolerance { return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(rawBefore), after: .number(rawBefore), error: nil) }
         if let refusal = proveIdempotentWrite(knob, value: rawBefore, read: { self.number(knob, kAXValueAttribute) }) { return failure(refusal, before: rawBefore) }
-        guard setNumber(knob, target) else { return failure("Writing the send level target over AXValue was rejected.", before: rawBefore) }
-        if let after = awaitValue(read: { self.number(knob, kAXValueAttribute) }, near: target) {
+        switch driveValue(knob, target: target, read: { self.number(knob, kAXValueAttribute) }) {
+        case .reached(let after):
             return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(rawBefore), after: .number(after), error: nil)
+        case .failed(let reason):
+            let restored = driveValue(knob, target: rawBefore, read: { self.number(knob, kAXValueAttribute) }).succeeded
+            return failure("The send level write did not verify: \(reason). \(restored ? "The knob was restored to its original position \(rawBefore)." : "RESTORING the original position \(rawBefore) also failed — check the strip in Logic.")", before: rawBefore)
         }
-        let observed = number(knob, kAXValueAttribute)
-        let restored = setNumber(knob, rawBefore) && awaitValue(read: { self.number(knob, kAXValueAttribute) }, near: rawBefore) != nil
-        return failure("The send knob reads \(observed.map { String($0) } ?? "unreadable") after writing \(target) — the value did not verify. \(restored ? "The knob was restored to its original position \(rawBefore)." : "RESTORING the original position \(rawBefore) also failed — check the strip in Logic.")", before: rawBefore)
     }
 
     // MARK: The shared calibrated dB write (volume fader, dB-displaying send knob)
@@ -329,41 +344,80 @@ struct LogicChannelStripAdapter: LiveActionAdapter {
         // not move either. A slider that rejects or distorts its own current value gets no further writes.
         if let refusal = proveIdempotentWrite(slider, value: rawBefore, read: { self.number(slider, kAXValueAttribute) }) { return failure(refusal, before: dbBefore) }
         guard let dbAfterProof = displayedDB(), abs(dbAfterProof - dbBefore) <= Self.tolerance else { return failure("Re-writing the \(control)'s own value moved the displayed dB — the write mechanism is not idempotent, refusing to continue.", before: dbBefore) }
-        func rollback() -> Bool { setNumber(slider, rawBefore) && awaitValue(read: displayedDB, near: dbBefore) != nil }
         switch FaderScale.detect(sliderValue: rawBefore, displayedDB: dbBefore) {
         case .decibels:
-            guard setNumber(slider, target) else { return failure("Writing the target over AXValue was rejected.", before: dbBefore) }
-            if let after = awaitValue(read: displayedDB, near: target) { return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(dbBefore), after: .number(after), error: nil) }
-            let restored = rollback()
-            return failure("The \(control) displays \(displayedDB().map { String($0) } ?? "unreadable") dB after writing \(target) dB on the proven dB scale — the value did not verify. \(restored ? "The \(control) was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
+            switch driveValue(slider, target: target, read: displayedDB) {
+            case .reached(let after):
+                return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(dbBefore), after: .number(after), error: nil)
+            case .failed(let reason):
+                let restored = driveValue(slider, target: dbBefore, read: displayedDB).succeeded
+                return failure("The \(control) write on the proven dB scale did not verify: \(reason). \(restored ? "The \(control) was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
+            }
         case .raw:
             // Raw units (the real Logic shape: AXValue 173 at 0.0 dB). No guessed curve: the servo measures the
             // control itself, and it needs the slider's own bounds to keep every step inside the control's travel.
             guard let rawMin = number(slider, kAXMinValueAttribute), let rawMax = number(slider, kAXMaxValueAttribute), rawMin < rawMax else {
                 return failure("The \(control)'s AXValue (\(rawBefore)) is not the displayed dB (\(dbBefore)) and the slider exposes no AXMinValue/AXMaxValue to calibrate against — the scale is unproven, refusing to write.", before: dbBefore)
             }
-            var points: [(raw: Double, db: Double)] = [(rawBefore, dbBefore)]
-            while true {
-                switch FaderServoMath.step(points: points, targetDB: target, range: rawMin...rawMax, tolerance: Self.tolerance) {
-                case .converged:
-                    return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(dbBefore), after: .number(points[points.count - 1].db), error: nil)
-                case .failed(let reason):
-                    let restored = rollback()
-                    return failure("Calibrated \(control) write failed: \(reason). \(restored ? "The \(control) was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
-                case .move(let raw):
-                    guard setNumber(slider, raw) else {
-                        let restored = rollback()
-                        return failure("Writing raw \(raw) over AXValue was rejected mid-calibration. \(restored ? "The \(control) was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
-                    }
-                    usleep(120_000)
-                    guard let rawNow = number(slider, kAXValueAttribute), let dbNow = displayedDB() else {
-                        let restored = rollback()
-                        return failure("The \(control) stopped reading back mid-calibration. \(restored ? "The \(control) was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
-                    }
-                    points.append((rawNow, dbNow))
+            switch servoDrive(slider, displayed: displayedDB, target: target, range: rawMin...rawMax) {
+            case .reached(let after):
+                return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(dbBefore), after: .number(after), error: nil)
+            case .failed(let reason):
+                // The rollback drives the fader back with the same measured servo — a single write is only one
+                // clamped step on the live Logic fader and would strand the control between the two positions.
+                let restored = servoDrive(slider, displayed: displayedDB, target: dbBefore, range: rawMin...rawMax).succeeded
+                return failure("Calibrated \(control) write failed: \(reason). \(restored ? "The \(control) was restored to \(dbBefore) dB." : "RESTORING \(dbBefore) dB also failed — check the strip in Logic.")", before: dbBefore)
+            }
+        }
+    }
+
+    /// Drives a raw-scale fader to the target displayed dB with the measured servo, re-reading BOTH the raw value and
+    /// the displayed dB after every write: the live Logic fader applies each write only as a bounded step toward the
+    /// written value, so the loop trusts nothing but the re-read pair, and `FaderServoMath` decides every next raw —
+    /// giving up with a named reason when the display stops progressing instead of walking forever.
+    private func servoDrive(_ slider: AXUIElement, displayed displayedDB: () -> Double?, target: Double, range: ClosedRange<Double>) -> DriveOutcome {
+        guard let raw0 = number(slider, kAXValueAttribute), let db0 = displayedDB() else { return .failed("the fader stopped reading back before the drive") }
+        var points: [(raw: Double, db: Double)] = [(raw0, db0)]
+        while true {
+            switch FaderServoMath.step(points: points, targetDB: target, range: range, tolerance: Self.tolerance) {
+            case .converged: return .reached(points[points.count - 1].db)
+            case .failed(let reason): return .failed(reason)
+            case .move(let raw):
+                guard setNumber(slider, raw) else { return .failed("writing raw \(raw) over AXValue was rejected mid-calibration") }
+                usleep(120_000)
+                guard let rawNow = number(slider, kAXValueAttribute), let dbNow = displayedDB() else { return .failed("the fader stopped reading back mid-calibration") }
+                points.append((rawNow, dbNow))
+            }
+        }
+    }
+
+    private enum DriveOutcome {
+        case reached(Double), failed(String)
+        var succeeded: Bool { if case .reached = self { return true }; return false }
+    }
+    /// Drives a control whose AXValue IS the fact scale (pan, a dB-proven fader, a raw send knob) to the target,
+    /// tolerating Logic's write clamping: the live controls apply each AXValue write only as a bounded step toward the
+    /// written value, so the write is repeated and every round re-read — success is only ever the control itself
+    /// reading the target within tolerance. A round that makes no progress toward the target for a whole stagnation
+    /// window fails with a named reason instead of looping.
+    private func driveValue(_ element: AXUIElement, target: Double, read: () -> Double?, stagnationWindow: Int = 8, maxWrites: Int = 1200) -> DriveOutcome {
+        guard let start = read() else { return .failed("the control's value stopped reading back before the drive") }
+        var readings: [Double] = [start]
+        while readings.count <= maxWrites {
+            let last = readings[readings.count - 1]
+            if abs(last - target) <= Self.tolerance { return .reached(last) }
+            guard setNumber(element, target) else { return .failed("writing \(target) over AXValue was rejected mid-drive") }
+            usleep(120_000)
+            guard let now = read() else { return .failed("the control's value stopped reading back mid-drive") }
+            readings.append(now)
+            if readings.count > stagnationWindow {
+                let then = readings[readings.count - 1 - stagnationWindow]
+                if abs(now - target) > abs(then - target) - Self.tolerance {
+                    return .failed("the control stopped at \(now) without progressing toward \(target) across \(stagnationWindow) consecutive writes")
                 }
             }
         }
+        return .failed("the control did not reach \(target) within \(maxWrites) verified writes (last reading: \(readings[readings.count - 1]))")
     }
 
     // MARK: Mechanism proof and small AX helpers
@@ -376,15 +430,6 @@ struct LogicChannelStripAdapter: LiveActionAdapter {
         guard setNumber(element, value) else { return "Writing the control's own current value back was rejected — the write mechanism is unproven, refusing to continue." }
         usleep(120_000)
         guard let after = read(), abs(after - value) <= max(Self.tolerance, abs(value) * 0.001) else { return "Re-writing the control's own value changed its reading — the write mechanism is not idempotent, refusing to continue." }
-        return nil
-    }
-    /// Polls a re-read until it lands within tolerance of `expected`; nil when it never does within the deadline.
-    private func awaitValue(read: () -> Double?, near expected: Double, timeout: TimeInterval = 2) -> Double? {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            usleep(100_000)
-            if let value = read(), abs(value - expected) <= Self.tolerance { return value }
-        }
         return nil
     }
     private enum ControlResolution { case resolved(AXUIElement), failed(String) }

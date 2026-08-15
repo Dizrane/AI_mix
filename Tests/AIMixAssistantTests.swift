@@ -1664,7 +1664,7 @@ private func logicLikeCurve(_ raw: Double) -> Double {
         let run = runServo(targetDB: target, curve: logicLikeCurve)
         #expect(run.outcome == .converged, "target \(target) dB did not converge: \(run.outcome)")
         #expect(abs(run.points[run.points.count - 1].db - target) <= 0.05)
-        #expect(run.points.count <= 12) // within the adapter's measurement budget
+        #expect(run.points.count <= 12) // an unclamped fader converges in a handful of measurements
         #expect(run.points.allSatisfy { (0.0...255.0).contains($0.raw) }) // every written value stays inside the fader's travel
     }
 }
@@ -1677,6 +1677,43 @@ private func logicLikeCurve(_ raw: Double) -> Double {
     let run = runServo(targetDB: 20, curve: logicLikeCurve) // +20 dB lies above the fader's +6 dB ceiling
     guard case .failed = run.outcome else { #expect(Bool(false), "an unreachable target must fail, got \(run.outcome)"); return }
     #expect(run.points.allSatisfy { (0.0...255.0).contains($0.raw) })
+}
+/// The live Logic fader applies each AXValue write only as a bounded step toward the written value — the real run
+/// moved 0.1 dB per write and the old fixed 12-measurement budget stranded a −7 dB move at −1.1 dB. The servo must
+/// drive a clamped fader all the way: steady progress is never a failure, however many measurements it takes.
+@Test func faderServoDrivesAWriteClampedFaderAllTheWay() {
+    var position = 173.0
+    var points: [(raw: Double, db: Double)] = [(position, logicLikeCurve(position))]
+    for _ in 0..<2000 {
+        switch FaderServoMath.step(points: points, targetDB: -20, range: 0...255) {
+        case .converged:
+            #expect(abs(points[points.count - 1].db - (-20)) <= 0.05)
+            #expect(points.count > 12) // the clamped drive genuinely needs more than the old fixed budget
+            return
+        case .failed(let reason):
+            #expect(Bool(false), "a steadily progressing clamped fader must never fail: \(reason)"); return
+        case .move(let raw):
+            position += max(-0.35, min(0.35, raw - position)) // Logic clamps each write to one small step toward the value
+            points.append((position, logicLikeCurve(position)))
+        }
+    }
+    #expect(Bool(false), "the servo did not converge on the clamped fader")
+}
+/// A fader that swallows writes entirely (the re-read never moves) must fail by stagnation with a named reason —
+/// the honest give-up that replaced the fixed measurement budget.
+@Test func faderServoGivesUpWhenTheFaderStopsProgressing() {
+    var points: [(raw: Double, db: Double)] = [(173, -4.5)]
+    for _ in 0..<2000 {
+        switch FaderServoMath.step(points: points, targetDB: -20, range: 0...255) {
+        case .converged: #expect(Bool(false), "a write-swallowing fader must never converge"); return
+        case .failed(let reason):
+            #expect(reason.contains("without progressing toward"))
+            #expect(points.count <= 12) // stagnation is detected within a short window, not after a long walk
+            return
+        case .move: points.append((173, -4.5)) // every write is ignored: the re-read pair never changes
+        }
+    }
+    #expect(Bool(false), "the servo walked a dead fader forever")
 }
 @Test func stripGrammarMatchesWholeCaptionsAndParsesLogicNumbers() {
     #expect(StripControlGrammar.matches("mute", "mute") && StripControlGrammar.matches(" Pan ", "pan"))
