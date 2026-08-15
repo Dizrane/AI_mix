@@ -106,6 +106,14 @@ struct LogicChannelStripAdapter: LiveActionAdapter {
     private let supportedBundleIDs: Set<String> = ["com.apple.logic10", "com.apple.mobilelogic"]
     /// One tolerance across the product: the validator's 0.05, matching the 0.1 precision Logic's controls display.
     static let tolerance = 0.05
+    /// The plan's direction proof (`parameters.current`) was validated against the snapshot; before a live write the
+    /// same number must still match the control's own live reading — a project that drifted since the analysis
+    /// silently invalidates every delta and reason the model argued with, so the write is refused instead of applied
+    /// to a state nobody reasoned about. Returns nil when the plan carries no `current` or the reading still matches.
+    static func stalenessRefusal(planCurrent: Double?, live: Double, control: String, unit: String) -> String? {
+        guard let planCurrent, abs(planCurrent - live) > tolerance else { return nil }
+        return "\(control) reads \(live)\(unit) live but the plan's parameters.current says \(planCurrent)\(unit) — the project changed since the analysis. Rescan and validate the plan again."
+    }
 
     func supports(_ action: MixAction) -> Bool { supportedActions.contains(action) }
 
@@ -229,6 +237,7 @@ struct LogicChannelStripAdapter: LiveActionAdapter {
         case .failed(let reason): return failure(reason)
         case .resolved(let slider):
             guard let before = number(slider, kAXValueAttribute) else { return failure("The pan control's AXValue does not read as a number.") }
+            if let stale = Self.stalenessRefusal(planCurrent: command.parameters["current"]?.numberValue, live: before, control: "Pan", unit: "") { return failure(stale, before: before) }
             if abs(before - target) <= Self.tolerance { return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(before), after: .number(before), error: nil) }
             // The pan facts (and the validator's −64…+63 range) come from this control's own AXValue, so the scale is
             // the fact scale by construction — but the write mechanism is still proven idempotently before moving it.
@@ -258,6 +267,7 @@ struct LogicChannelStripAdapter: LiveActionAdapter {
         func displayedDB() -> Double? { StripControlGrammar.decimal(string(level, kAXTitleAttribute) ?? string(level, kAXValueAttribute)) }
         guard let rawBefore = number(slider, kAXValueAttribute) else { return failure("The volume fader's AXValue does not read as a number.") }
         guard let dbBefore = displayedDB() else { return failure("The strip's \u{2018}volume fader level\u{2019} text does not read as a dB number.") }
+        if let stale = Self.stalenessRefusal(planCurrent: command.parameters["current"]?.numberValue, live: dbBefore, control: "Volume", unit: " dB") { return failure(stale, before: dbBefore) }
         if abs(dbBefore - target) <= Self.tolerance { return .init(actionID: command.id, status: ExecutionStatus.executed, before: .number(dbBefore), after: .number(dbBefore), error: nil) }
         // Mechanism proof before the first real write: read → set(the same value) → read, and the displayed dB must
         // not move either. A slider that rejects or distorts its own current value gets no further writes.

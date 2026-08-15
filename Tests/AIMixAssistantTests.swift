@@ -1685,6 +1685,15 @@ private func logicLikeCurve(_ raw: Double) -> Double {
     #expect(StripControlGrammar.decimal("volume fader level, -1,5 dB") == -1.5) // comma decimals, caption noise ignored
     #expect(StripControlGrammar.boolValue("on") == true && StripControlGrammar.boolValue("0") == false && StripControlGrammar.boolValue("maybe") == nil)
 }
+/// The plan's `parameters.current` was validated against the snapshot; a live control that no longer reads that value
+/// means the project drifted since the analysis, and the write is refused instead of applied to an unreasoned state.
+@Test func liveWriteRefusesAStalePlanCurrent() {
+    #expect(LogicChannelStripAdapter.stalenessRefusal(planCurrent: -1.0, live: -1.04, control: "Volume", unit: " dB") == nil) // within the product tolerance
+    #expect(LogicChannelStripAdapter.stalenessRefusal(planCurrent: nil, live: 5, control: "Pan", unit: "") == nil) // a plan without a current states no proof to defend
+    let refusal = LogicChannelStripAdapter.stalenessRefusal(planCurrent: -1.0, live: -3.0, control: "Volume", unit: " dB")
+    #expect(refusal?.contains("the project changed since the analysis") == true)
+    #expect(refusal?.contains("Rescan and validate the plan again") == true)
+}
 @Test func packageDescribesLiveExecutionHonestly() {
     for delivery in [PackageDelivery.markdownOnly, .fullPackage] {
         let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: delivery)
