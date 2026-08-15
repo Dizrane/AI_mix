@@ -512,7 +512,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.22`"))
+    #expect(md.contains("Package schema: `2.23`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -586,10 +586,48 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(plan.version == "1.0")
     #expect(plan.status == "ready") // the example must model the documented contract, not a drifted status caption
     #expect(plan.actions.allSatisfy { !$0.reason.isEmpty })
-    // The printed example must survive the app's own validator end to end (fixture has no "track_2", so retarget).
-    var retargeted = plan
-    retargeted.actions = plan.actions.map { action in var a = action; a.target.trackID = "channel_aux_1"; return a }
-    #expect(CommandValidator().validate(retargeted, against: fixture()).allSatisfy { $0.status == .valid })
+    // The printed example is built from the snapshot's own facts, so it must survive the app's validator against that
+    // same snapshot as is — no retargeting, exactly like a model that copied it.
+    #expect(CommandValidator().validate(plan, against: fixture()).allSatisfy { $0.status == .valid })
+}
+/// Models copy the example verbatim, so it must target a real track from the same document with its real current values —
+/// a placeholder id validates only as requires_probe. A snapshot without a known Volume+Pan track cannot fabricate current
+/// values, so the static example remains as the fallback there.
+@Test func packageExampleTargetsARealTrackAndValidatesAgainstTheSameSnapshot() throws {
+    let snapshot = fixture()
+    let md = AIPackageGenerator().make(snapshot: snapshot, sessionID: "t")
+    let json = try #require(md.components(separatedBy: "```json").last?.components(separatedBy: "```").first)
+    #expect(!json.contains("track_2"))
+    let plan = try JSONDecoder().decode(MixPlan.self, from: Data(json.utf8))
+    #expect(plan.actions.count == 2)
+    #expect(plan.actions.allSatisfy { $0.target.trackID == "channel_aux_1" }) // the fixture's one known Volume+Pan track
+    let validated = CommandValidator().validate(plan, against: snapshot)
+    #expect(validated.allSatisfy { $0.status == .valid }, "\(validated.map { "\($0.id): \($0.status.rawValue) — \($0.message)" })")
+    let fallback = AIPackageGenerator().make(snapshot: normalize(headers: [headerNode("h1", "Track 1 “Vox”")], strips: []), sessionID: "t")
+    #expect(fallback.contains("\"trackID\": \"track_2\""))
+}
+/// `reason` is the one human-readable field inside the JSON — the Review screen shows it to the user under each action —
+/// so the blanket "JSON stays English" rule needs an explicit exception in both places the document teaches the format,
+/// or models keep writing user-facing justifications in English.
+@Test func packageTeachesReasonInTheUsersLanguage() {
+    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t")
+    #expect(md.contains("with ONE exception inside the JSON: each action's `reason` is written in the user's language"))
+    #expect(md.contains("Write `reason` in the language the user writes to you in"))
+    #expect(md.contains("stays exactly as this document states them"))
+}
+/// A cold model without hearing reported "checked all 10 WAVs" and never said it cannot listen. The declaration is now
+/// structural in BOTH deliveries: the first paragraph of ANALYSIS must open with one explicit audio-mode line, and the
+/// markdown-only delivery's line must state working from the measurements — "checked the files" does not count.
+@Test func packageRequiresAnAudioModeDeclarationInBothDeliveries() {
+    let full = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
+    #expect(full.contains("open the first paragraph of the ANALYSIS section with one explicit line declaring your audio mode"))
+    #expect(full.contains("\u{201C}I checked the files\u{201D} is NOT such a declaration"))
+    #expect(full.contains("its FIRST paragraph opens with the one-line audio-mode declaration required above (you listened to the files, or you cannot listen and work from the measurements and facts)"))
+    let markdown = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .markdownOnly)
+    #expect(markdown.contains("open the first paragraph of the ANALYSIS section with one explicit line stating that the audio was not delivered"))
+    #expect(markdown.contains("\u{201C}I checked the files\u{201D} is NOT such a declaration"))
+    #expect(markdown.contains("its FIRST paragraph opens with the one-line audio-mode declaration required above (the audio was not delivered — you work from the measured metrics and written facts)"))
+    #expect(!markdown.contains("declaring your audio mode — either that you actually listened")) // the markdown delivery never offers a listening mode
 }
 /// `parameters.current` mismatches are transcription errors: the values sit scattered across long per-track sections, so
 /// the model retypes them wrong and the validator rejects the plan. The package must collect them into one table the model
@@ -1311,7 +1349,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.22`"))
+    #expect(md.contains("Package schema: `2.23`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
