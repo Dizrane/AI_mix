@@ -7,7 +7,8 @@ import SwiftUI
 
 // MARK: - Workflow model
 
-/// Only stages with a working backend are exposed. Execution / verification are not shown until a live Logic adapter exists.
+/// Only stages with a working backend are exposed. Execution lives inside Review: the validated plan can be dry-run
+/// (default, writes nothing) or executed LIVE through the verified channel-strip adapter after explicit confirmation.
 enum WorkflowStage: Int, CaseIterable, Identifiable {
     case connection, analysis, audio, aiPackage, review
     var id: Int { rawValue }
@@ -468,7 +469,7 @@ struct PackageScreen: View {
 struct ReviewScreen: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
-        Screen(title: "Review", subtitle: "Paste the MixPlan JSON returned by your LLM. It is validated against the current snapshot — nothing is written to Logic Pro.") {
+        Screen(title: "Review", subtitle: "Paste the MixPlan JSON returned by your LLM. It is validated against the current snapshot; nothing is written to Logic Pro unless you explicitly execute valid actions in LIVE mode below.") {
             Card {
                 Text("MixPlan JSON").font(.headline)
                 TextEditor(text: $model.planText).font(.system(.callout, design: .monospaced)).frame(minHeight: 150).padding(6)
@@ -494,8 +495,72 @@ struct ReviewScreen: View {
                     }
                 }
             }
-            Text("Live execution is not available in this build. AI Mix Assistant validates and previews the plan only; it never modifies Logic Pro. A validated plan is your instruction sheet: apply each action in Logic by hand — the value shown is the absolute target setting — together with the MANUAL STEPS from the model's reply.").font(.caption).foregroundStyle(.secondary)
+            if !model.validated.isEmpty {
+                Card {
+                    Text("Execution").font(.headline)
+                    Text("DRY RUN (default) writes nothing — it only shows which actions would reach the live adapters. LIVE really moves Logic's own controls, but only the four verified channel-strip actions (volume, pan, mute, solo), only actions the validator marked valid, and every write is calibrated against the strip's own displayed value, re-read afterwards and rolled back if it does not verify. Everything else — plug-ins, sends, MANUAL STEPS — is still applied by hand.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 12) {
+                        Picker("Mode", selection: $model.executionMode) {
+                            Text("DRY RUN").tag(OperationMode.dryRun)
+                            Text("LIVE").tag(OperationMode.live)
+                        }.pickerStyle(.segmented).frame(width: 220).labelsHidden().disabled(model.executionRunning)
+                        Button(model.executionMode == .live ? "Execute in Logic" : "Run Dry Run") { model.requestExecution() }
+                            .buttonStyle(.borderedProminent).tint(model.executionMode == .live ? .red : .accentColor)
+                            .disabled(model.executionRunning || model.validExecutableActions == 0)
+                        if model.executionRunning { ProgressView().controlSize(.small) }
+                    }
+                    if !model.executionStatus.isEmpty { Text(model.executionStatus).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+                    if !model.executionResults.isEmpty {
+                        Divider()
+                        ForEach(model.executionResults) { result in
+                            HStack(spacing: 10) {
+                                StatusDot(state: executionState(result.status))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text([result.actionID, executionLabel(result.status), readback(result)].compactMap { $0 }.joined(separator: " · ")).font(.system(size: 13, weight: .medium))
+                                    if let error = result.error { Text(error).font(.caption).foregroundStyle(.secondary) }
+                                }
+                                Spacer()
+                            }
+                            if result.id != model.executionResults.last?.id { Divider() }
+                        }
+                    }
+                }
+                if let diff = model.executionDiff {
+                    Card {
+                        Text("After execution — fresh scan").font(.headline)
+                        Text("A new read-only scan was compared against the snapshot this plan was validated with.").font(.caption).foregroundStyle(.secondary)
+                        StatusRow("Changed", diff.changed.isEmpty ? "No tracks changed" : "\(diff.changed.count)", diff.changed.isEmpty ? .idle : .ok)
+                        ForEach(diff.changed, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
+                        Divider()
+                        StatusRow("Unchanged", "\(diff.unchanged.count) tracks", .idle)
+                        if !diff.errors.isEmpty {
+                            Divider()
+                            ForEach(diff.errors, id: \.self) { Label($0, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.red) }
+                        }
+                    }
+                }
+            }
+            Text("The Review screen validates the plan against the current snapshot; LIVE execution covers only the four verified channel-strip actions after your explicit confirmation, with DRY RUN as the default. The validated plan together with the MANUAL STEPS from the model's reply remains your instruction sheet for everything the adapters do not cover — the value shown is the absolute target setting.").font(.caption).foregroundStyle(.secondary)
         }
+        .alert("Execute the plan in Logic Pro?", isPresented: $model.showLiveConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Execute LIVE", role: .destructive) { model.confirmLiveExecution() }
+        } message: { Text("LIVE mode will really change \(model.validExecutableActions) control value\(model.validExecutableActions == 1 ? "" : "s") in Logic Pro (volume, pan, mute or solo only). Every write is verified by re-reading the control and rolled back when it does not verify; a failed action halts the rest of the queue. A fresh scan afterwards shows what actually changed. Actions the validator did not mark valid are never executed.") }
+    }
+    private func executionState(_ status: String) -> IndicatorState { switch status { case ExecutionStatus.executed: .ok; case ExecutionStatus.failed: .error; case ExecutionStatus.dryRun: .idle; default: .warn } }
+    private func executionLabel(_ status: String) -> String { switch status { case ExecutionStatus.executed: "executed"; case ExecutionStatus.failed: "failed"; case ExecutionStatus.dryRun: "dry run — not written"; default: "not executed" } }
+    /// The adapter's own re-read values around the write: "before → after" for numbers, on/off for switches.
+    private func readback(_ result: ExecutionResult) -> String? {
+        func text(_ value: JSONValue?) -> String? {
+            switch value {
+            case .number(let n): var s = String(format: "%.1f", n); if s.hasSuffix(".0") { s.removeLast(2) }; return s
+            case .bool(let b): return b ? "on" : "off"
+            default: return nil
+            }
+        }
+        guard let before = text(result.before) else { return nil }
+        guard let after = text(result.after) else { return before }
+        return before == after ? "already \(after)" : "\(before) \u{2192} \(after)"
     }
     private func targetLabel(_ target: CommandTarget) -> String {
         var parts = [target.trackName ?? target.trackID ?? "—"]
