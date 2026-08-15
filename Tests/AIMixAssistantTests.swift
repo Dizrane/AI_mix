@@ -512,7 +512,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.21`"))
+    #expect(md.contains("Package schema: `2.22`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
     #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
@@ -616,6 +616,24 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     // model resolves by guessing; the validator cannot catch a guessed `current` when no known fact exists to compare.
     #expect(md.contains("Ask in QUESTIONS for the value Logic's channel strip shows"))
     #expect(md.contains("the user's answer then becomes `parameters.current`"))
+}
+/// Compliance with a long instruction document dies in two known places: the model drafts a plan in its first reply
+/// (skipping the user's confirmation), and requirements buried mid-document get dropped from the final answer. The
+/// package must fix both structurally — an explicit two-reply protocol, and a final self-check list that mirrors
+/// exactly what the stage-5 validator rejects, placed after the JSON example as the last thing the model reads.
+@Test func packageFixesTwoReplyProtocolAndPreDeliveryChecklist() throws {
+    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t")
+    #expect(md.contains("your FIRST reply delivers stages 1–4 only and contains NO `MIX PLAN` JSON block"))
+    #expect(md.contains("deliver stage 6 alone"))
+    #expect(md.contains("the plan follows the answers, not your earlier defaults"))
+    #expect(md.contains("### Pre-delivery checklist (stage 6)"))
+    #expect(md.contains("the sign of `delta` matches the direction the `reason` states"))
+    #expect(md.contains("never a LUFS/RMS/peak measurement"))
+    #expect(md.contains("no trailing commas, every number a plain JSON number"))
+    // The checklist sits after the example fence but must not break the extraction the schema tests (and users' pastes) rely on:
+    // the example JSON stays the document's last fenced json block and still decodes.
+    let json = try #require(md.components(separatedBy: "```json").last?.components(separatedBy: "```").first)
+    #expect((try? JSONDecoder().decode(MixPlan.self, from: Data(json.utf8))) != nil)
 }
 /// The golden path between stage 4 and stage 5: a reply written exactly as the generated package instructs — prose around
 /// a `MIX PLAN` fenced JSON block plus MANUAL STEPS, with `current` copied from the package's own table — pastes into the
@@ -1293,7 +1311,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.21`"))
+    #expect(md.contains("Package schema: `2.22`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
