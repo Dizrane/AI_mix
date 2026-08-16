@@ -12,6 +12,7 @@ struct Fact<Value: Codable & Sendable>: Codable, Sendable {
     static func known(_ value: Value, source: String? = nil) -> Self { .init(state: .known, value: value, source: source) }
     static var unavailable: Self { .init(state: .unavailable, value: nil, source: nil) }
 }
+extension Fact: Equatable where Value: Equatable {}
 
 struct RawAccessibilityNode: Codable, Identifiable, Sendable {
     var id: String; var role: String; var subrole: String?; var title: String?; var description: String?; var value: String?; var enabled: Bool?; var position: String?; var size: String?; var supportedAttributes: [String]; var parameterizedAttributes: [String]; var actions: [String]; var children: [RawAccessibilityNode]
@@ -116,8 +117,8 @@ struct LinkingDiagnostics: Codable, Sendable {
     var trackHeaderCandidates: Int; var channelCandidates: Int; var confirmedLinks: Int; var unresolvedHeaders: Int; var unresolvedChannels: Int; var ambiguous: Int; var logicalTracks: Int
     static let empty = LinkingDiagnostics(trackHeaderCandidates: 0, channelCandidates: 0, confirmedLinks: 0, unresolvedHeaders: 0, unresolvedChannels: 0, ambiguous: 0, logicalTracks: 0)
 }
-struct PluginFacts: Codable, Identifiable, Sendable { var id: String; var slot: Int; var name: Fact<String>; var manufacturer: Fact<String>; var bypass: Fact<Bool>; var parameters: [PluginParameter] }
-struct PluginParameter: Codable, Identifiable, Sendable { var id: String; var name: String; var value: Fact<Double>; var range: ClosedRange<Double>?; var unit: String? }
+struct PluginFacts: Codable, Identifiable, Equatable, Sendable { var id: String; var slot: Int; var name: Fact<String>; var manufacturer: Fact<String>; var bypass: Fact<Bool>; var parameters: [PluginParameter] }
+struct PluginParameter: Codable, Identifiable, Equatable, Sendable { var id: String; var name: String; var value: Fact<Double>; var range: ClosedRange<Double>?; var unit: String? }
 /// The KIND of a routing destination, derived from the caption grammar Logic itself uses for routing slots — the same
 /// patterns the routing classifier accepts as destinations. "Bus N" is an internal bus; "St Out" / "Stereo Out(put)" the
 /// project's stereo output; "Output" / "Output N(-M)" a hardware output (pair); "Input N(-M)" a hardware input;
