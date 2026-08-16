@@ -1696,6 +1696,151 @@ private func logicLikeCurve(_ raw: Double) -> Double {
     guard case .failed = run.outcome else { #expect(Bool(false), "an unreachable target must fail, got \(run.outcome)"); return }
     #expect(run.points.allSatisfy { (0.0...255.0).contains($0.raw) })
 }
+/// The live Logic fader applies each AXValue write only as one bounded step toward the written value (the real
+/// Stereo Out run moved ≈0.1 dB per write), so the old fixed 12-measurement budget stranded every real move partway.
+/// Steady progress is never a failure: the servo must drive a clamped fader all the way, however long it takes.
+@Test func faderServoDrivesAWriteClampedFaderAllTheWay() {
+    var position = 173.0
+    var points: [(raw: Double, db: Double)] = [(position, logicLikeCurve(position))]
+    for _ in 0..<2000 {
+        switch FaderServoMath.step(points: points, targetDB: -20, range: 0...255) {
+        case .converged:
+            #expect(abs(points[points.count - 1].db - (-20)) <= 0.05)
+            #expect(points.count > 12) // the clamped drive genuinely needs more than the old fixed budget
+            #expect(points.allSatisfy { (0.0...255.0).contains($0.raw) })
+            return
+        case .failed(let reason):
+            #expect(Bool(false), "a steadily progressing clamped fader must never fail: \(reason)"); return
+        case .move(let raw):
+            position += max(-0.35, min(0.35, raw - position)) // Logic clamps each write to one small step toward the value
+            points.append((position, logicLikeCurve(position)))
+        }
+    }
+    #expect(Bool(false), "the servo did not converge on the clamped fader")
+}
+/// A fader that swallows writes entirely (the re-read pair never moves) must fail by stagnation with a named reason —
+/// the honest, progress-based give-up that replaced the fixed measurement budget.
+@Test func faderServoGivesUpWhenTheFaderStopsProgressing() {
+    var points: [(raw: Double, db: Double)] = [(173, -4.5)]
+    for _ in 0..<2000 {
+        switch FaderServoMath.step(points: points, targetDB: -20, range: 0...255) {
+        case .converged: #expect(Bool(false), "a write-swallowing fader must never converge"); return
+        case .failed(let reason):
+            #expect(reason.contains("without progressing toward"))
+            #expect(points.count <= 25) // stagnation is detected within a short window, not after a long walk
+            return
+        case .move: points.append((173, -4.5)) // every write is ignored: the re-read pair never changes
+        }
+    }
+    #expect(Bool(false), "the servo walked a dead fader forever")
+}
+
+/// A live-Logic-shaped fake slider for the calibrated write engine: every write lands only as one bounded raw step
+/// toward the written value (the clamping the real Stereo Out fader showed), the display comes through a quantizing
+/// curve, and every write is recorded — so a test can prove not just the outcome but what the algorithm really did.
+private final class FakeClampedFader {
+    var raw: Double
+    let clampPerWrite: Double
+    let range: ClosedRange<Double>
+    let curve: (Double) -> Double
+    var writes: [Double] = []
+    /// Writes beyond this count are accepted but ignored — the control freezes mid-drive.
+    var freezeAfter: Int? = nil
+    /// A displacement Logic adds when re-applying a write — set on the FIRST write only, it makes the idempotent
+    /// mechanism proof itself move the control, exactly the clamping fact the engine must survive.
+    var firstWriteOffset = 0.0
+    init(raw: Double, clampPerWrite: Double = 0.35, range: ClosedRange<Double> = 0...255, curve: @escaping (Double) -> Double = logicLikeCurve) {
+        self.raw = raw; self.clampPerWrite = clampPerWrite; self.range = range; self.curve = curve
+    }
+    var displayedDB: Double { curve(raw) }
+    func io(displayIsRaw: Bool = false) -> SliderWriteIO {
+        .init(readRaw: { self.raw },
+              readDisplay: { displayIsRaw ? self.raw : self.displayedDB },
+              write: { value in
+                  self.writes.append(value)
+                  if let freezeAfter = self.freezeAfter, self.writes.count > freezeAfter { return true }
+                  let offset = self.writes.count == 1 ? self.firstWriteOffset : 0
+                  let landing = min(max(value + offset, self.range.lowerBound), self.range.upperBound)
+                  self.raw += min(max(landing - self.raw, -self.clampPerWrite), self.clampPerWrite)
+                  return true
+              },
+              isSettable: { true },
+              bounds: { self.range },
+              settle: {})
+    }
+    func volumeWriter(displayIsRaw: Bool = false) -> CalibratedSliderWriter {
+        .init(io: io(displayIsRaw: displayIsRaw), control: "volume fader", stalenessControl: "Volume", unit: " dB")
+    }
+}
+/// The acceptance scenario of the live bug: Stereo Out at 0.0 dB, plan current 0.0 / value −2.0, a raw-scale fader
+/// that clamps every write. The write must provably reach −2.0 on the control's own display — the old fixed budget
+/// stranded it at −1.1 dB and a single-write rollback left it at −1.0.
+@Test func clampedRawFaderIsDrivenAllTheWayToTheTarget() {
+    let fader = FakeClampedFader(raw: 193.2) // logicLikeCurve(193.2) displays 0.0 dB
+    let outcome = fader.volumeWriter().write(target: -2.0, planCurrent: 0.0)
+    guard case .executed(let before, let after) = outcome else { #expect(Bool(false), "the clamped drive must succeed, got \(outcome)"); return }
+    #expect(before == 0.0)
+    #expect(abs(after - (-2.0)) <= 0.05)
+    #expect(abs(fader.displayedDB - (-2.0)) <= 0.05) // the control itself, not just the report
+    #expect(fader.writes.count > 12) // genuinely more writes than the old budget allowed
+}
+/// The staleness gate must fire BEFORE anything touches the control — the mechanism proof included. A drifted
+/// project is refused with zero writes, so repeated runs can never nudge the fader.
+@Test func stalenessRefusesBeforeAnyWriteTouchesTheControl() {
+    let fader = FakeClampedFader(raw: 193.2) // displays 0.0 dB
+    let outcome = fader.volumeWriter().write(target: -2.0, planCurrent: -7.0)
+    guard case .refused(let before, let message) = outcome else { #expect(Bool(false), "a drifted project must be refused, got \(outcome)"); return }
+    #expect(before == 0.0)
+    #expect(message.contains("the project changed since the analysis"))
+    #expect(fader.writes.isEmpty) // nothing was written, not even the mechanism proof
+}
+/// A refused write must end with the fader PROVABLY back at its original displayed dB: the rollback is driven with
+/// the same clamped-write discipline and verified by re-reading — never the single write that stranded the real
+/// Stereo Out fader at −1.0 dB.
+@Test func aRefusedWriteDrivesTheFaderBackToTheOriginalDisplayedDB() {
+    let fader = FakeClampedFader(raw: 193.2, range: 190...255) // the travel floor (≈−0.6 dB) makes −2.0 unreachable
+    let outcome = fader.volumeWriter().write(target: -2.0, planCurrent: 0.0)
+    guard case .refused(let before, let message) = outcome else { #expect(Bool(false), "an unreachable target must refuse, got \(outcome)"); return }
+    #expect(before == 0.0)
+    #expect(message.contains("Calibrated volume fader write failed"))
+    #expect(message.contains("was restored to 0.0 dB"))
+    #expect(abs(fader.displayedDB - 0.0) <= 0.05) // the control really is back, not just reported back
+}
+/// When even the driven rollback cannot move the control (it froze mid-drive), the refusal must name the EXACT value
+/// the control was left at — an honest third-state report instead of a silent lie about restoration.
+@Test func aFailedRollbackNamesTheExactRestingValue() {
+    let fader = FakeClampedFader(raw: 193.2)
+    fader.freezeAfter = 12 // the drive moves the fader partway, then every later write (rollback included) is swallowed
+    let outcome = fader.volumeWriter().write(target: -2.0, planCurrent: 0.0)
+    guard case .refused(_, let message) = outcome else { #expect(Bool(false), "a frozen fader must refuse, got \(outcome)"); return }
+    #expect(abs(fader.displayedDB - 0.0) > 0.05) // the fader really was left away from 0.0…
+    #expect(message.contains("RESTORING 0.0 dB FAILED"))
+    #expect(message.contains("was left at \(fader.displayedDB) dB")) // …and the message names exactly where
+}
+/// The mechanism proof writes the control's own current value; when Logic re-applies even that write and the display
+/// moves, the engine must recognize the clamping fact, refuse, and drive the control back — the proof itself has no
+/// right to leave the observable state changed.
+@Test func aProofWriteThatMovesTheDisplayIsRefusedAndTheControlRestored() {
+    let fader = FakeClampedFader(raw: 193.2)
+    fader.firstWriteOffset = -2.0 // Logic displaces the first (proof) write: the display moves off 0.0 dB
+    let outcome = fader.volumeWriter().write(target: -2.0, planCurrent: 0.0)
+    guard case .refused(let before, let message) = outcome else { #expect(Bool(false), "a non-idempotent proof must refuse, got \(outcome)"); return }
+    #expect(before == 0.0)
+    #expect(message.contains("moved its displayed value"))
+    #expect(message.contains("was restored to 0.0 dB"))
+    #expect(abs(fader.displayedDB - 0.0) <= 0.05) // the proof's own damage was driven back and re-read
+}
+/// A control whose AXValue IS the fact scale (pan, a raw send knob, a dB-scale fader) is driven through the same
+/// clamping: one write proves nothing, repeated verified writes walk the control the whole way.
+@Test func directScaleClampedControlIsWalkedToTheTarget() {
+    let pan = FakeClampedFader(raw: 30, clampPerWrite: 0.5, range: -64...63, curve: { $0 })
+    let writer = CalibratedSliderWriter(io: pan.io(displayIsRaw: true), control: "pan control", stalenessControl: "Pan", unit: "")
+    let outcome = writer.write(target: -20, planCurrent: 30)
+    guard case .executed(let before, let after) = outcome else { #expect(Bool(false), "the clamped direct drive must succeed, got \(outcome)"); return }
+    #expect(before == 30 && abs(after - (-20)) <= 0.05)
+    #expect(abs(pan.raw - (-20)) <= 0.05)
+    #expect(pan.writes.count > 90) // 50 units of travel at 0.5 per write is a long, legitimate drive
+}
 @Test func stripGrammarMatchesWholeCaptionsAndParsesLogicNumbers() {
     #expect(StripControlGrammar.matches("mute", "mute") && StripControlGrammar.matches(" Pan ", "pan"))
     #expect(!StripControlGrammar.matches("expand", "pan")) // containing the word is never a match
