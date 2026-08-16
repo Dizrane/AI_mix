@@ -50,6 +50,10 @@ struct ApplicationLauncher: Sendable {
     @Published var assistantFailure: String?
     @Published var assistantCanResumePolling = false
     var assistantConfirmationSent = false
+    /// How many non-empty assistant replies the transcript held when the last message went out — the baseline
+    /// `AssistantSettling.turnComplete` compares against, so a thread status that has not caught up with the send
+    /// yet can never pass off the previous transcript as the model's answer.
+    var assistantRepliesBeforeSend = 0
     var assistantWork: Task<Void, Never>?
 
     // MARK: Offline render (MixEngine) — the Render stage's state; manual paste works with no API key at all.
