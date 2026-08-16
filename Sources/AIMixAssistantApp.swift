@@ -1,6 +1,17 @@
 import SwiftUI
 
-@main struct AIMixAssistantApp: App {
+/// Process entry point. Debug builds accept the `mix-render` lab subcommand (offline MixEngine render, no UI, no
+/// Logic) before any app machinery starts; every other launch — and every release build — runs the SwiftUI app.
+@main enum AIMixAssistantMain {
+    @MainActor static func main() {
+        #if DEBUG
+        MixEngineCLI.runAndExitIfRequested(arguments: Array(CommandLine.arguments.dropFirst()))
+        #endif
+        AIMixAssistantApp.main()
+    }
+}
+
+struct AIMixAssistantApp: App {
     @StateObject private var model = AppModel()
     var body: some Scene { WindowGroup { RootView().environmentObject(model).frame(minWidth: 960, minHeight: 680) } }
 }
