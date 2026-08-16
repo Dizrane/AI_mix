@@ -53,12 +53,21 @@ enum MixGraphDryCheck {
                     issues.append("\(label): \"\(component)\" is not a valid FourCC component identifier (expected \"type/subtype/manufacturer\", e.g. \"aufx/pmeq/appl\").")
                     continue
                 }
+                // The engine loads only audio effects (type "aufx"); a music effect or instrument picked from the
+                // catalogue would fail at render time, so the type mismatch is named here — no inventory needed,
+                // the identifier itself states the type.
+                if parts[0].lowercased() != "aufx" {
+                    issues.append("\(label): \(component) is not an audio effect (type \"aufx\"); this prototype loads effects only.")
+                    continue
+                }
                 guard !installed.isEmpty else { continue }
                 if !installed.contains(where: { $0.identifier.caseInsensitiveCompare(component) == .orderedSame }) {
                     issues.append("\(label): no installed Audio Unit matches \"\(component)\" — the plugin is not installed on this machine.")
                 }
             } else if let name = insert.name, !installed.isEmpty {
-                let matches = installed.filter { nameMatches(name, item: $0) }
+                // Mirrors the engine's name resolution, which searches installed EFFECTS only: a name that matches
+                // only a music effect or an instrument would render as "not installed", so it is reported that way here.
+                let matches = installed.filter { $0.identifier.lowercased().hasPrefix("aufx/") && nameMatches(name, item: $0) }
                 if matches.isEmpty { issues.append("\(label): no installed Audio Unit effect matches \"\(name)\" — the plugin is not installed on this machine.") }
                 else if matches.count > 1 { issues.append("\(label): the name \"\(name)\" matches \(matches.count) installed plugins (\(matches.map(\.identifier).joined(separator: ", "))); use the exact component identifier instead.") }
             }
