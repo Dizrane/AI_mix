@@ -28,6 +28,7 @@ enum MixEngineError: LocalizedError, Equatable {
     case parametersNotResolved(insert: String, keys: [String], available: [String])
     case ambiguousParameter(insert: String, key: String, matches: [String])
     case engineStartFailed(reason: String)
+    case alignmentDelayUnavailable(reason: String)
     case renderFailed(reason: String)
     case outputFileUnwritable(path: String, reason: String)
 
@@ -53,6 +54,7 @@ enum MixEngineError: LocalizedError, Equatable {
         case .parametersNotResolved(let insert, let keys, let available): "\(insert): \(plural(keys.count, "parameter")) could not be resolved: \(keys.joined(separator: ", ")). The unit exposes: \(available.joined(separator: "; "))."
         case .ambiguousParameter(let insert, let key, let matches): "\(insert): the display name \"\(key)\" matches \(plural(matches.count, "parameter")) (\(matches.joined(separator: ", "))); use the parameter identifier or address instead."
         case .engineStartFailed(let reason): "The offline audio engine failed to start: \(reason)"
+        case .alignmentDelayUnavailable(let reason): "The sample-exact alignment delay could not be set up: \(reason). Without it, parallel paths with unequal insert latencies would land misaligned in the sum, so the render refuses instead of guessing."
         case .renderFailed(let reason): "Offline rendering failed: \(reason)"
         case .outputFileUnwritable(let path, let reason): "The output file \(path) cannot be created: \(reason)"
         }
@@ -74,23 +76,36 @@ struct MixAppliedParameter: Sendable {
 }
 
 /// One insert that was really loaded: where it sits, what the graph requested, which installed component it resolved
-/// to, and the full parameter write/read-back report.
+/// to, the full parameter write/read-back report, and the latency the unit itself reported. The latency is read from
+/// `auAudioUnit.latency` only after the engine allocated render resources — the one moment the number is real — so
+/// every latency figure in a report traces to the unit's own statement, never to a guess.
 struct MixInsertReport: Sendable {
     var location: String
     var requested: String
     var resolvedName: String
     var resolvedIdentifier: String
     var parameters: [MixAppliedParameter]
+    /// `auAudioUnit.latency` in seconds, read after render resources were allocated.
+    var latencySeconds: Double
+    /// The reported latency in whole frames at the mix rate — the part the render really compensates; a fractional
+    /// remainder, if any, is named in the result's `notes`.
+    var latencyFrames: Int
 }
 
 /// The engine's answer: where the mix landed and the measured facts about it. The metrics come from the same local
 /// BS.1770-4 analyzer the app uses for exported WAVs; the engine only reports numbers — what is acceptable is the
 /// caller's judgement. `busMetrics` is best effort (manual-rendering taps carry no delivery guarantee) and `notes`
-/// names what was and was not measured.
+/// names what was and was not measured. `renderedFrames` counts the frames written to the mix file: the graph's own
+/// latency (`compensatedLatencyFrames`) is rendered in addition and trimmed from the head, so the file stays
+/// positionally at t=0 with its full tail. Anything the compensation could NOT align — a fractional latency a unit
+/// reported — is named in `notes` instead of being silently absorbed.
 struct MixRenderResult: Sendable {
     var outputURL: URL
     var sampleRate: Double
     var renderedFrames: Int
+    /// Total graph latency in frames — slowest track chain + slowest bus chain + master chain, every summand traced
+    /// to `auAudioUnit.latency` — that was aligned across all parallel paths and trimmed from the written mix.
+    var compensatedLatencyFrames: Int
     var inserts: [MixInsertReport]
     var mixMetrics: AudioMetrics?
     var busMetrics: [String: AudioMetrics]
@@ -108,8 +123,13 @@ struct MixRenderResult: Sendable {
 /// bus. Sends are therefore post-fader and post-pan by construction. Each bus is a collector mixer → its inserts → an
 /// output mixer carrying the bus gain; master is the same shape, its gain applied after the master inserts as a final
 /// trim. The mix sample rate is the first input file's rate — a file at any other rate is a named error, never a
-/// resample. Insert latency is NOT compensated (a look-ahead limiter shifts the render by its latency); this is a
-/// prototype for proving programmatic AU control, not a mastering tool.
+/// resample. Insert latency IS compensated, sample-accurately and only from numbers the units themselves report:
+/// after `start()` has allocated render resources (the one moment `auAudioUnit.latency` is real), the engine plans
+/// with `MixLatencyMath` — a lower-latency track starts later by scheduled silence instead of gaining DSP in its
+/// path, send fan-outs are re-converged by bit-exact whole-frame delays (`SampleExactDelayAudioUnit`) on the direct
+/// branch and on each bus output, and the graph's total latency is rendered in addition and trimmed from the head so
+/// the written mix stays at t=0. What cannot be compensated (a fractional reported latency) is named in `notes`,
+/// never silently misaligned.
 struct MixEngine {
     /// Sample format of the written mix file; rendering itself is always float32.
     enum OutputSampleFormat: Sendable { case float32, int24 }
@@ -167,9 +187,10 @@ struct MixEngine {
         catch { throw MixEngineError.engineStartFailed(reason: error.localizedDescription) }
 
         var insertReports: [MixInsertReport] = []
+        var loadedInserts: [(chain: MixChainKey, reportIndex: Int, unit: AVAudioUnit)] = []
         var notes: [String] = []
 
-        func buildChain(after source: AVAudioNode, sourceFormat: AVAudioFormat, inserts: [MixGraphInsert], owner: String) throws -> AVAudioNode {
+        func buildChain(after source: AVAudioNode, sourceFormat: AVAudioFormat, inserts: [MixGraphInsert], owner: String, chain: MixChainKey) throws -> AVAudioNode {
             var tail = source
             for (index, insert) in inserts.enumerated() {
                 let location = "\(owner) insert \(index + 1)"
@@ -178,40 +199,68 @@ struct MixEngine {
                 let parameters = try apply(parameters: insert.parameters, to: unit, location: location)
                 engine.attach(unit)
                 engine.connect(tail, to: unit, format: sourceFormat)
-                insertReports.append(.init(location: location, requested: insert.component ?? insert.name ?? "?", resolvedName: component.name, resolvedIdentifier: identifierString(component.audioComponentDescription), parameters: parameters))
+                insertReports.append(.init(location: location, requested: insert.component ?? insert.name ?? "?", resolvedName: component.name, resolvedIdentifier: identifierString(component.audioComponentDescription), parameters: parameters, latencySeconds: 0, latencyFrames: 0))
+                loadedInserts.append((chain, insertReports.count - 1, unit))
                 tail = unit
             }
             return tail
         }
 
-        // Buses first, so track sends have a destination to connect to.
+        // Buses first, so track sends have a destination to connect to. Branch-alignment delays exist only when a
+        // bus carries inserts: only then can a track's fan-out reach the master sum through two chains of different
+        // latency, which no player offset can fix (an offset moves both branches equally). The delays are attached
+        // now, at zero, because their real values are unknowable until render resources exist; they are configured
+        // after `start()`, before the first render call.
         let masterCollector = AVAudioMixerNode()
         engine.attach(masterCollector)
+        let needsBranchDelays = graph.buses.contains { !$0.inserts.isEmpty }
+        var directCollector: AVAudioMixerNode?
+        var directDelay: SampleExactDelayAudioUnit?
+        var busDelays: [String: SampleExactDelayAudioUnit] = [:]
+        if needsBranchDelays {
+            let collector = AVAudioMixerNode()
+            let delay = try SampleExactDelayAudioUnit.makeNode()
+            engine.attach(collector)
+            engine.attach(delay.node)
+            engine.connect(collector, to: delay.node, format: stereo)
+            engine.connect(delay.node, to: masterCollector, format: stereo)
+            directCollector = collector
+            directDelay = delay.unit
+        }
         var busInputs: [String: AVAudioMixerNode] = [:]
         var busOutputs: [String: AVAudioMixerNode] = [:]
         for bus in graph.buses {
             let input = AVAudioMixerNode(); let output = AVAudioMixerNode()
             engine.attach(input); engine.attach(output)
-            let chainEnd = try buildChain(after: input, sourceFormat: stereo, inserts: bus.inserts, owner: "bus \"\(bus.name)\"")
+            let chainEnd = try buildChain(after: input, sourceFormat: stereo, inserts: bus.inserts, owner: "bus \"\(bus.name)\"", chain: .bus(bus.name))
             engine.connect(chainEnd, to: output, format: stereo)
             output.outputVolume = Float(linearGain(bus.gainDB))
-            engine.connect(output, to: masterCollector, format: stereo)
+            if needsBranchDelays {
+                let delay = try SampleExactDelayAudioUnit.makeNode()
+                engine.attach(delay.node)
+                engine.connect(output, to: delay.node, format: stereo)
+                engine.connect(delay.node, to: masterCollector, format: stereo)
+                busDelays[bus.name] = delay.unit
+            } else {
+                engine.connect(output, to: masterCollector, format: stereo)
+            }
             busInputs[bus.name] = input
             busOutputs[bus.name] = output
         }
 
-        var players: [AVAudioPlayerNode] = []
+        var players: [(player: AVAudioPlayerNode, file: AVAudioFile, track: String)] = []
         for (track, file) in files {
             let player = AVAudioPlayerNode()
             engine.attach(player)
             let fileFormat = file.processingFormat
-            let chainEnd = try buildChain(after: player, sourceFormat: fileFormat, inserts: track.inserts, owner: "track \"\(track.name)\"")
+            let chainEnd = try buildChain(after: player, sourceFormat: fileFormat, inserts: track.inserts, owner: "track \"\(track.name)\"", chain: .track(track.name))
             let trackMixer = AVAudioMixerNode()
             engine.attach(trackMixer)
             engine.connect(chainEnd, to: trackMixer, format: fileFormat)
             trackMixer.outputVolume = Float(linearGain(track.gainDB))
             trackMixer.pan = Float(track.pan)
-            var destinations = [AVAudioConnectionPoint(node: masterCollector, bus: masterCollector.nextAvailableInputBus)]
+            let directSum = directCollector ?? masterCollector
+            var destinations = [AVAudioConnectionPoint(node: directSum, bus: directSum.nextAvailableInputBus)]
             var sendMixers: [(mixer: AVAudioMixerNode, bus: String)] = []
             for send in track.sends {
                 let sendMixer = AVAudioMixerNode()
@@ -226,12 +275,11 @@ struct MixEngine {
                 guard let busInput = busInputs[busName] else { continue } // proven present by the upfront validation
                 engine.connect(sendMixer, to: busInput, format: stereo)
             }
-            player.scheduleFile(file, at: nil, completionHandler: nil)
-            players.append(player)
+            players.append((player, file, track.name))
         }
 
         // Master: inserts on the full sum, then the gain as a final trim on the way into the output node.
-        let masterChainEnd = try buildChain(after: masterCollector, sourceFormat: stereo, inserts: graph.master.inserts, owner: "master")
+        let masterChainEnd = try buildChain(after: masterCollector, sourceFormat: stereo, inserts: graph.master.inserts, owner: "master", chain: .master)
         let masterOut = AVAudioMixerNode()
         engine.attach(masterOut)
         engine.connect(masterChainEnd, to: masterOut, format: stereo)
@@ -255,14 +303,59 @@ struct MixEngine {
         catch { throw MixEngineError.outputFileUnwritable(path: outputURL.path, reason: error.localizedDescription) }
 
         do { try engine.start() } catch { throw MixEngineError.engineStartFailed(reason: error.localizedDescription) }
-        for player in players { player.play() }
+
+        // A unit's reported latency is real only once its render resources exist, so the numbers are read here —
+        // after `start()` has allocated the whole graph — and only now can offsets, branch delays and the output trim
+        // be planned. A fractional remainder no whole-frame alignment can absorb is named instead of dropped.
+        var trackChainFrames = Dictionary(uniqueKeysWithValues: graph.tracks.map { ($0.name, 0) })
+        var busChainFrames = Dictionary(uniqueKeysWithValues: graph.buses.map { ($0.name, 0) })
+        var masterChainFrames = 0
+        for loaded in loadedInserts {
+            let seconds = loaded.unit.auAudioUnit.latency
+            let latency = MixLatencyMath.insertLatency(reportedSeconds: seconds, sampleRate: sampleRate)
+            insertReports[loaded.reportIndex].latencySeconds = seconds
+            insertReports[loaded.reportIndex].latencyFrames = latency.frames
+            if abs(latency.residualSamples) > MixLatencyMath.residualNoteThresholdSamples {
+                notes.append("\(insertReports[loaded.reportIndex].location): the unit reports \(String(format: "%.6f", seconds)) s of latency (\(String(format: "%.3f", seconds * sampleRate)) samples at \(Int(sampleRate)) Hz); only the whole-frame part (\(latency.frames)) is compensated — the \(String(format: "%.3f", latency.residualSamples))-sample remainder cannot be aligned by integer scheduling and stays uncompensated.")
+            }
+            switch loaded.chain {
+            case .track(let name): trackChainFrames[name, default: 0] += latency.frames
+            case .bus(let name): busChainFrames[name, default: 0] += latency.frames
+            case .master: masterChainFrames += latency.frames
+            }
+        }
+        let plan = MixLatencyMath.plan(trackChainFrames: trackChainFrames, busChainFrames: busChainFrames, masterChainFrames: masterChainFrames)
+        directDelay?.configure(delayFrames: plan.directBranchDelayFrames)
+        for (name, delay) in busDelays { delay.configure(delayFrames: plan.busOutputDelayFrames[name] ?? 0) }
+
+        // Every input WAV covers the timeline from t=0, so a lower-latency track is aligned by playing it LATER:
+        // exactly `playerOffsetFrames` of scheduled silence in front of the file, sample-accurate because a player
+        // renders its scheduled segments back to back.
+        for entry in players {
+            let offset = plan.playerOffsetFrames[entry.track] ?? 0
+            if offset > 0 {
+                let fileFormat = entry.file.processingFormat
+                guard let silence = AVAudioPCMBuffer(pcmFormat: fileFormat, frameCapacity: AVAudioFrameCount(offset)), let channelData = silence.floatChannelData else {
+                    engine.stop(); throw MixEngineError.renderFailed(reason: "could not allocate \(plural(offset, "frame")) of alignment silence for track \"\(entry.track)\"")
+                }
+                silence.frameLength = AVAudioFrameCount(offset)
+                for channel in 0..<Int(fileFormat.channelCount) { channelData[channel].update(repeating: 0, count: offset) }
+                entry.player.scheduleBuffer(silence, completionHandler: nil)
+            }
+            entry.player.scheduleFile(entry.file, at: nil, completionHandler: nil)
+            entry.player.play()
+        }
 
         guard let renderBuffer = AVAudioPCMBuffer(pcmFormat: engine.manualRenderingFormat, frameCapacity: Self.maximumRenderFrames) else {
             engine.stop(); throw MixEngineError.renderFailed(reason: "could not allocate the render buffer")
         }
+        // The graph runs `trimFrames` late overall; rendering that many extra frames and dropping them from the head
+        // keeps the written mix positionally at t=0 with its full tail.
+        let renderTarget = totalFrames + AVAudioFramePosition(plan.trimFrames)
+        var framesToDrop = plan.trimFrames
         var stalledIterations = 0
-        while engine.manualRenderingSampleTime < totalFrames {
-            let remaining = totalFrames - engine.manualRenderingSampleTime
+        while engine.manualRenderingSampleTime < renderTarget {
+            let remaining = renderTarget - engine.manualRenderingSampleTime
             let frames = AVAudioFrameCount(min(Int64(Self.maximumRenderFrames), remaining))
             let status: AVAudioEngineManualRenderingStatus
             do { status = try engine.renderOffline(frames, to: renderBuffer) }
@@ -270,6 +363,20 @@ struct MixEngine {
             switch status {
             case .success:
                 stalledIterations = 0
+                if framesToDrop > 0 {
+                    let produced = Int(renderBuffer.frameLength)
+                    let dropped = min(framesToDrop, produced)
+                    framesToDrop -= dropped
+                    let kept = produced - dropped
+                    guard kept > 0 else { continue }
+                    guard let channelData = renderBuffer.floatChannelData else {
+                        engine.stop(); throw MixEngineError.renderFailed(reason: "the render buffer exposes no float channel data, so the latency preroll cannot be trimmed")
+                    }
+                    for channel in 0..<Int(renderBuffer.format.channelCount) {
+                        memmove(channelData[channel], channelData[channel] + dropped, kept * MemoryLayout<Float>.stride)
+                    }
+                    renderBuffer.frameLength = AVAudioFrameCount(kept)
+                }
                 do { try outputFile?.write(from: renderBuffer) }
                 catch { engine.stop(); throw MixEngineError.outputFileUnwritable(path: outputURL.path, reason: error.localizedDescription) }
             case .insufficientDataFromInputNode, .cannotDoInCurrentContext:
@@ -282,7 +389,7 @@ struct MixEngine {
                 engine.stop(); throw MixEngineError.renderFailed(reason: "the engine returned an unknown render status at frame \(engine.manualRenderingSampleTime)")
             }
         }
-        let renderedFrames = Int(engine.manualRenderingSampleTime)
+        let renderedFrames = Int(engine.manualRenderingSampleTime) - plan.trimFrames
         engine.stop()
         outputFile = nil // close the file so the analyzer measures the final bytes on disk
 
@@ -305,7 +412,7 @@ struct MixEngine {
 
         let mixMetrics = AudioMetricsAnalyzer().analyze(fileAt: outputURL)
         if mixMetrics == nil { notes.append("the rendered mix file could not be analyzed; the render itself completed (\(plural(renderedFrames, "frame"))).") }
-        return MixRenderResult(outputURL: outputURL, sampleRate: sampleRate, renderedFrames: renderedFrames, inserts: insertReports, mixMetrics: mixMetrics, busMetrics: busMetrics, notes: notes)
+        return MixRenderResult(outputURL: outputURL, sampleRate: sampleRate, renderedFrames: renderedFrames, compensatedLatencyFrames: plan.trimFrames, inserts: insertReports, mixMetrics: mixMetrics, busMetrics: busMetrics, notes: notes)
     }
 
     // MARK: Component resolution and instantiation
@@ -434,9 +541,16 @@ struct MixEngine {
 
 // MARK: - Internal plumbing
 
+/// Which insert chain a loaded unit sits in, kept so the engine can sum reported latencies per chain once the numbers
+/// are real (after render resources exist) and hand the sums to the pure planning math.
+private enum MixChainKey: Hashable {
+    case track(String), bus(String), master
+}
+
 /// Hands the async AVAudioUnit instantiation result across threads exactly once, with a timeout. The lock makes the
-/// single handoff safe; nothing else is shared.
-private final class InstantiationBox: @unchecked Sendable {
+/// single handoff safe; nothing else is shared. Internal rather than private because the sample-exact alignment delay
+/// instantiates through the same async API.
+final class InstantiationBox: @unchecked Sendable {
     private let semaphore = DispatchSemaphore(value: 0)
     private let lock = NSLock()
     private var unit: AVAudioUnit?

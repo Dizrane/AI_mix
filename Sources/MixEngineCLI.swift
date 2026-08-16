@@ -65,10 +65,12 @@ enum MixEngineCLI {
     /// facts (numbers only — judging them is the caller's job).
     static func report(for result: MixRenderResult) -> String {
         var lines = ["Rendered \(result.outputURL.path) (\(plural(result.renderedFrames, "frame")) at \(Int(result.sampleRate)) Hz)."]
+        lines.append("Compensated latency: \(plural(result.compensatedLatencyFrames, "frame")) — every parallel path aligned before summing, the head trimmed so the mix stays at t=0.")
         if !result.inserts.isEmpty {
             lines.append("Inserts:")
             for insert in result.inserts {
                 lines.append("  \(insert.location): \(insert.resolvedName) [\(insert.resolvedIdentifier)] (requested \"\(insert.requested)\")")
+                lines.append("    reported latency: \(plural(insert.latencyFrames, "frame")) (\(String(format: "%.3f", insert.latencySeconds * 1000)) ms, from auAudioUnit.latency)")
                 for parameter in insert.parameters {
                     let verdict = parameter.verified ? "verified" : "READ-BACK DIFFERS"
                     lines.append("    \(parameter.key) → \(parameter.resolvedName) [\(parameter.resolvedIdentifier)]: set \(parameter.requestedValue), read back \(parameter.readBackValue) (\(verdict))")
