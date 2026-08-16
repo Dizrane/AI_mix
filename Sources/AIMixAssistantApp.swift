@@ -21,11 +21,11 @@ struct AIMixAssistantApp: App {
 /// Only stages with a working backend are exposed. Execution lives inside Review: the validated plan can be dry-run
 /// (default, writes nothing) or executed LIVE through the verified channel-strip adapter after explicit confirmation.
 enum WorkflowStage: Int, CaseIterable, Identifiable {
-    case connection, analysis, audio, aiPackage, review
+    case connection, analysis, audio, aiPackage, assistant, render, review
     var id: Int { rawValue }
     var number: String { String(format: "%02d", rawValue + 1) }
-    var title: String { switch self { case .connection: "Connection"; case .analysis: "Analysis"; case .audio: "Audio"; case .aiPackage: "AI Package"; case .review: "Review" } }
-    var symbol: String { switch self { case .connection: "link"; case .analysis: "waveform.path.ecg"; case .audio: "waveform"; case .aiPackage: "doc.text"; case .review: "checklist" } }
+    var title: String { switch self { case .connection: "Connection"; case .analysis: "Analysis"; case .audio: "Audio"; case .aiPackage: "AI Package"; case .assistant: "Assistant"; case .render: "Render"; case .review: "Review" } }
+    var symbol: String { switch self { case .connection: "link"; case .analysis: "waveform.path.ecg"; case .audio: "waveform"; case .aiPackage: "doc.text"; case .assistant: "sparkles"; case .render: "waveform.circle"; case .review: "checklist" } }
 }
 
 // MARK: - Indicators
@@ -93,9 +93,32 @@ struct SettingsView: View {
     @State private var confirmingClear = false
     @State private var deleteStage1 = false
     @State private var deleteStage2 = false
+    /// The key is typed here and handed straight to the Keychain; it is never pre-filled back from the Keychain, so a
+    /// saved key can be replaced or removed but not read off this screen.
+    @State private var keyInput = ""
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack { Text("Settings").font(.system(.title2, design: .rounded).weight(.semibold)); Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+            ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+            Card {
+                Text("AI (Capy API)").font(.headline)
+                Text("Lets the Assistant stage run the model dialog itself over the Capy API (the only network host this feature talks to). The key is stored in the macOS Keychain only and leaves it solely as the Authorization header of Capy requests. Without a key the app works fully manually: copy the AI Package yourself and paste the MixGraph on the Render screen.").font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    SecureField(model.capyKeyPresent ? "Key saved — enter a new key to replace it" : "Capy API key", text: $keyInput).textFieldStyle(.roundedBorder)
+                    Button("Save") { model.saveCapyKey(keyInput); if model.capyKeyPresent { keyInput = "" } }.disabled(keyInput.isEmpty)
+                    Button("Remove") { model.removeCapyKey() }.disabled(!model.capyKeyPresent)
+                }
+                HStack(spacing: 10) {
+                    TextField("Project id (from the project page URL at capy.ai)", text: $model.capyProjectID).textFieldStyle(.roundedBorder)
+                    Button("Verify") { model.verifyCapyKey() }.disabled(!model.capyKeyPresent || model.capyProjectID.isEmpty)
+                }
+                HStack(spacing: 10) {
+                    Picker("Model", selection: $model.capyModelID) { ForEach(CapyAPI.knownModels, id: \.self) { Text($0).tag($0) } }
+                    Picker("Reasoning", selection: $model.capyReasoning) { ForEach(CapyAPI.reasoningModes, id: \.self) { Text($0).tag($0) } }
+                }
+                if !model.capyKeyStatus.isEmpty { Text(model.capyKeyStatus).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+            }
             Card {
                 Text("Updates").font(.headline)
                 Text("The app updates itself in place from this project's GitHub Releases: the new AI Mix Assistant.app replaces the current one inside the same folder, and Data/ with your analyses stays untouched. A folder still named after the old version (AI_Mix_<version>) is renamed to the new one; a folder you named yourself is never touched.").font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -129,7 +152,8 @@ struct SettingsView: View {
                 .background(RoundedRectangle(cornerRadius: 12).fill(Color.red.opacity(0.06)))
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.red.opacity(0.35), lineWidth: 0.6))
             }
-            Spacer()
+            }
+            }
         }
         .padding(24).frame(width: 500, height: 640)
         .confirmationDialog("Clear Temporary Project Files?", isPresented: $confirmingClear, titleVisibility: .visible) {
@@ -159,6 +183,8 @@ struct RootView: View {
             case .analysis: AnalysisScreen()
             case .audio: AudioScreen()
             case .aiPackage: PackageScreen()
+            case .assistant: AssistantScreen()
+            case .render: RenderScreen()
             case .review: ReviewScreen()
             }
         }
@@ -469,12 +495,113 @@ struct PackageScreen: View {
                 DisclosureGroup("Preview the text \u{201C}Copy for AI\u{201D} sends (Markdown only, no files)") { ScrollView { Text(model.aiPackage).font(.system(.caption2, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 320) }.font(.callout)
                 if model.packageFolderURL != nil { Text("The saved package's own AI_MIX_ANALYSIS.md differs on purpose: it ships with the JSON files and WAVs, so it instructs the AI to read and listen to them. Open Package to read it.").font(.caption).foregroundStyle(.secondary) }
             }
-            StageFooter(title: "Continue to Review", enabled: model.isAvailable(.review)) { model.go(to: .review) }
+            StageFooter(title: "Continue to Assistant", enabled: model.isAvailable(.assistant)) { model.go(to: .assistant) }
         }
         .onAppear { model.ensurePluginInventory() }
     }
     private var packageLabel: String { switch r.overall { case .ready: "Ready"; case .incomplete: "Incomplete"; case .error: "Integrity error"; case .notReady: "Not ready" } }
     private var packageState: IndicatorState { switch r.overall { case .ready: .ok; case .incomplete: .warn; case .error: .error; case .notReady: .idle } }
+}
+
+/// The Capy-API conversation: send the package, read the model's stages 1–4, answer (or accept defaults), receive the
+/// MixGraph. Everything here is explicit clicks — polling resumes only by button after its named ceiling, and the
+/// received graph lands on the Render screen without ever starting a render on its own.
+struct AssistantScreen: View {
+    @EnvironmentObject var model: AppModel
+    var body: some View {
+        Screen(title: "Assistant", subtitle: "The app sends the analysis package over the Capy API and holds the whole dialog: stages 1\u{2013}4, your confirmation, then the final MixGraph for the offline render.") {
+            if !model.assistantConfigured {
+                Card {
+                    Label("No Capy API key configured", systemImage: "key").font(.headline)
+                    Text("Add an API key and the project id in Settings \u{2192} AI (Capy API) to let the app run the dialog itself. Without a key the app stays fully usable: send the AI Package to any model yourself and paste its MixGraph by hand on the Render screen.").font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack(spacing: 10) {
+                Button(model.assistantThreadID == nil ? "Analyze" : "Restart Analysis") { model.assistantAnalyze() }
+                    .buttonStyle(.borderedProminent).disabled(model.normalized == nil || model.assistantBusy || !model.assistantConfigured)
+                if model.assistantBusy { ProgressView().controlSize(.small) }
+                if !model.assistantThreadStatus.isEmpty { Text("Thread: \(model.assistantThreadStatus)").font(.caption).foregroundStyle(.secondary) }
+            }
+            if !model.assistantStatus.isEmpty { Text(model.assistantStatus).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+            if !model.assistantLatestReply.isEmpty {
+                Card {
+                    Text("Model reply").font(.headline)
+                    ScrollView { markdownText(model.assistantLatestReply).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 360)
+                }
+            }
+            if model.assistantAwaitingConfirmation {
+                Card {
+                    Text("Your confirmation (stage 5)").font(.headline)
+                    Text("Answer the model's questions in your own words, or accept its proposed defaults. The final MixGraph is delivered only after this step.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    TextEditor(text: $model.assistantConfirmationText).font(.system(.callout)).frame(minHeight: 100).padding(6)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
+                    HStack(spacing: 10) {
+                        Button("Send Answer") { model.assistantConfirm() }.buttonStyle(.borderedProminent).disabled(model.assistantBusy)
+                        Button("Accept All Defaults") { model.assistantAcceptDefaults() }.disabled(model.assistantBusy)
+                    }
+                }
+            }
+            if let failure = model.assistantFailure {
+                Card {
+                    Label(failure, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 10) {
+                        if model.assistantCanResumePolling { Button("Continue Polling") { model.assistantResumePolling() }.buttonStyle(.borderedProminent).disabled(model.assistantBusy) }
+                        if !model.assistantGraphIssues.isEmpty { Button("Ask the Model to Fix It") { model.assistantAskFix() }.disabled(model.assistantBusy) }
+                    }
+                }
+            }
+            if !model.assistantGraphIssues.isEmpty {
+                Card {
+                    Text("MixGraph validation issues").font(.headline)
+                    ForEach(model.assistantGraphIssues, id: \.self) { Label($0, systemImage: "xmark.circle").font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
+                }
+            }
+            if model.assistantGraphReady { Text("MixGraph received and validated — it is loaded on the Render screen. Nothing renders until you press Render there.").font(.callout).foregroundStyle(.green) }
+            StageFooter(title: "Continue to Render", enabled: model.isAvailable(.render)) { model.go(to: .render) }
+        }
+    }
+    /// Model prose rendered as inline Markdown; a reply Markdown parsing rejects falls back to the honest plain text.
+    private func markdownText(_ text: String) -> Text {
+        if let attributed = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) { return Text(attributed) }
+        return Text(text)
+    }
+}
+
+/// The offline render stage: a MixGraph — from the Assistant, or pasted by hand (the keyless path) — is validated
+/// with named verdicts, and only the explicit Render press runs MixEngine over the exported WAVs into current/render.
+struct RenderScreen: View {
+    @EnvironmentObject var model: AppModel
+    var body: some View {
+        Screen(title: "Render", subtitle: "Offline mix outside Logic: the MixGraph below drives the app's own engine over the exported WAVs. Paste a graph by hand, or let the Assistant fill it in. Nothing renders until you press Render.") {
+            Card {
+                Text("MixGraph JSON").font(.headline)
+                TextEditor(text: $model.renderGraphText).font(.system(.callout, design: .monospaced)).frame(minHeight: 180).padding(6)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
+                    .onChange(of: model.renderGraphText) { _, _ in model.renderGraphEdited() }
+                HStack(spacing: 10) {
+                    Button("Validate") { model.validateRenderGraph() }.disabled(model.renderGraphText.isEmpty || model.renderRunning)
+                    Button("Render") { model.runRender() }.buttonStyle(.borderedProminent).disabled(!model.renderGraphValid || model.renderRunning)
+                    if model.renderRunning { ProgressView().controlSize(.small) }
+                    Spacer()
+                }
+                Text("You can paste the model's whole reply — the app extracts its last fenced json block. Validate checks the graph against the really exported WAVs and the installed plugin catalogue; Render is enabled only after it passes.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            if !model.renderIssues.isEmpty {
+                Card { ForEach(model.renderIssues, id: \.self) { Label($0, systemImage: "xmark.circle").font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) } }
+            }
+            if !model.renderStatus.isEmpty { Text(model.renderStatus).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+            if !model.renderSummary.isEmpty {
+                Card {
+                    Text("Rendered mix — measured facts").font(.headline)
+                    Text(model.renderSummary).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                    HStack { Button("Open Render Folder") { model.openRenderFolder() }; Spacer() }
+                }
+            }
+            StageFooter(title: "Continue to Review", enabled: model.isAvailable(.review)) { model.go(to: .review) }
+        }
+    }
 }
 
 struct ReviewScreen: View {
