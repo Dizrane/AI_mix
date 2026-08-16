@@ -1857,6 +1857,62 @@ private final class FakeClampedFader {
     #expect(refusal?.contains("the project changed since the analysis") == true)
     #expect(refusal?.contains("Rescan and validate the plan again") == true)
 }
+// MARK: - Strip resolution: the live Mixer outranks the captured AX path
+
+/// The v0.2.30 divergence made structural: the snapshot's captured AX path lands on the main window's inspector
+/// MIRROR of the selected strip — same caption, same fader, potentially stale AXValue — while the real Mixer shows
+/// the strip itself. The mirror must lose: a unique caption match in the live Mixer areas resolves the Mixer's own
+/// element, and the provenance says the scanner's evidence confirmed it.
+@Test func aUniqueLiveMixerMatchOutranksACapturedPathOnTheInspectorMirror() {
+    let decision = StripResolutionMath.decide(
+        name: "Stereo Out",
+        areas: [
+            [(caption: "Kick", strip: "mixer-kick"), (caption: "Stereo Out", strip: "mixer-stereo-out")],
+            [(caption: "Stereo Out", strip: "inspector-mirror")],
+        ],
+        pathStrip: "inspector-mirror")
+    #expect(decision == .resolved("mixer-stereo-out", .liveMixer))
+}
+/// Two same-named strips INSIDE the real Mixer are distinct objects the scanner itself refuses to link; the captured
+/// path has no right to break that tie, even when it lands squarely on one of them.
+@Test func twoSameNamedMixerStripsRefuseAsAmbiguousRegardlessOfThePath() {
+    let decision = StripResolutionMath.decide(
+        name: "Kick",
+        areas: [[(caption: "Kick", strip: "kick-1"), (caption: "Kick", strip: "kick-2"), (caption: "Snare", strip: "snare")]],
+        pathStrip: "kick-1")
+    guard case .failed(let reason) = decision else { #expect(Bool(false), "two same-named strips must refuse, got \(decision)"); return }
+    #expect(reason.contains("ambiguous"))
+    #expect(reason.contains("2 strips carry that caption"))
+    #expect(reason.contains("refusing to guess"))
+}
+/// The inspector mirror is the same Logic object seen twice, not a second strip: a smaller area's same-named strip
+/// must not double a name into ambiguity — exactly the normalizer's dedup. A name found ONLY in a smaller area is a
+/// real object and still resolves.
+@Test func anInspectorMirrorNeitherDoublesANameNorHidesARealOne() {
+    let areas = [
+        [(caption: "Kick", strip: "mixer-kick"), (caption: "Snare", strip: "mixer-snare")],
+        [(caption: "Kick", strip: "inspector-mirror"), (caption: "Output", strip: "inspector-output")],
+    ]
+    #expect(StripResolutionMath.decide(name: "Kick", areas: areas, pathStrip: nil) == .resolved("mixer-kick", .liveMixer))
+    #expect(StripResolutionMath.decide(name: "Output", areas: areas, pathStrip: nil) == .resolved("inspector-output", .liveMixer))
+}
+/// With no live Mixer area showing the caption (Mixer window closed, or the strip scrolled out of every area) the
+/// captured AX path is still a legitimate fallback — but only the verified one, and the provenance states that the
+/// scanner's evidence never confirmed the element.
+@Test func zeroLiveMixerMatchesFallBackToTheVerifiedCapturedPath() {
+    #expect(StripResolutionMath.decide(name: "Vocals", areas: [], pathStrip: "path-vocals") == .resolved("path-vocals", .capturedPathOnly))
+    #expect(StripResolutionMath.decide(name: "Vocals", areas: [[(caption: "Kick", strip: "mixer-kick")]], pathStrip: "path-vocals") == .resolved("path-vocals", .capturedPathOnly))
+}
+/// Zero live matches AND a stale path is the honest dead end: the failure names the staleness and the rescan recipe
+/// instead of guessing an element.
+@Test func zeroMatchesAndAStalePathFailWithTheNamedRescanMessage() {
+    let decision = StripResolutionMath.decide(name: "Vocals", areas: [[(caption: "Kick", strip: "mixer-kick")]], pathStrip: nil)
+    guard case .failed(let reason) = decision else { #expect(Bool(false), "a stale path with no live match must fail, got \(decision)"); return }
+    #expect(reason.contains("was not found in Logic's live Mixer"))
+    #expect(reason.contains("the captured AX path is stale"))
+    #expect(reason.contains("Rescan and validate the plan again"))
+}
+
 @Test func packageDescribesLiveExecutionHonestly() {
     for delivery in [PackageDelivery.markdownOnly, .fullPackage] {
         let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: delivery)

@@ -107,6 +107,52 @@ struct StripControlGrammar {
     }
 }
 
+// MARK: - Pure, testable strip resolution
+
+/// The pure decision of WHICH live element a plan action's strip name addresses, extracted from the AX plumbing the
+/// same way `CalibratedSliderWriter` extracts the write discipline — so the mirror scenario a real live run produced
+/// (the snapshot's captured AX path landing on the main window's inspector MIRROR of the selected strip, same caption
+/// and fader but a potentially stale AXValue, while a fresh scan read the real Mixer) is provable in unit tests. The
+/// live Mixer areas — the scanner's own evidence — outrank the captured path by construction: the area with the most
+/// strips is the real Mixer, smaller "mixer"-described areas are inspector mirrors of the same Logic objects and
+/// contribute only names the main area does not show (exactly `SnapshotNormalizer.mixerStripNodes`' dedup — a name
+/// found ONLY there is a real object and is kept), and a unique caption match resolves the element the scanner would
+/// publish the fact from. Two same-named strips in the real Mixer stay ambiguous and refused regardless of where the
+/// path lands — the path has no right to break a tie the scanner itself refuses to break. Only when NO area shows the
+/// caption does the verified captured path resolve, and its provenance is carried on the result so every later
+/// failure can name that the scanner's evidence never confirmed this element.
+struct StripResolutionMath {
+    enum Provenance: Equatable, Sendable { case liveMixer, capturedPathOnly }
+    enum Decision<Strip> {
+        case resolved(Strip, Provenance)
+        case failed(String)
+    }
+    /// `areas` are the live "mixer"-described areas with their strips' captions; `pathStrip` is the captured AX
+    /// path's landing element ONLY when it still verified as the named strip (exact caption plus volume-fader slider).
+    static func decide<Strip>(name: String, areas: [[(caption: String, strip: Strip)]], pathStrip: Strip?) -> Decision<Strip> {
+        var candidates: [Strip] = []
+        if let mainIndex = areas.indices.max(by: { areas[$0].count < areas[$1].count }) {
+            candidates = areas[mainIndex].filter { StripControlGrammar.matches($0.caption, name) }.map { $0.strip }
+            if candidates.isEmpty {
+                var names = Set(areas[mainIndex].map { $0.caption.localizedLowercase })
+                for (index, area) in areas.enumerated() where index != mainIndex {
+                    for entry in area where names.insert(entry.caption.localizedLowercase).inserted {
+                        if StripControlGrammar.matches(entry.caption, name) { candidates.append(entry.strip) }
+                    }
+                }
+            }
+        }
+        switch candidates.count {
+        case 1: return .resolved(candidates[0], .liveMixer)
+        case 0:
+            if let pathStrip { return .resolved(pathStrip, .capturedPathOnly) }
+            return .failed("Channel strip \u{2018}\(name)\u{2019} was not found in Logic's live Mixer — the captured AX path is stale and no strip carries that caption. Rescan and validate the plan again.")
+        default: return .failed("Channel strip \u{2018}\(name)\u{2019} is ambiguous in Logic's live Mixer (\(candidates.count) strips carry that caption) — refusing to guess which one the plan means.")
+        }
+    }
+}
+extension StripResolutionMath.Decision: Equatable where Strip: Equatable {}
+
 // MARK: - The calibrated slider write engine (pure algorithm over injected control IO)
 
 /// Everything the calibrated write algorithm needs from one live slider, injected as closures so the whole write
@@ -265,8 +311,9 @@ struct CalibratedSliderWriter {
 // MARK: - The live channel-strip adapter
 
 /// The verified live adapter: volume, pan, mute, solo and send level on a Mixer channel strip. Discipline:
-/// - the strip is located from live AX evidence (the snapshot's captured AX path first, verified by the strip's own
-///   caption; a unique-name search across the live Mixer as fallback) — never guessed, never by coordinates;
+/// - the strip is located from live AX evidence (a unique caption match in the live Mixer areas FIRST — the scanner's
+///   own evidence, inspector mirrors deduped; the snapshot's captured AX path only as a verified fallback when no
+///   area shows the caption, named as such in every later failure) — never guessed, never by coordinates;
 /// - mute/solo use the documented AXPress on the strip's own captioned control and the switch is believed only after
 ///   re-reading the value;
 /// - volume, pan and send levels all run through `CalibratedSliderWriter`: staleness gate before any write, the
@@ -298,36 +345,37 @@ struct LogicChannelStripAdapter: LiveActionAdapter {
         guard let app = NSWorkspace.shared.runningApplications.first(where: { !$0.isTerminated && ($0.bundleIdentifier.map(supportedBundleIDs.contains) == true || $0.localizedName == "Logic Pro") }) else { return failure("Logic Pro is not running.") }
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
         let strip: AXUIElement
+        let provenance: StripResolutionMath.Provenance
         switch resolveStrip(named: name, capturedPath: channelPath, in: appElement) {
         case .failed(let reason): return failure(reason)
-        case .resolved(let element): strip = element
+        case .resolved(let element, let origin): strip = element; provenance = origin
         }
+        let outcome: ExecutionResult
         switch command.action {
-        case .setMute: return toggle(command, strip: strip, control: "mute")
-        case .setSolo: return toggle(command, strip: strip, control: "solo")
-        case .setVolume: return setVolume(command, strip: strip)
-        case .setPan: return setPan(command, strip: strip)
-        case .setSendLevel: return setSendLevel(command, strip: strip)
-        default: return failure("No verified live Logic adapter is installed for this action.")
+        case .setMute: outcome = toggle(command, strip: strip, control: "mute")
+        case .setSolo: outcome = toggle(command, strip: strip, control: "solo")
+        case .setVolume: outcome = setVolume(command, strip: strip)
+        case .setPan: outcome = setPan(command, strip: strip)
+        case .setSendLevel: outcome = setSendLevel(command, strip: strip)
+        default: outcome = failure("No verified live Logic adapter is installed for this action.")
         }
+        // A failure on a strip only the captured path vouched for must say so: the scanner's evidence never confirmed
+        // this element, so the reader is pointed at the one recipe that makes both readers meet — an open Mixer.
+        guard provenance == .capturedPathOnly, outcome.status == ExecutionStatus.failed, let error = outcome.error else { return outcome }
+        return .init(actionID: outcome.actionID, status: outcome.status, before: outcome.before, after: outcome.after, error: error + " The strip was resolved from the snapshot's captured AX path because no live Mixer area shows its caption — open the Mixer window (X) so Logic renders the strips and rescan.")
     }
 
     // MARK: Strip resolution
 
-    private enum StripResolution { case resolved(AXUIElement), failed(String) }
-    /// Resolves the live AXUIElement of the strip the snapshot captured. The captured AX path (child indices from the
-    /// application element) is walked first and trusted only when the element it lands on still carries the strip's
-    /// exact caption and a volume-fader slider; when the path has gone stale, the live Mixer areas are searched for a
-    /// strip with that exact caption, and only a UNIQUE match is accepted — two same-named strips are ambiguous and
-    /// refused, exactly as the normalizer refuses to link them.
-    private func resolveStrip(named name: String, capturedPath: String, in appElement: AXUIElement) -> StripResolution {
-        if let walked = element(at: capturedPath, from: appElement), isStrip(walked, named: name) { return .resolved(walked) }
-        let candidates = liveMixerStrips(in: appElement).filter { StripControlGrammar.matches(string($0, kAXDescriptionAttribute), name) }
-        switch candidates.count {
-        case 1: return .resolved(candidates[0])
-        case 0: return .failed("Channel strip \u{2018}\(name)\u{2019} was not found in Logic's live Mixer — the captured AX path is stale and no strip carries that caption. Rescan and validate the plan again.")
-        default: return .failed("Channel strip \u{2018}\(name)\u{2019} is ambiguous in Logic's live Mixer (\(candidates.count) strips carry that caption) — refusing to guess which one the plan means.")
-        }
+    /// Resolves the live AXUIElement of the strip the snapshot captured. The live Mixer areas — the scanner's own
+    /// evidence — are searched FIRST and the captured AX path can never override or outrank them: the decision itself
+    /// is `StripResolutionMath.decide` (pure, tested), fed the areas' captions and the path's landing element only
+    /// when that element still verifies as the named strip (exact caption plus a volume-fader slider). A unique
+    /// caption match resolves from the real Mixer; two same-named strips are ambiguous and refused, exactly as the
+    /// normalizer refuses to link them; only a caption no area shows falls back to the verified captured path.
+    private func resolveStrip(named name: String, capturedPath: String, in appElement: AXUIElement) -> StripResolutionMath.Decision<AXUIElement> {
+        let walked = element(at: capturedPath, from: appElement)
+        return StripResolutionMath.decide(name: name, areas: liveMixerAreas(in: appElement), pathStrip: walked.flatMap { isStrip($0, named: name) ? $0 : nil })
     }
     /// Walks a captured AX path ("application.3.0.15…"): each numeric segment indexes into the live children array.
     private func element(at path: String, from appElement: AXUIElement) -> AXUIElement? {
@@ -347,36 +395,28 @@ struct LogicChannelStripAdapter: LiveActionAdapter {
             && StripControlGrammar.matches(string(element, kAXDescriptionAttribute), name)
             && children(element).contains { role($0) == "AXSlider" && StripControlGrammar.matches(string($0, kAXDescriptionAttribute) ?? string($0, kAXTitleAttribute), "volume fader") }
     }
-    /// Every strip in the live Mixer, using the same structural evidence as the normalizer: an AXLayoutArea described
-    /// "mixer" whose AXLayoutItem children carry a volume-fader slider. The area with the most strips is the real
-    /// Mixer (the inspector mirrors the selected strip in a smaller "mixer" area); strips from smaller areas are added
-    /// only when the main area shows no strip with their caption, so a mirror never doubles a name into ambiguity.
-    private func liveMixerStrips(in appElement: AXUIElement) -> [AXUIElement] {
-        var areas: [[AXUIElement]] = []
+    /// Every "mixer"-described AXLayoutArea in the live UI, each with its strips (AXLayoutItem children captioned and
+    /// carrying a volume-fader slider) — the same structural evidence the normalizer scans, delivered raw so
+    /// `StripResolutionMath` applies the identical largest-area/mirror dedup the scanner applies.
+    private func liveMixerAreas(in appElement: AXUIElement) -> [[(caption: String, strip: AXUIElement)]] {
+        var areas: [[(caption: String, strip: AXUIElement)]] = []
         var visited = 0
         var queue: [(element: AXUIElement, depth: Int)] = windows(appElement).map { ($0, 0) }
         while !queue.isEmpty && visited < 60_000 {
             let (element, depth) = queue.removeFirst()
             visited += 1
             if role(element) == "AXLayoutArea", string(element, kAXDescriptionAttribute)?.localizedCaseInsensitiveContains("mixer") == true {
-                areas.append(children(element).filter { candidate in
-                    role(candidate) == "AXLayoutItem" && (string(candidate, kAXDescriptionAttribute)?.isEmpty == false)
-                        && children(candidate).contains { role($0) == "AXSlider" && StripControlGrammar.matches(string($0, kAXDescriptionAttribute) ?? string($0, kAXTitleAttribute), "volume fader") }
+                areas.append(children(element).compactMap { candidate -> (caption: String, strip: AXUIElement)? in
+                    guard role(candidate) == "AXLayoutItem", let caption = string(candidate, kAXDescriptionAttribute), !caption.isEmpty,
+                          children(candidate).contains(where: { role($0) == "AXSlider" && StripControlGrammar.matches(string($0, kAXDescriptionAttribute) ?? string($0, kAXTitleAttribute), "volume fader") })
+                    else { return nil }
+                    return (caption: caption, strip: candidate)
                 })
                 continue // the area's strips are captured; no need to enqueue its thousands of grandchildren
             }
             if depth < 14 { queue.append(contentsOf: children(element).map { ($0, depth + 1) }) }
         }
-        guard let mainIndex = areas.indices.max(by: { areas[$0].count < areas[$1].count }) else { return [] }
-        var strips = areas[mainIndex]
-        var names = Set(strips.compactMap { string($0, kAXDescriptionAttribute)?.localizedLowercase })
-        for (index, area) in areas.enumerated() where index != mainIndex {
-            for strip in area {
-                guard let name = string(strip, kAXDescriptionAttribute)?.localizedLowercase else { continue }
-                if names.insert(name).inserted { strips.append(strip) }
-            }
-        }
-        return strips
+        return areas
     }
 
     // MARK: Mute / solo — AXPress with re-read
