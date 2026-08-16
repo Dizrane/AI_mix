@@ -78,7 +78,7 @@ actor SessionStore {
         let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto"); process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", source.path, dest.path]
         try process.run(); process.waitUntilExit(); return process.terminationStatus == 0
     }
-    private static func createStructure(at current: URL) throws { for folder in ["raw", "normalized", "audio", "mix", "metadata", "prompts", "responses", "logs", "temporary"] { try FileManager.default.createDirectory(at: current.appendingPathComponent(folder), withIntermediateDirectories: true) } }
+    private static func createStructure(at current: URL) throws { for folder in ["raw", "normalized", "audio", "mix", "render", "metadata", "prompts", "responses", "logs", "temporary"] { try FileManager.default.createDirectory(at: current.appendingPathComponent(folder), withIntermediateDirectories: true) } }
     private static func dataRoot() -> URL {
         let bundleURL = Bundle.main.bundleURL
         if bundleURL.pathExtension == "app" { return bundleURL.deletingLastPathComponent().appendingPathComponent("Data", isDirectory: true) }
