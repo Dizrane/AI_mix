@@ -1,5 +1,9 @@
 import Foundation
 
+/// A named rejection of the pasted MixGraph text — the typed `Error` a `Result` requires, carrying the one sentence
+/// the Render screen shows.
+struct RenderGraphRejection: Error { let message: String }
+
 /// The Render stage: a MixGraph JSON — pasted by hand (the keyless fallback that keeps the app fully usable without
 /// any API) or delivered by the Assistant — is DRY-validated with named verdicts, and only an explicit press of
 /// Render runs `MixEngine` offline over the exported WAVs in current/audio to produce `mix.wav` in current/render.
@@ -20,19 +24,19 @@ import Foundation
 
     /// The decoded graph behind the paste field. Tolerates a whole model reply pasted by hand by extracting its last
     /// fenced json block first.
-    private func decodeRenderGraph() -> Result<MixGraph, String> {
+    private func decodeRenderGraph() -> Result<MixGraph, RenderGraphRejection> {
         let text = renderGraphText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return .failure("Paste a MixGraph JSON first.") }
+        guard !text.isEmpty else { return .failure(.init(message: "Paste a MixGraph JSON first.")) }
         let body = FencedCodeBlocks.lastJSONBlock(in: text) ?? text
         do { return .success(try JSONDecoder().decode(MixGraph.self, from: Data(body.utf8))) }
-        catch { return .failure("Invalid MixGraph JSON: \(error.localizedDescription)") }
+        catch { return .failure(.init(message: "Invalid MixGraph JSON: \(error.localizedDescription)")) }
     }
 
     /// The dry validation — the same checks the Assistant applies to a model reply, so both paths meet one standard.
     func validateRenderGraph() {
         switch decodeRenderGraph() {
-        case .failure(let reason):
-            renderIssues = [reason]; renderGraphValid = false; renderStatus = "MixGraph rejected."
+        case .failure(let rejection):
+            renderIssues = [rejection.message]; renderGraphValid = false; renderStatus = "MixGraph rejected."
         case .success(let graph):
             ensurePluginInventory()
             Task {
