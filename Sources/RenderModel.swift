@@ -6,7 +6,8 @@ struct RenderGraphRejection: Error { let message: String }
 
 /// The Render stage: a MixGraph JSON — pasted by hand (the keyless fallback that keeps the app fully usable without
 /// any API) or delivered by the Assistant — is DRY-validated with named verdicts, and only an explicit press of
-/// Render runs `MixEngine` offline over the exported WAVs in current/audio to produce `mix.wav` in current/render.
+/// Render runs `MixEngine` offline over the exported WAVs in current/audio to produce `mix.wav` in current/render —
+/// in a crash-isolated child process (`RenderChildProcess`), so a plugin bug can never take the app down with it.
 /// Nothing renders automatically, and the result is measured, never presumed.
 @MainActor extension AppModel {
 
@@ -50,34 +51,43 @@ struct RenderGraphRejection: Error { let message: String }
         }
     }
 
-    /// The single explicit render action. Runs `MixEngine` off the main thread, reports the named engine error on
-    /// failure, and on success publishes the real measured facts of the written file plus its render report.
+    /// The single explicit render action. Runs the render in a short-lived CHILD process — the app's own binary with
+    /// the `mix-render` subcommand — because plugins load in the rendering process and a plugin bug at load,
+    /// processing, or Audio Unit teardown kills that process in ways Swift cannot catch (a real v0.2.37 crash:
+    /// SIGABRT from a plugin freeing a pointer it never allocated, AFTER the render had completed — see
+    /// `RenderChildProcess`). Success is the child's result file, not its clean exit: a child that crashed after
+    /// writing it still succeeded, and the post-render crash is named in a note. On failure the named reason quotes
+    /// how the child ended and its stderr; a hung child is killed after a generous timeout and fails by name. No
+    /// silent retries, no bypass.
     func runRender() {
         guard !renderRunning else { return }
         guard renderGraphValid, case .success(let graph) = decodeRenderGraph() else { renderStatus = "Validate the MixGraph first."; return }
         guard let store else { renderStatus = storageUnavailableMessage; return }
         renderRunning = true; renderedMixURL = nil; renderSummary = ""
-        renderStatus = "Rendering mix.wav offline\u{2026}"
+        renderStatus = "Rendering mix.wav offline in a child process\u{2026}"
         Task {
             let audioDir = await store.folderURL("audio")
             let renderDir = await store.folderURL("render")
             try? FileManager.default.createDirectory(at: renderDir, withIntermediateDirectories: true)
             let outputURL = renderDir.appendingPathComponent("mix.wav")
-            let outcome = await Task.detached(priority: .userInitiated) { () -> Result<MixRenderResult, Error> in
-                do { return .success(try MixEngine().render(graph: graph, folder: audioDir, outputURL: outputURL)) }
-                catch { return .failure(error) }
+            let graphURL = renderDir.appendingPathComponent("mixgraph.json")
+            let resultURL = renderDir.appendingPathComponent("render_result.json")
+            let outcome = await Task.detached(priority: .userInitiated) { () -> Result<RenderChildSuccess, RenderChildFailure> in
+                RenderChildProcess.render(graph: graph, audioFolder: audioDir, outputURL: outputURL, graphURL: graphURL, resultURL: resultURL)
             }.value
             switch outcome {
-            case .success(let result):
+            case .success(let success):
+                var result = success.result
+                if let note = success.postRenderNote { result.notes.append(note) }
                 renderedMixURL = result.outputURL
                 renderSummary = Self.renderSummaryLine(result)
-                renderStatus = "mix.wav rendered."
+                renderStatus = success.postRenderNote.map { "mix.wav rendered. Note: \($0)" } ?? "mix.wav rendered."
                 let report = MixEngineCLI.report(for: result)
                 _ = try? await store.saveText(report, folder: "render", name: "render_report.txt")
-                log.append("Offline render finished: \(result.outputURL.lastPathComponent), \(result.renderedFrames) frames at \(Int(result.sampleRate)) Hz.")
-            case .failure(let error):
-                renderStatus = (error as? MixEngineError)?.errorDescription ?? error.localizedDescription
-                log.append("Offline render failed: \(renderStatus)")
+                log.append("Offline render finished: \(result.outputURL.lastPathComponent), \(result.renderedFrames) frames at \(Int(result.sampleRate)) Hz." + (success.postRenderNote.map { " Note: \($0)" } ?? ""))
+            case .failure(let failure):
+                renderStatus = "Render failed: \(failure.message)"
+                log.append("Offline render failed: \(failure.message)")
             }
             renderRunning = false
         }

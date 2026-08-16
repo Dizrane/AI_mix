@@ -45,13 +45,17 @@ The engine (`Sources/MixEngine.swift`) renders through AVAudioEngine in **manual
 
 Known prototype limits, stated rather than hidden: mixer nodes apply their own pan/upmix law, not Logic's; sample-rate mismatches are refusals, not resampling. (Insert latency, formerly on this list, is now compensated — see step 7.)
 
-## Lab bench (debug builds only)
+## Crash isolation: every render runs in a child process
+
+Plugins load into the rendering process itself (AUv2 units cannot load out-of-process), and a plugin bug anywhere — load, processing, or Audio Unit teardown — kills that process in ways Swift cannot catch: a real v0.2.37 crash report shows a third-party framework calling `free()` on a pointer it never allocated while the node graph was being torn down, aborting the whole app with SIGABRT *after the render had already completed*; AVAudioEngine's NSExceptions (e.g. a rejected connection format) are equally uncatchable. So the app never renders in its own process. The Render stage (`Sources/RenderChildProcess.swift`) launches the app's own binary with the `mix-render` subcommand as a short-lived child, off the main thread, and judges the outcome by the child's *result file*, never by its clean exit: the child writes `mix.wav`, then the `MixRenderResult` facts as JSON (`render_result.json`), atomically and strictly last — a completion sentinel. A present, decodable result file is success even when the child then died during plugin teardown; that death is named in a note instead of hidden. No result file is a named failure quoting how the child ended (exit code, signal, or the generous 15-minute timeout after which a hung child is killed) and what it wrote to stderr. No silent retries, no bypass — and `MixEngine` itself is unchanged and still testable in-process.
+
+## Lab bench (every build)
 
 ```sh
-swift run "AI Mix Assistant" mix-render <wav-folder> <mixgraph.json> [--tail <seconds>] [--int24] [--no-bus-metrics]
+swift run "AI Mix Assistant" mix-render <wav-folder> <mixgraph.json> [--tail <seconds>] [--int24] [--no-bus-metrics] [--output <path>] [--result <path>]
 ```
 
-Renders `mix.wav` next to the input WAVs and prints the insert parameter reports plus the measured facts. The subcommand is compiled into DEBUG builds only and is a lab bench, not product UI.
+Renders `mix.wav` next to the input WAVs (or at `--output`) and prints the insert parameter reports plus the measured facts; `--result` additionally writes the `MixRenderResult` facts as JSON, atomically after the mix is complete. The subcommand is compiled into every build because it doubles as the app's own render child process (see above); it never touches Logic or the app's data.
 
 ## What the tests prove
 

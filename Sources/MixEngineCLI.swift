@@ -1,8 +1,11 @@
 import Foundation
 
-/// Debug-only lab bench for `MixEngine`: `swift run "AI Mix Assistant" mix-render <wav-folder> <mixgraph.json>`
-/// renders `mix.wav` next to the input WAVs and prints the measured facts. It is a test rig, not product UI — the
-/// entry point in `AIMixAssistantApp` compiles it in DEBUG builds only, and it never touches Logic or the app's data.
+/// The render child process (and the lab bench): `mix-render <wav-folder> <mixgraph.json>` renders `mix.wav`
+/// through `MixEngine` — no UI, no Logic, none of the app's data — and prints the measured facts. It is compiled
+/// into every build because the app launches ITSELF with this subcommand for each render (`RenderChildProcess`), so
+/// a plugin crash kills only this short-lived child, never the UI. `--result <path>` is the parent's contract: the
+/// result file carries the `MixRenderResult` facts as JSON and is written atomically only AFTER `mix.wav` is
+/// complete, so its presence proves the render finished even when a plugin then kills the child during teardown.
 enum MixEngineCLI {
     /// Runs the subcommand and exits the process when the first argument requests it; returns silently otherwise so
     /// the ordinary SwiftUI launch proceeds.
@@ -12,10 +15,14 @@ enum MixEngineCLI {
     }
 
     /// `mix-render` body, separated from `exit` so it is testable: arguments are `<wav-folder> <mixgraph.json>` plus
-    /// optional `--tail <seconds>`, `--int24` and `--no-bus-metrics`. Returns the process exit code.
+    /// optional `--tail <seconds>`, `--int24`, `--no-bus-metrics`, `--output <path>` (defaults to `mix.wav` next to
+    /// the inputs) and `--result <path>` (the JSON result file, written atomically after the mix — the parent's
+    /// completion sentinel). Returns the process exit code.
     static func run(arguments: [String]) -> Int32 {
         var positional: [String] = []
         var options = MixEngine.Options(tailSeconds: 2, output: .float32, measureBuses: true)
+        var outputPath: String?
+        var resultPath: String?
         var index = 0
         while index < arguments.count {
             let argument = arguments[index]
@@ -30,6 +37,14 @@ enum MixEngineCLI {
             case "--no-bus-metrics":
                 options.measureBuses = false
                 index += 1
+            case "--output":
+                guard index + 1 < arguments.count else { return fail("--output requires a file path.") }
+                outputPath = arguments[index + 1]
+                index += 2
+            case "--result":
+                guard index + 1 < arguments.count else { return fail("--result requires a file path.") }
+                resultPath = arguments[index + 1]
+                index += 2
             default:
                 guard !argument.hasPrefix("--") else { return fail("Unknown option \(argument).\n\(usage)") }
                 positional.append(argument)
@@ -44,9 +59,20 @@ enum MixEngineCLI {
         let graph: MixGraph
         do { graph = try JSONDecoder().decode(MixGraph.self, from: try Data(contentsOf: graphURL)) }
         catch { return fail("Could not load the MixGraph JSON at \(graphURL.path): \(error.localizedDescription)") }
-        let outputURL = folder.appendingPathComponent("mix.wav")
+        let outputURL = outputPath.map { URL(fileURLWithPath: $0) } ?? folder.appendingPathComponent("mix.wav")
         do {
             let result = try MixEngine().render(graph: graph, folder: folder, outputURL: outputURL, options: options)
+            // The result file is the completion sentinel: written atomically, strictly after `render` returned with
+            // `mix.wav` complete and closed, and before anything else — so a plugin that corrupts the process during
+            // the still-pending Audio Unit teardown (deallocation the runtime may run any time after this point)
+            // kills the child AFTER everything of value is on disk.
+            if let resultPath {
+                let resultURL = URL(fileURLWithPath: resultPath)
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                do { try encoder.encode(result).write(to: resultURL, options: .atomic) }
+                catch { return fail("The render completed but the result file at \(resultURL.path) could not be written: \(error.localizedDescription)") }
+            }
             print(report(for: result))
             return 0
         } catch {
@@ -54,7 +80,7 @@ enum MixEngineCLI {
         }
     }
 
-    private static let usage = "Usage: mix-render <wav-folder> <mixgraph.json> [--tail <seconds>] [--int24] [--no-bus-metrics]"
+    private static let usage = "Usage: mix-render <wav-folder> <mixgraph.json> [--tail <seconds>] [--int24] [--no-bus-metrics] [--output <path>] [--result <path>]"
 
     private static func fail(_ message: String) -> Int32 {
         FileHandle.standardError.write(Data(("mix-render: " + message + "\n").utf8))

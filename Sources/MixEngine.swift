@@ -66,7 +66,7 @@ enum MixEngineError: LocalizedError, Equatable {
 /// One parameter the engine set on an Audio Unit: what the graph asked, what the parameter tree resolved it to, and
 /// what the parameter reported when read back immediately after the write. `verified` is a plain tolerance comparison
 /// (the unit may legitimately quantize); the read-back value is always reported so nothing diverges silently.
-struct MixAppliedParameter: Sendable {
+struct MixAppliedParameter: Codable, Sendable {
     var key: String
     var resolvedIdentifier: String
     var resolvedName: String
@@ -79,7 +79,7 @@ struct MixAppliedParameter: Sendable {
 /// to, the full parameter write/read-back report, and the latency the unit itself reported. The latency is read from
 /// `auAudioUnit.latency` only after the engine allocated render resources — the one moment the number is real — so
 /// every latency figure in a report traces to the unit's own statement, never to a guess.
-struct MixInsertReport: Sendable {
+struct MixInsertReport: Codable, Sendable {
     var location: String
     var requested: String
     var resolvedName: String
@@ -98,8 +98,10 @@ struct MixInsertReport: Sendable {
 /// names what was and was not measured. `renderedFrames` counts the frames written to the mix file: the graph's own
 /// latency (`compensatedLatencyFrames`) is rendered in addition and trimmed from the head, so the file stays
 /// positionally at t=0 with its full tail. Anything the compensation could NOT align — a fractional latency a unit
-/// reported — is named in `notes` instead of being silently absorbed.
-struct MixRenderResult: Sendable {
+/// reported — is named in `notes` instead of being silently absorbed. The result is `Codable` because it doubles as
+/// the child render process's result file: the child writes these facts as JSON after `mix.wav` is complete, and the
+/// parent app decodes them without depending on the child's clean exit (see `RenderChildProcess`).
+struct MixRenderResult: Codable, Sendable {
     var outputURL: URL
     var sampleRate: Double
     var renderedFrames: Int
