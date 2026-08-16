@@ -29,7 +29,37 @@ struct ApplicationLauncher: Sendable {
     @Published var mixStatus = ""
     @Published var mixPhase: AudioExportPhase = .idle
     @Published var showBounceConfirm = false
-    let analyzer: any DAWAnalyzer = LogicAccessibilityAnalyzer(); let normalizer = SnapshotNormalizer(); let validator = CommandValidator(); let audioExtractor = AudioAssetExtractor(); let metricsAnalyzer = AudioMetricsAnalyzer(); let exporter = LogicExportAutomator(); let pluginInventory = PluginInventory(); private var store: SessionStore?
+    let analyzer: any DAWAnalyzer = LogicAccessibilityAnalyzer(); let normalizer = SnapshotNormalizer(); let validator = CommandValidator(); let audioExtractor = AudioAssetExtractor(); let metricsAnalyzer = AudioMetricsAnalyzer(); let exporter = LogicExportAutomator(); let pluginInventory = PluginInventory(); var store: SessionStore?
+
+    // MARK: Capy assistant (LLM over the Capy API) — orchestration state; the API key itself lives ONLY in the
+    // Keychain (CapyKeyStore) and is loaded at call time, never held in published state.
+    @Published var capyKeyPresent = CapyKeyStore().load()?.isEmpty == false
+    @Published var capyKeyStatus = ""
+    @Published var capyProjectID = UserDefaults.standard.string(forKey: "capyProjectID") ?? "" { didSet { UserDefaults.standard.set(capyProjectID, forKey: "capyProjectID") } }
+    @Published var capyModelID = UserDefaults.standard.string(forKey: "capyModelID") ?? CapyAPI.defaultModel { didSet { UserDefaults.standard.set(capyModelID, forKey: "capyModelID") } }
+    @Published var capyReasoning = UserDefaults.standard.string(forKey: "capyReasoning") ?? "default" { didSet { UserDefaults.standard.set(capyReasoning, forKey: "capyReasoning") } }
+    @Published var assistantBusy = false
+    @Published var assistantStatus = ""
+    @Published var assistantThreadID: String?
+    @Published var assistantThreadStatus = ""
+    @Published var assistantTranscript: [CapyMessage] = []
+    @Published var assistantAwaitingConfirmation = false
+    @Published var assistantConfirmationText = ""
+    @Published var assistantGraphReady = false
+    @Published var assistantGraphIssues: [String] = []
+    @Published var assistantFailure: String?
+    @Published var assistantCanResumePolling = false
+    var assistantConfirmationSent = false
+    var assistantWork: Task<Void, Never>?
+
+    // MARK: Offline render (MixEngine) — the Render stage's state; manual paste works with no API key at all.
+    @Published var renderGraphText = ""
+    @Published var renderIssues: [String] = []
+    @Published var renderGraphValid = false
+    @Published var renderStatus = ""
+    @Published var renderRunning = false
+    @Published var renderedMixURL: URL?
+    @Published var renderSummary = ""
     /// Metrics of already-analyzed WAVs keyed by absolute path; entries are reused only while the file's size and modification date match, so Refresh Export Status never re-analyzes unchanged files.
     private var metricsCache: [String: AudioMetrics] = [:]
     private let storeInitFailure: String?
@@ -166,9 +196,16 @@ struct ApplicationLauncher: Sendable {
     /// from it. A stage is complete only when its own work is really done — Audio requires every discovered audio track
     /// to have a real exported WAV on disk AND the bounced Stereo Out mix validated in current/mix (the sum is the
     /// loudness reference the AI package is built around), never a merely prepared asset list or the tracks alone.
-    func isComplete(_ stage: WorkflowStage) -> Bool { switch stage { case .connection: connection.found && connection.accessibilityTrusted && connection.projectOpen == true; case .analysis: normalized != nil; case .audio: !audioAssets.isEmpty && audioAssets.allSatisfy { $0.status == .exported } && mixAsset != nil; case .aiPackage: !aiPackage.isEmpty; case .review: !validated.isEmpty } }
-    /// Strict step order: a stage opens only when the previous one is complete — never every stage at once after a scan.
-    func isAvailable(_ target: WorkflowStage) -> Bool { WorkflowStage(rawValue: target.rawValue - 1).map(isComplete) ?? true }
+    func isComplete(_ stage: WorkflowStage) -> Bool { switch stage { case .connection: connection.found && connection.accessibilityTrusted && connection.projectOpen == true; case .analysis: normalized != nil; case .audio: !audioAssets.isEmpty && audioAssets.allSatisfy { $0.status == .exported } && mixAsset != nil; case .aiPackage: !aiPackage.isEmpty; case .assistant: assistantGraphReady; case .render: renderedMixURL != nil; case .review: !validated.isEmpty } }
+    /// Strict step order up to the AI package: a stage opens only when the previous one is complete. The three
+    /// consumers of the package — Assistant (needs the Capy key), Render (works with a manual paste and no key at
+    /// all) and Review (the Logic live path) — each open on the package alone, so no optional path gates another.
+    func isAvailable(_ target: WorkflowStage) -> Bool {
+        switch target {
+        case .assistant, .render, .review: isComplete(.aiPackage)
+        default: WorkflowStage(rawValue: target.rawValue - 1).map(isComplete) ?? true
+        }
+    }
     func go(to target: WorkflowStage) { if isAvailable(target) { stage = target } }
     @Published var scanProgress = 0
     private var scanWork: Task<RawSnapshot, Error>?
@@ -180,7 +217,7 @@ struct ApplicationLauncher: Sendable {
             do {
                 try await store.resetForNewAnalysis()
                 analysisSessionID = "analysis_\(ISO8601DateFormatter().string(from: Date()))"
-                raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; resetExecutionState(); resetVerificationState(); audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil; metricsCache = [:]; exportSettings = nil; mixAsset = nil; mixStatus = ""; mixPhase = .idle; showBounceConfirm = false
+                raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""; planText = ""; validated = []; resetExecutionState(); resetVerificationState(); resetAssistantState(); resetRenderState(); audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; packageFolderURL = nil; packageZipURL = nil; metricsCache = [:]; exportSettings = nil; mixAsset = nil; mixStatus = ""; mixPhase = .idle; showBounceConfirm = false
                 log.append("Previous AI Mix Assistant analysis data removed. Starting a clean read-only scan.")
                 let exporter = exporter
                 let mixerOutcome = await Task.detached(priority: .userInitiated) { exporter.ensureMixerVisible() }.value
@@ -216,7 +253,14 @@ struct ApplicationLauncher: Sendable {
     @Published var packageFolderURL: URL?; @Published var packageZipURL: URL?
     var packageReadiness: PackageReadiness { PackageReadiness.evaluate(snapshot: normalized, assets: audioAssets) }
     func ensurePluginInventory() { if availablePlugins.isEmpty { availablePlugins = pluginInventory.discoverAvailable() } }
-    func generateAIPackage() { guard let snapshot = normalized else { aiPackageStatus = "Run a full analysis first."; return }; ensurePluginInventory(); aiPackage = AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: audioAssets, plugins: availablePlugins, delivery: .markdownOnly, exportSettings: exportSettings, mix: mixAsset, postApply: postApplyReport); let r = packageReadiness; aiPackageStatus = "AI package generated (\(r.overall.rawValue)\(postApplyVerifiedAt != nil ? ", post-apply" : "")) · \(availablePlugins.count) plugins available." + (r.audioTotal > 0 && r.audioExported < r.audioTotal ? " Audio incomplete: \(r.audioTotal - r.audioExported) WAV missing." : "") }
+    func generateAIPackage() { guard let package = packageText(delivery: .markdownOnly) else { aiPackageStatus = "Run a full analysis first."; return }; aiPackage = package; let r = packageReadiness; aiPackageStatus = "AI package generated (\(r.overall.rawValue)\(postApplyVerifiedAt != nil ? ", post-apply" : "")) · \(availablePlugins.count) plugins available." + (r.audioTotal > 0 && r.audioExported < r.audioTotal ? " Audio incomplete: \(r.audioTotal - r.audioExported) WAV missing." : "") }
+    /// The package document in a given delivery, built from the current analysis state; nil before an analysis exists.
+    /// The Assistant sends the `.apiDelivery` variant — same facts, API-specific preamble and response contract.
+    func packageText(delivery: PackageDelivery) -> String? {
+        guard let snapshot = normalized else { return nil }
+        ensurePluginInventory()
+        return AIPackageGenerator().make(snapshot: snapshot, sessionID: analysisSessionID, audio: audioAssets, plugins: availablePlugins, delivery: delivery, exportSettings: exportSettings, mix: mixAsset, postApply: postApplyReport)
+    }
     func savePackage() {
         guard let snapshot = normalized, let raw, let store else { aiPackageStatus = "Run a full analysis first."; return }
         ensurePluginInventory()
@@ -268,7 +312,7 @@ struct ApplicationLauncher: Sendable {
             do {
                 try await store.resetForNewAnalysis()
                 raw = nil; normalized = nil; aiPackage = ""; aiPackageURL = nil; aiPackageStatus = ""
-                planText = ""; validated = []; planStatus = ""; resetExecutionState(); resetVerificationState()
+                planText = ""; validated = []; planStatus = ""; resetExecutionState(); resetVerificationState(); resetAssistantState(); resetRenderState()
                 audioAssets = []; audioStatus = ""; exportPhase = .idle; showExportConfirm = false; metricsCache = [:]; exportSettings = nil
                 mixAsset = nil; mixStatus = ""; mixPhase = .idle; showBounceConfirm = false
                 packageFolderURL = nil; packageZipURL = nil
