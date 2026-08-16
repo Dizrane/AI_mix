@@ -26,6 +26,30 @@ private func writeStereoFloatWAV(_ url: URL, sampleRate: Double = 48000, left: [
 private func mixSine(_ frequency: Double, amplitude: Double, seconds: Double, sampleRate: Double = 48000) -> [Float] {
     (0..<Int(seconds * sampleRate)).map { Float(amplitude * sin(2 * .pi * frequency * Double($0) / sampleRate)) }
 }
+private func mixImpulse(at index: Int, amplitude: Float, length: Int) -> [Float] {
+    var samples = [Float](repeating: 0, count: length)
+    samples[index] = amplitude
+    return samples
+}
+private func argmaxAbs(_ samples: [Float]) -> Int {
+    var best = 0
+    for index in samples.indices where abs(samples[index]) > abs(samples[best]) { best = index }
+    return best
+}
+/// The latency AUPeakLimiter itself reports at the mix rate, read from an independent instance after allocating its
+/// render resources — the same source the engine compensates from. The tests derive every expectation from this
+/// runtime number instead of hardcoding any plugin's latency; when the installed limiter reports zero, the alignment
+/// assertions still hold exactly (the zero case is a provable no-op).
+private func probedLimiterLatencyFrames(sampleRate: Double = 48000) throws -> Int {
+    let description = AudioComponentDescription(componentType: kAudioUnitType_Effect, componentSubType: kAudioUnitSubType_PeakLimiter, componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0)
+    let probe = AVAudioUnitEffect(audioComponentDescription: description)
+    let format = try #require(AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2))
+    try probe.auAudioUnit.inputBusses[0].setFormat(format)
+    try probe.auAudioUnit.outputBusses[0].setFormat(format)
+    try probe.auAudioUnit.allocateRenderResources()
+    defer { probe.auAudioUnit.deallocateRenderResources() }
+    return MixLatencyMath.insertLatency(reportedSeconds: probe.auAudioUnit.latency, sampleRate: sampleRate).frames
+}
 private func readChannels(_ url: URL) throws -> [[Float]] {
     let file = try AVAudioFile(forReading: url)
     let buffer = try #require(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)))
@@ -158,10 +182,172 @@ private let peakLimiter = "aufx/lmtr/appl"
     #expect(result.notes.contains { $0.hasPrefix("bus \"verb\"") }, "the bus measurement must be reported by name, measured or honestly unavailable")
 }
 
+// MARK: - Latency compensation: pure planning math
+
+/// Two tracks with unequal insert-chain latencies are aligned purely by player offsets: the lower-latency track
+/// starts later, no DSP enters any path, and the trim removes the slowest chain from the output.
+@Test func mixLatencyPlanAlignsUnequalTrackChainsByPlayerOffsets() {
+    let plan = MixLatencyMath.plan(trackChainFrames: ["A": 0, "B": 576], busChainFrames: [:], masterChainFrames: 0)
+    #expect(plan.playerOffsetFrames == ["A": 576, "B": 0])
+    #expect(plan.busOutputDelayFrames.isEmpty)
+    #expect(plan.directBranchDelayFrames == 0)
+    #expect(plan.trimFrames == 576)
+}
+
+/// A send into a latent bus splits one signal into two branches of different latency; the plan repairs the divergence
+/// where it happens — the direct branch waits for the slowest bus, every bus output waits for the difference — while
+/// player offsets still equalize the tracks before any fan-out.
+@Test func mixLatencyPlanDelaysDivergingBranchesAgainstLatentBuses() {
+    let plan = MixLatencyMath.plan(trackChainFrames: ["T": 128, "U": 0], busChainFrames: ["verb": 512, "comp": 64], masterChainFrames: 0)
+    #expect(plan.playerOffsetFrames == ["T": 0, "U": 128])
+    #expect(plan.busOutputDelayFrames == ["verb": 0, "comp": 448])
+    #expect(plan.directBranchDelayFrames == 512)
+    #expect(plan.trimFrames == 128 + 512)
+}
+
+/// The master chain sits on the single path after every sum, so its latency needs no alignment — only removal from
+/// the head of the written file.
+@Test func mixLatencyPlanTrimsMasterChainLatencyWithoutAligningAnything() {
+    let plan = MixLatencyMath.plan(trackChainFrames: ["A": 0, "B": 0], busChainFrames: [:], masterChainFrames: 576)
+    #expect(plan.playerOffsetFrames == ["A": 0, "B": 0])
+    #expect(plan.directBranchDelayFrames == 0)
+    #expect(plan.trimFrames == 576)
+}
+
+/// A graph whose units all report zero latency plans an all-zero no-op: nothing is offset, delayed or trimmed.
+@Test func mixLatencyPlanIsANoOpForAZeroLatencyGraph() {
+    let plan = MixLatencyMath.plan(trackChainFrames: ["A": 0, "B": 0], busChainFrames: ["verb": 0], masterChainFrames: 0)
+    #expect(plan.playerOffsetFrames == ["A": 0, "B": 0])
+    #expect(plan.busOutputDelayFrames == ["verb": 0])
+    #expect(plan.directBranchDelayFrames == 0)
+    #expect(plan.trimFrames == 0)
+}
+
+/// Reported seconds convert to whole frames with the uncompensatable remainder carried, not hidden: an exact frame
+/// count leaves only float noise, a fractional latency names its fraction, a negative report contributes nothing.
+@Test func mixLatencyMathConvertsReportedSecondsToWholeFramesHonestly() {
+    let exact = MixLatencyMath.insertLatency(reportedSeconds: 576.0 / 48000.0, sampleRate: 48000)
+    #expect(exact.frames == 576)
+    #expect(abs(exact.residualSamples) < MixLatencyMath.residualNoteThresholdSamples)
+    let fractional = MixLatencyMath.insertLatency(reportedSeconds: 100.4 / 48000.0, sampleRate: 48000)
+    #expect(fractional.frames == 100)
+    #expect(abs(fractional.residualSamples - 0.4) < 1e-6)
+    let negative = MixLatencyMath.insertLatency(reportedSeconds: -0.001, sampleRate: 48000)
+    #expect(negative.frames == 0)
+    #expect(abs(negative.residualSamples + 48.0) < 1e-9)
+    let zero = MixLatencyMath.insertLatency(reportedSeconds: 0, sampleRate: 48000)
+    #expect(zero == MixInsertLatency(frames: 0, residualSamples: 0))
+}
+
+/// The alignment delay ring is bit-exact by construction, proven with plain `==` on the floats: input comes back
+/// untouched exactly `delayFrames` later, across arbitrary block boundaries, and zero delay is the identity.
+@Test func sampleExactDelayRingReplaysInputBitExactly() {
+    var ring = SampleExactDelayRing(delayFrames: 3)
+    #expect(ring.process([1, 2, 3, 4, 5]) == [0, 0, 0, 1, 2])
+    #expect(ring.process([6, 7]) == [3, 4])
+    #expect(ring.process([8]) == [5])
+    var identity = SampleExactDelayRing(delayFrames: 0)
+    let input: [Float] = [0.125, -0.25, 0.3]
+    #expect(identity.process(input) == input)
+    var longDelay = SampleExactDelayRing(delayFrames: 5)
+    #expect(longDelay.process([1, 2]) == [0, 0])
+    #expect(longDelay.process([3]) == [0])
+    #expect(longDelay.process([4, 5, 6, 7]) == [0, 1, 2, 3])
+}
+
+// MARK: - Latency compensation: rendered proof
+
+/// Two tracks carry an impulse at the same input sample; one runs through AUPeakLimiter on its own chain. The
+/// limiter's latency is read from the unit at runtime (never hardcoded): the solo render proves the trim (the impulse
+/// lands exactly where the input put it), and the two-track render proves alignment arithmetically — the mix at the
+/// impulse sample equals the sum of the individual renders there, which is only possible when both branches landed on
+/// the same frame. Every assertion holds exactly for a zero-latency limiter too (the provable no-op case).
+@Test func mixEngineAlignsUnequalTrackChainsSampleExactly() throws {
+    let dir = try mixFixtureDirectory()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let position = 4800
+    let impulse = mixImpulse(at: position, amplitude: 0.4, length: 24000)
+    try writeStereoFloatWAV(dir.appendingPathComponent("a.wav"), left: impulse, right: impulse)
+    try writeStereoFloatWAV(dir.appendingPathComponent("b.wav"), left: impulse, right: impulse)
+    let probedLatency = try probedLimiterLatencyFrames()
+
+    let limited = try render(MixGraph(tracks: [.init(name: "B", file: "b.wav", inserts: [.init(component: peakLimiter)])]), folder: dir, output: "mix_b.wav")
+    #expect(limited.inserts.first?.latencyFrames == probedLatency)
+    #expect(limited.compensatedLatencyFrames == probedLatency)
+    #expect(limited.renderedFrames == 24000)
+    let limitedChannels = try readChannels(dir.appendingPathComponent("mix_b.wav"))
+    #expect(argmaxAbs(limitedChannels[0]) == position, "the limited track's impulse must land exactly at the input position — the trim removed exactly the reported latency")
+
+    let together = try render(MixGraph(tracks: [
+        .init(name: "A", file: "a.wav"),
+        .init(name: "B", file: "b.wav", inserts: [.init(component: peakLimiter)])
+    ]), folder: dir)
+    #expect(together.compensatedLatencyFrames == probedLatency)
+    let channels = try readChannels(dir.appendingPathComponent("mix.wav"))
+    #expect(argmaxAbs(channels[0]) == position)
+    let expected = 0.4 + limitedChannels[0][position]
+    #expect(abs(channels[0][position] - expected) < 1e-4, "the aligned sum at the impulse must equal the individual renders' sum (got \(channels[0][position]), expected \(expected))")
+}
+
+/// A send fans one track out into two branches: direct to the master sum and through a bus whose insert carries
+/// latency. Offsets cannot split a fan-out, so this proves the per-branch delays: the bus branch's energy must ADD at
+/// exactly the input impulse sample (any misalignment leaves the mix at the bare direct amplitude and puts a second
+/// peak elsewhere), and every dominant sample sits at that one position.
+@Test func mixEngineAlignsSendBusFanOutSampleExactly() throws {
+    let dir = try mixFixtureDirectory()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let position = 4800
+    let impulse = mixImpulse(at: position, amplitude: 0.4, length: 24000)
+    try writeStereoFloatWAV(dir.appendingPathComponent("t.wav"), left: impulse, right: impulse)
+    let probedLatency = try probedLimiterLatencyFrames()
+    let graph = MixGraph(
+        tracks: [.init(name: "T", file: "t.wav", sends: [.init(bus: "comp", levelDB: 0)])],
+        buses: [.init(name: "comp", inserts: [.init(component: peakLimiter)])]
+    )
+    let result = try render(graph, folder: dir)
+    #expect(result.compensatedLatencyFrames == probedLatency)
+    let channels = try readChannels(dir.appendingPathComponent("mix.wav"))
+    #expect(argmaxAbs(channels[0]) == position)
+    #expect(channels[0][position] > 0.45, "the bus branch must add its impulse at exactly the direct branch's sample (mix at the impulse was \(channels[0][position]))")
+    let peak = abs(channels[0][argmaxAbs(channels[0])])
+    for index in channels[0].indices where abs(channels[0][index]) > 0.5 * peak {
+        #expect(index == position, "a dominant sample away from the impulse (index \(index)) means the branches did not converge")
+    }
+}
+
+/// A latent bus that receives no sends still switches the graph onto the branch-delay topology, so the tracks' direct
+/// path runs through the alignment delay — and must come out bit-faithful: the written mix is exactly the input
+/// impulse at exactly the input position, everything else silent.
+@Test func mixEngineAlignmentDelayKeepsTheDirectPathBitFaithful() throws {
+    let dir = try mixFixtureDirectory()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let position = 4800
+    let impulse = mixImpulse(at: position, amplitude: 0.4, length: 24000)
+    try writeStereoFloatWAV(dir.appendingPathComponent("a.wav"), left: impulse, right: impulse)
+    let probedLatency = try probedLimiterLatencyFrames()
+    let graph = MixGraph(
+        tracks: [.init(name: "A", file: "a.wav")],
+        buses: [.init(name: "pad", inserts: [.init(component: peakLimiter)])]
+    )
+    let result = try render(graph, folder: dir)
+    #expect(result.compensatedLatencyFrames == probedLatency)
+    #expect(result.renderedFrames == 24000)
+    let channels = try readChannels(dir.appendingPathComponent("mix.wav"))
+    for channel in channels {
+        #expect(abs(channel[position] - 0.4) <= 1e-4, "the delayed direct path must stay faithful within the suite's unity-path tolerance (impulse came out as \(channel[position]))")
+        for index in channel.indices where index != position && abs(channel[index]) > 1e-4 {
+            Issue.record("expected silence at \(index), got \(channel[index]) — the alignment delay must not color or smear the signal")
+            break
+        }
+    }
+}
+
 // MARK: - Limiter
 
 /// A deliberately clipping sum (two 0.9 sines in phase) counts clipped samples without a limiter and zero with
-/// AUPeakLimiter on the master — measured by the same clipped-sample metric the app uses for exported WAVs.
+/// AUPeakLimiter on the master — measured by the same clipped-sample metric the app uses for exported WAVs. The
+/// master limiter's look-ahead latency must additionally NOT shift the render: the trim equals exactly the latency
+/// the unit itself reported, and an impulse through the same master chain lands exactly at its input position.
 @Test func mixEnginePeakLimiterPreventsClippedSamples() throws {
     let dir = try mixFixtureDirectory()
     defer { try? FileManager.default.removeItem(at: dir) }
@@ -173,11 +359,23 @@ private let peakLimiter = "aufx/lmtr/appl"
     let clipped = try render(MixGraph(tracks: tracks, master: .init(gainDB: -1)), folder: dir, output: "mix_clipped.wav")
     let clippedCount = try #require(clipped.mixMetrics?.clippedSampleCount.value)
     #expect(clippedCount > 0, "the unlimited sum must really clip, or the limiter test proves nothing")
+    #expect(clipped.compensatedLatencyFrames == 0, "a graph without inserts has nothing to compensate")
 
     let limited = try render(MixGraph(tracks: tracks, master: .init(gainDB: -1, inserts: [.init(component: peakLimiter)])), folder: dir)
     #expect(limited.mixMetrics?.clippedSampleCount.value == 0)
     let limitedPeak = try #require(limited.mixMetrics?.samplePeakDBFS.value)
     #expect(limitedPeak < 0)
+    #expect(limited.renderedFrames == 48000)
+    #expect(limited.compensatedLatencyFrames == limited.inserts.first?.latencyFrames)
+
+    let position = 9600
+    let impulse = mixImpulse(at: position, amplitude: 0.5, length: 24000)
+    try writeStereoFloatWAV(dir.appendingPathComponent("imp.wav"), left: impulse, right: impulse)
+    let aligned = try render(MixGraph(tracks: [.init(name: "I", file: "imp.wav")], master: .init(inserts: [.init(component: peakLimiter)])), folder: dir, output: "mix_impulse.wav")
+    #expect(aligned.compensatedLatencyFrames == aligned.inserts.first?.latencyFrames)
+    #expect(aligned.renderedFrames == 24000)
+    let impulseChannels = try readChannels(dir.appendingPathComponent("mix_impulse.wav"))
+    #expect(argmaxAbs(impulseChannels[0]) == position, "the master limiter's latency must be trimmed, not shifted into the mix")
 }
 
 // MARK: - Named refusals
