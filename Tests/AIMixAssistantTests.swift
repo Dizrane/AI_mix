@@ -584,8 +584,8 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     let mix = MixBounceAsset(relativePath: "mix/song.wav", durationSeconds: .known(60), sampleRate: .known(48000), channels: .known(2), bitDepth: .known(24), format: .known("PCM"), bounceSettings: nil, metrics: nil)
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage, mix: mix)
     #expect(md.contains("the bounced Stereo Out mix in `mix/`"))
-    #expect(md.contains("listen to the bounced Stereo Out mix in `mix/` as the reference"))
-    #expect(md.contains("Listen separately to the bounced Stereo Out mix"))
+    #expect(md.contains("listen first to the bounced Stereo Out mix in `mix/`"))
+    #expect(md.contains("Finally return to the mix"))
     #expect(md.contains("never substitute an inference from isolated tracks for listening to the sum"))
 }
 /// A live run mixed the two deliveries: the user pasted the Copy-for-AI text AND attached the Save-Package ZIP. Each variant
