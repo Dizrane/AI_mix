@@ -94,6 +94,19 @@ private func client(_ transport: FakeTransport, key: String = "test-key") -> Cap
     #expect(transport.requests[1].url?.query()?.contains("after=c1") == true)
 }
 
+// MARK: - Model picker rows
+
+@Test func pickerKeepsAStoredUnknownModelSelectable() {
+    #expect(CapyAPI.pickerModels(current: CapyAPI.defaultModel) == CapyAPI.knownModels)
+    let legacy = "anthropic/claude-opus-4-5"
+    #expect(!CapyAPI.knownModels.contains(legacy)) // the list moved on; the stored id must still be offered
+    #expect(CapyAPI.pickerModels(current: legacy) == [legacy] + CapyAPI.knownModels)
+}
+@Test func theDefaultModelIsInTheCuratedList() {
+    #expect(CapyAPI.knownModels.contains(CapyAPI.defaultModel))
+    #expect(Set(CapyAPI.knownModels).count == CapyAPI.knownModels.count)
+}
+
 // MARK: - Polling discipline
 
 @Test func pollingBacksOffToTheNamedCeiling() {

@@ -15,9 +15,20 @@ enum CapyAPI {
         #endif
         return productionBaseURL
     }()
-    /// Model ids the picker offers. The API takes any model id string; this list is the curated, known-good set.
-    static let knownModels = ["anthropic/claude-opus-4-5", "anthropic/claude-sonnet-4-6", "anthropic/claude-haiku-4-5", "openai/gpt-5.3-codex", "openai/gpt-5.4", "google/gemini-3.1-pro-preview"]
-    static let defaultModel = "anthropic/claude-opus-4-5"
+    /// Model ids the picker offers — the current generation on the Capy platform. The API takes any model id
+    /// string, so this list is curation, not a limit.
+    static let knownModels = [
+        "anthropic/claude-fable-5", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5", "anthropic/claude-haiku-4-5",
+        "openai/gpt-5.6-sol", "openai/gpt-5.6-terra", "openai/gpt-5.6-luna", "openai/gpt-5.5", "openai/gpt-5.3-codex",
+        "google/gemini-3.1-pro-preview", "google/gemini-3-flash-preview",
+        "xai/grok-4.5", "deepseek/deepseek-v4-pro", "moonshotai/kimi-k3", "zai/glm-5.2",
+    ]
+    static let defaultModel = "anthropic/claude-opus-5"
+    /// The picker's rows: the curated list, plus the currently stored id when it is not in the list (saved by an
+    /// older version, or set by hand) — an unknown selection stays visible and selectable, never silently blank.
+    static func pickerModels(current: String) -> [String] {
+        knownModels.contains(current) ? knownModels : [current] + knownModels
+    }
     /// Reasoning modes from the API schema, plus "default" meaning the field is omitted and the platform decides.
     static let reasoningModes = ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"]
 }
