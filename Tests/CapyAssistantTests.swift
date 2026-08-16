@@ -209,6 +209,19 @@ private func graph(tracks: [MixGraphTrack], buses: [MixGraphBus] = [], master: M
     let ambiguous = MixGraphDryCheck.validate(graph(tracks: [.init(name: "Beat", file: "Beat.wav", inserts: [.init(name: "Duplicate")])]), audioFiles: ["Beat.wav"], installedPlugins: installed)
     #expect(ambiguous.count == 1); #expect(ambiguous[0].contains("matches 2 installed plugins"))
 }
+@Test func dryCheckRejectsANonEffectComponentEvenWhenInstalled() {
+    let withMusicEffect = installed + [PluginInventoryItem(name: "FabFilter Pro-L 2", manufacturer: "FabFilter", type: "Music Effect", identifier: "aumf/FL2p/FabF", version: nil)]
+    let issues = MixGraphDryCheck.validate(graph(tracks: [.init(name: "Beat", file: "Beat.wav")], master: .init(inserts: [.init(component: "aumf/FL2p/FabF")])), audioFiles: ["Beat.wav"], installedPlugins: withMusicEffect)
+    #expect(issues == ["master insert 1: aumf/FL2p/FabF is not an audio effect (type \"aufx\"); this prototype loads effects only."])
+    // The identifier itself states the type, so the mismatch is named even before any inventory exists.
+    let withoutInventory = MixGraphDryCheck.validate(graph(tracks: [.init(name: "Beat", file: "Beat.wav", inserts: [.init(component: "aumu/samp/appl")])]), audioFiles: ["Beat.wav"], installedPlugins: [])
+    #expect(withoutInventory.count == 1); #expect(withoutInventory[0].contains("is not an audio effect"))
+}
+@Test func dryCheckMatchesNamesAgainstInstalledEffectsOnly() {
+    let withMusicEffect = installed + [PluginInventoryItem(name: "FabFilter Pro-L 2", manufacturer: "FabFilter", type: "Music Effect", identifier: "aumf/FL2p/FabF", version: nil)]
+    let issues = MixGraphDryCheck.validate(graph(tracks: [.init(name: "Beat", file: "Beat.wav", inserts: [.init(name: "FabFilter Pro-L 2")])]), audioFiles: ["Beat.wav"], installedPlugins: withMusicEffect)
+    #expect(issues.count == 1); #expect(issues[0].contains("no installed Audio Unit effect matches"))
+}
 @Test func dryCheckHonestlySkipsCatalogueChecksWithoutAnInventory() {
     let g = graph(tracks: [.init(name: "Beat", file: "Beat.wav", inserts: [.init(component: "aufx/none/none"), .init(name: "Anything")])]), files = ["Beat.wav"]
     #expect(MixGraphDryCheck.validate(g, audioFiles: files, installedPlugins: []).isEmpty)
@@ -225,9 +238,11 @@ private func exportedAsset(_ id: String, name: String, file: String) -> AudioAss
 
 @Test func apiDeliveryTeachesTheMixGraphContractInsteadOfTheMixPlan() {
     let md = AIPackageGenerator().make(snapshot: apiFixture(), sessionID: "t", audio: [exportedAsset("a1", name: "Beat", file: "Beat.wav"), exportedAsset("a2", name: "Vocal", file: "Vocal.wav")], plugins: installed, delivery: .apiDelivery)
-    #expect(md.contains("Package schema: `2.30`"))
+    #expect(md.contains("Package schema: `2.31`"))
     #expect(md.contains("DELIVERY: API (TEXT ONLY)"))
     #expect(md.contains("## MixGraph response contract (machine-validated)"))
+    #expect(md.contains("only from entries whose identifier starts with `aufx/`"))
+    #expect(md.contains("its type MUST be `aufx`"))
     #expect(!md.contains("## Mix Plan schema (machine-validated)"))
     #expect(md.contains("6. MIX GRAPH — only after confirmation."))
     #expect(md.contains("contains NO fenced json code block at all"))
