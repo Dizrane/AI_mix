@@ -84,7 +84,12 @@ struct AssistantDialogRecord: Codable, Sendable {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { capyKeyStatus = "Enter a key first."; return }
         if let failure = CapyKeyStore().save(trimmed) { capyKeyStatus = failure }
-        else { capyKeyPresent = true; capyKeyStatus = "Key saved to the macOS Keychain. It never leaves the Keychain except as the Authorization header of Capy API requests." }
+        else {
+            capyKeyPresent = true
+            let projectMissing = capyProjectID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            capyKeyStatus = "Key saved to the macOS Keychain. It never leaves the Keychain except as the Authorization header of Capy API requests."
+                + (projectMissing ? " Now add the project id — the Assistant needs both (a capy.ai project without any GitHub repository works)." : "")
+        }
     }
 
     func removeCapyKey() {

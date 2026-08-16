@@ -104,6 +104,7 @@ struct SettingsView: View {
             Card {
                 Text("AI (Capy API)").font(.headline)
                 Text("Lets the Assistant stage run the model dialog itself over the Capy API (the only network host this feature talks to). The key is stored in the macOS Keychain only and leaves it solely as the Authorization header of Capy requests. Without a key the app works fully manually: copy the AI Package yourself and paste the MixGraph on the Render screen.").font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text("The Assistant needs BOTH the key and a project id. Create a project once at capy.ai — no GitHub repository is required — and copy its id from the project page URL. The Capy API offers no call that creates or lists projects, so the app cannot create one for you.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 10) {
                     SecureField(model.capyKeyPresent ? "Key saved — enter a new key to replace it" : "Capy API key", text: $keyInput).textFieldStyle(.roundedBorder)
                     Button("Save") { model.saveCapyKey(keyInput); if model.capyKeyPresent { keyInput = "" } }.disabled(keyInput.isEmpty)
@@ -114,7 +115,7 @@ struct SettingsView: View {
                     Button("Verify") { model.verifyCapyKey() }.disabled(!model.capyKeyPresent || model.capyProjectID.isEmpty)
                 }
                 HStack(spacing: 10) {
-                    Picker("Model", selection: $model.capyModelID) { ForEach(CapyAPI.knownModels, id: \.self) { Text($0).tag($0) } }
+                    Picker("Model", selection: $model.capyModelID) { ForEach(CapyAPI.pickerModels(current: model.capyModelID), id: \.self) { Text($0).tag($0) } }
                     Picker("Reasoning", selection: $model.capyReasoning) { ForEach(CapyAPI.reasoningModes, id: \.self) { Text($0).tag($0) } }
                 }
                 if !model.capyKeyStatus.isEmpty { Text(model.capyKeyStatus).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
@@ -512,8 +513,8 @@ struct AssistantScreen: View {
         Screen(title: "Assistant", subtitle: "The app sends the analysis package over the Capy API and holds the whole dialog: stages 1\u{2013}4, your confirmation, then the final MixGraph for the offline render.") {
             if !model.assistantConfigured {
                 Card {
-                    Label("No Capy API key configured", systemImage: "key").font(.headline)
-                    Text("Add an API key and the project id in Settings \u{2192} AI (Capy API) to let the app run the dialog itself. Without a key the app stays fully usable: send the AI Package to any model yourself and paste its MixGraph by hand on the Render screen.").font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Label(missingConfigurationTitle, systemImage: "key").font(.headline)
+                    Text("Add the missing piece in Settings \u{2192} AI (Capy API). The project id comes from an existing Capy project: create one once at capy.ai — no GitHub repository is required — and copy the id from the project page URL (the API has no call to create projects, so the app cannot do it for you). Without the API the app stays fully usable: send the AI Package to any model yourself and paste its MixGraph by hand on the Render screen.").font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
             }
             HStack(spacing: 10) {
@@ -561,6 +562,14 @@ struct AssistantScreen: View {
             StageFooter(title: "Continue to Render", enabled: model.isAvailable(.render)) { model.go(to: .render) }
         }
     }
+    /// Names exactly what is missing — an entered key with no project id must never read as "no key".
+    private var missingConfigurationTitle: String {
+        let missingKey = !model.capyKeyPresent
+        let missingProject = model.capyProjectID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if missingKey && missingProject { return "No Capy API key or project id configured" }
+        return missingKey ? "No Capy API key configured" : "No Capy project id configured"
+    }
+
     /// Model prose rendered as inline Markdown; a reply Markdown parsing rejects falls back to the honest plain text.
     private func markdownText(_ text: String) -> Text {
         if let attributed = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) { return Text(attributed) }
