@@ -252,7 +252,8 @@ private let peakLimiter = "aufx/lmtr/appl"
     var longDelay = SampleExactDelayRing(delayFrames: 5)
     #expect(longDelay.process([1, 2]) == [0, 0])
     #expect(longDelay.process([3]) == [0])
-    #expect(longDelay.process([4, 5, 6, 7]) == [0, 1, 2, 3])
+    #expect(longDelay.process([4, 5, 6, 7]) == [0, 0, 1, 2])
+    #expect(longDelay.process([8, 9]) == [3, 4])
 }
 
 // MARK: - Latency compensation: rendered proof
