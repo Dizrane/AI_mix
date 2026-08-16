@@ -144,7 +144,9 @@ struct MixEngine {
         // Input files: the first file's sample rate is the mix rate; anything else is a named refusal.
         var files: [(track: MixGraphTrack, file: AVAudioFile)] = []
         for track in graph.tracks {
-            let url = URL(fileURLWithPath: track.file, relativeTo: folder).standardizedFileURL
+            // Deliberately not URL(fileURLWithPath:relativeTo:): a base URL without a trailing slash silently drops
+            // its last path component during RFC 3986 resolution, sending the lookup into the folder's parent.
+            let url = (track.file.hasPrefix("/") ? URL(fileURLWithPath: track.file) : folder.appendingPathComponent(track.file)).standardizedFileURL
             guard url.path != outputURL.standardizedFileURL.path else { throw MixEngineError.outputWouldOverwriteInput(path: url.path) }
             guard let file = try? AVAudioFile(forReading: url) else { throw MixEngineError.inputFileUnreadable(track: track.name, path: url.path) }
             guard file.length > 0 else { throw MixEngineError.emptyInputFile(track: track.name, path: url.path) }
