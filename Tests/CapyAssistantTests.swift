@@ -12,11 +12,14 @@ private final class FakeTransport: CapyHTTPTransport, @unchecked Sendable {
     private var recorded: [URLRequest] = []
     func enqueue(status: Int, json: String) { lock.lock(); queue.append((status, Data(json.utf8))); lock.unlock() }
     var requests: [URLRequest] { lock.lock(); defer { lock.unlock() }; return recorded }
-    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+    /// The locked mutation lives in a synchronous helper because NSLock.lock() is unavailable inside async functions.
+    private func recordAndDequeue(_ request: URLRequest) -> (status: Int, body: Data)? {
         lock.lock(); defer { lock.unlock() }
         recorded.append(request)
-        guard !queue.isEmpty else { throw CapyAPIError.network("the fake transport queue is empty") }
-        let next = queue.removeFirst()
+        return queue.isEmpty ? nil : queue.removeFirst()
+    }
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        guard let next = recordAndDequeue(request) else { throw CapyAPIError.network("the fake transport queue is empty") }
         return (next.body, HTTPURLResponse(url: request.url!, statusCode: next.status, httpVersion: nil, headerFields: nil)!)
     }
 }
