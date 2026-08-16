@@ -573,10 +573,20 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
 
 @Test func packageStatesTheFullPackageDelivery() {
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage)
-    #expect(md.contains("Package schema: `2.28`"))
+    #expect(md.contains("Package schema: `2.29`"))
     #expect(md.contains("DELIVERY: FULL PACKAGE"))
-    #expect(md.contains("listen to ALL available WAV audio assets in `audio/`"))
+    #expect(md.contains("listen to ALL available track WAV assets in `audio/`"))
     #expect(!md.contains("DELIVERY: THIS DOCUMENT ONLY"))
+}
+/// The bounced Stereo Out is mandatory before the UI opens AI Package because only the sum proves overall balance,
+/// masking and master-chain results. A full package must explicitly send the model to that file, not list only tracks.
+@Test func fullPackageRequiresListeningToTheBouncedMix() {
+    let mix = MixBounceAsset(relativePath: "mix/song.wav", durationSeconds: .known(60), sampleRate: .known(48000), channels: .known(2), bitDepth: .known(24), format: .known("PCM"), bounceSettings: nil, metrics: nil)
+    let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: .fullPackage, mix: mix)
+    #expect(md.contains("the bounced Stereo Out mix in `mix/`"))
+    #expect(md.contains("listen first to the bounced Stereo Out mix in `mix/`"))
+    #expect(md.contains("Finally return to the mix"))
+    #expect(md.contains("never substitute an inference from isolated tracks for listening to the sum"))
 }
 /// A live run mixed the two deliveries: the user pasted the Copy-for-AI text AND attached the Save-Package ZIP. Each variant
 /// honestly asserted its own mode, so the pasted text ordered the model to ignore audio that was really there. Both variants
@@ -665,9 +675,8 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     // same snapshot as is — no retargeting, exactly like a model that copied it.
     #expect(CommandValidator().validate(plan, against: fixture()).allSatisfy { $0.status == .valid })
 }
-/// Models copy the example verbatim, so it must target a real track from the same document with its real current values —
-/// a placeholder id validates only as requires_probe. A snapshot without a known Volume+Pan track cannot fabricate current
-/// values, so the static example remains as the fallback there.
+/// Models copy the example verbatim, so it must target a real track from the same document with its real current values.
+/// Partial facts produce only the action they prove; no control facts produce an empty plan, never a phantom track.
 @Test func packageExampleTargetsARealTrackAndValidatesAgainstTheSameSnapshot() throws {
     let snapshot = fixture()
     let md = AIPackageGenerator().make(snapshot: snapshot, sessionID: "t")
@@ -678,8 +687,17 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     #expect(plan.actions.allSatisfy { $0.target.trackID == "channel_aux_1" }) // the fixture's one known Volume+Pan track
     let validated = CommandValidator().validate(plan, against: snapshot)
     #expect(validated.allSatisfy { $0.status == .valid }, "\(validated.map { "\($0.id): \($0.status.rawValue) — \($0.message)" })")
-    let fallback = AIPackageGenerator().make(snapshot: normalize(headers: [headerNode("h1", "Track 1 “Vox”")], strips: []), sessionID: "t")
-    #expect(fallback.contains("\"trackID\": \"track_2\""))
+    var volumeOnly = fixture()
+    volumeOnly.tracks[0].channel?.pan = .unavailable
+    let partialJSON = try #require(AIPackageGenerator().make(snapshot: volumeOnly, sessionID: "t").components(separatedBy: "```json").last?.components(separatedBy: "```").first)
+    let partialPlan = try JSONDecoder().decode(MixPlan.self, from: Data(partialJSON.utf8))
+    #expect(partialPlan.actions.map(\.action) == [.setVolume])
+    #expect(CommandValidator().validate(partialPlan, against: volumeOnly).allSatisfy { $0.status == .valid })
+    let blind = normalize(headers: [headerNode("h1", "Track 1 “Vox”")], strips: [])
+    let fallbackJSON = try #require(AIPackageGenerator().make(snapshot: blind, sessionID: "t").components(separatedBy: "```json").last?.components(separatedBy: "```").first)
+    let fallbackPlan = try JSONDecoder().decode(MixPlan.self, from: Data(fallbackJSON.utf8))
+    #expect(fallbackPlan.actions.isEmpty)
+    #expect(!fallbackJSON.contains("track_2"))
 }
 /// `reason` is the one human-readable field inside the JSON — the Review screen shows it to the user under each action —
 /// so the blanket "JSON stays English" rule needs an explicit exception in both places the document teaches the format,
@@ -1424,7 +1442,7 @@ private let minus18RMSAmplitude = pow(10.0, -18.0 / 20.0) * 2.0.squareRoot()
     let raw = audioSnapshot()
     let (assets, _) = AudioMetricsAnalyzer().attach(to: extractAudio(raw, dir: dir), audioDirectory: dir, cache: [:])
     let md = AIPackageGenerator().make(snapshot: SnapshotNormalizer().normalize(raw), sessionID: "t", audio: assets)
-    #expect(md.contains("Package schema: `2.28`"))
+    #expect(md.contains("Package schema: `2.29`"))
     #expect(md.components(separatedBy: "- Audio metrics (computed locally, facts):").count == 2) // exactly one asset is exported
     #expect(md.contains(" LUFS")); #expect(md.contains(" dBTP"))
     #expect(md.contains("Integrated loudness (BS.1770-4): known: -18.0 LUFS"))
