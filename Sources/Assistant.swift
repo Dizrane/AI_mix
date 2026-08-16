@@ -50,6 +50,20 @@ enum AssistantPolling {
     static func nextInterval(after interval: TimeInterval) -> TimeInterval { min(interval * 1.5, maximumInterval) }
 }
 
+/// Proof that a turn really finished. A settled thread status alone is not it: right after a message is sent the
+/// platform may still report the settled status the thread held BEFORE the send (the transition back to a working
+/// status is asynchronous), and polling that trusted the status alone would grab the previous transcript and report
+/// a false "the model returned no MixGraph" failure. A turn is complete only when the thread has settled AND the
+/// transcript carries more non-empty assistant replies than it had when the message went out.
+enum AssistantSettling {
+    static func turnComplete(status: String, assistantReplies: Int, repliesBeforeSend: Int) -> Bool {
+        CapyThreadStatus.settled.contains(status) && assistantReplies > repliesBeforeSend
+    }
+    static func assistantReplyCount(_ messages: [CapyMessage]) -> Int {
+        messages.filter { $0.source == "assistant" && !$0.text.isEmpty }.count
+    }
+}
+
 /// The saved conversation: which package went out, what the model answered, which thread carried it — everything
 /// needed to reproduce the analysis later. The API key is deliberately not part of this record.
 struct AssistantDialogRecord: Codable, Sendable {
@@ -103,7 +117,7 @@ struct AssistantDialogRecord: Codable, Sendable {
         assistantBusy = false; assistantStatus = ""; assistantThreadID = nil; assistantThreadStatus = ""
         assistantTranscript = []; assistantAwaitingConfirmation = false; assistantConfirmationText = ""
         assistantConfirmationSent = false; assistantGraphReady = false; assistantGraphIssues = []
-        assistantFailure = nil; assistantCanResumePolling = false
+        assistantFailure = nil; assistantCanResumePolling = false; assistantRepliesBeforeSend = 0
     }
 
     /// Sends the API-delivery package into a fresh Capy thread and polls until the model's stage 1–4 reply settles.
@@ -128,7 +142,7 @@ struct AssistantDialogRecord: Codable, Sendable {
                 log.append("Capy thread created (\(thread.id), model \(model.modelId)\(model.reasoningMode.map { ", reasoning \($0)" } ?? "")); package sent (API delivery).")
                 try await runAssistantTurn(client: client)
             } catch { assistantHandle(error) }
-            assistantBusy = false
+            if !Task.isCancelled { assistantBusy = false }
         }
     }
 
@@ -158,7 +172,7 @@ struct AssistantDialogRecord: Codable, Sendable {
         assistantBusy = true
         assistantWork = Task {
             do { try await runAssistantTurn(client: CapyAPIClient(apiKey: key)) } catch { assistantHandle(error) }
-            assistantBusy = false
+            if !Task.isCancelled { assistantBusy = false }
         }
     }
 
@@ -167,6 +181,7 @@ struct AssistantDialogRecord: Codable, Sendable {
         guard let key = CapyKeyStore().load(), !key.isEmpty else { assistantStatus = "No Capy API key. Add one in Settings → AI."; return }
         assistantAwaitingConfirmation = false
         assistantConfirmationSent = true
+        assistantRepliesBeforeSend = AssistantSettling.assistantReplyCount(assistantTranscript)
         assistantFailure = nil; assistantGraphIssues = []
         assistantBusy = true
         assistantStatus = "Sending the reply\u{2026}"
@@ -176,28 +191,44 @@ struct AssistantDialogRecord: Codable, Sendable {
                 try await client.sendMessage(threadID: id, text: text)
                 try await runAssistantTurn(client: client)
             } catch { assistantHandle(error) }
-            assistantBusy = false
+            if !Task.isCancelled { assistantBusy = false }
         }
     }
 
-    /// One turn of the conversation: poll the thread to a settled status (bounded intervals, named total ceiling),
-    /// refresh and persist the transcript, then either present stages 1–4 for confirmation or extract the MixGraph.
+    /// One turn of the conversation: poll the thread until `AssistantSettling.turnComplete` — a settled status PLUS
+    /// a new assistant reply in the transcript, because right after a send the status can still be the pre-send
+    /// settled one — then persist the transcript and either present stages 1–4 for confirmation or extract the
+    /// MixGraph. Intervals are bounded, the total ceiling is named, and a cancelled turn stops writing state at the
+    /// first opportunity.
     private func runAssistantTurn(client: CapyAPIClient) async throws {
         guard let id = assistantThreadID else { return }
         var interval = AssistantPolling.initialInterval
         let deadline = Date().addingTimeInterval(AssistantPolling.totalTimeout)
         while true {
             let thread = try await client.thread(id: id)
+            try Task.checkCancellation()
             assistantThreadStatus = thread.status
-            if CapyThreadStatus.settled.contains(thread.status) { break }
+            if thread.status == "error" {
+                if let transcript = try? await client.fullTranscript(threadID: id) { assistantTranscript = transcript }
+                await persistAssistantDialog()
+                throw CapyAPIError.threadFailed
+            }
+            if CapyThreadStatus.settled.contains(thread.status) {
+                let transcript = try await client.fullTranscript(threadID: id)
+                try Task.checkCancellation()
+                if AssistantSettling.turnComplete(status: thread.status, assistantReplies: AssistantSettling.assistantReplyCount(transcript), repliesBeforeSend: assistantRepliesBeforeSend) {
+                    assistantTranscript = transcript
+                    break
+                }
+                // Settled, but no reply newer than the send: the platform has not picked the message up yet, so this
+                // is the pre-send status — keep polling instead of extracting from the previous transcript.
+            }
             assistantStatus = "The model is working (thread status: \(thread.status))\u{2026}"
             guard Date() < deadline else { throw CapyAPIError.pollTimeout(minutes: Int(AssistantPolling.totalTimeout / 60)) }
             try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             interval = AssistantPolling.nextInterval(after: interval)
         }
-        assistantTranscript = try await client.fullTranscript(threadID: id)
         await persistAssistantDialog()
-        if assistantThreadStatus == "error" { throw CapyAPIError.threadFailed }
         if assistantConfirmationSent {
             await assistantExtractGraph()
         } else {
@@ -240,8 +271,11 @@ struct AssistantDialogRecord: Codable, Sendable {
         log.append("Assistant delivered a valid MixGraph (\(graph.tracks.count) tracks); loaded on the Render screen.")
     }
 
+    /// A cancelled task writes nothing here: `resetAssistantState()` already published the state a cancellation
+    /// leaves behind, and a stale "cancelled" line (or a cancellation surfacing as a network error) must never
+    /// overwrite what a fresh analysis has published since.
     private func assistantHandle(_ error: Error) {
-        if error is CancellationError { assistantStatus = "Assistant conversation cancelled."; return }
+        guard !(error is CancellationError), !Task.isCancelled else { return }
         let message = error.localizedDescription
         assistantFailure = message
         assistantStatus = ""

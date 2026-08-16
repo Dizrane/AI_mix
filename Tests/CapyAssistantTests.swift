@@ -104,6 +104,26 @@ private func client(_ transport: FakeTransport, key: String = "test-key") -> Cap
     #expect(AssistantPolling.totalTimeout == 15 * 60)
 }
 
+// MARK: - Turn completion (a settled status alone is not proof)
+
+@Test func aSettledStatusAloneDoesNotCompleteATurn() {
+    // Right after a send the thread can still report the PRE-send settled status; without a new reply the turn is not over.
+    #expect(!AssistantSettling.turnComplete(status: "pending_user", assistantReplies: 1, repliesBeforeSend: 1))
+    #expect(AssistantSettling.turnComplete(status: "pending_user", assistantReplies: 2, repliesBeforeSend: 1))
+    #expect(AssistantSettling.turnComplete(status: "idle", assistantReplies: 1, repliesBeforeSend: 0))
+    #expect(!AssistantSettling.turnComplete(status: "active", assistantReplies: 2, repliesBeforeSend: 1))
+    #expect(!AssistantSettling.turnComplete(status: "waiting", assistantReplies: 2, repliesBeforeSend: 1))
+}
+@Test func assistantReplyCountIgnoresUserToolAndEmptyMessages() {
+    let messages = [
+        CapyMessage(id: "m1", source: "user", tool: nil, text: "package", createdAt: "t"),
+        CapyMessage(id: "m2", source: "assistant", tool: nil, text: "", createdAt: "t"),
+        CapyMessage(id: "m3", source: "tool", tool: "bash", text: "swift test", createdAt: "t"),
+        CapyMessage(id: "m4", source: "assistant", tool: nil, text: "stages 1-4", createdAt: "t"),
+    ]
+    #expect(AssistantSettling.assistantReplyCount(messages) == 1)
+}
+
 // MARK: - Fenced json extraction
 
 @Test func lastJSONBlockWinsAmongSeveral() {
