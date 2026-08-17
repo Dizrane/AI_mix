@@ -238,7 +238,7 @@ private func exportedAsset(_ id: String, name: String, file: String) -> AudioAss
 
 @Test func apiDeliveryTeachesTheMixGraphContractInsteadOfTheMixPlan() {
     let md = AIPackageGenerator().make(snapshot: apiFixture(), sessionID: "t", audio: [exportedAsset("a1", name: "Beat", file: "Beat.wav"), exportedAsset("a2", name: "Vocal", file: "Vocal.wav")], plugins: installed, delivery: .apiDelivery)
-    #expect(md.contains("Package schema: `2.31`"))
+    #expect(md.contains("Package schema: `2.32`"))
     #expect(md.contains("DELIVERY: API (TEXT ONLY)"))
     #expect(md.contains("## MixGraph response contract (machine-validated)"))
     #expect(md.contains("only from entries whose identifier starts with `aufx/`"))

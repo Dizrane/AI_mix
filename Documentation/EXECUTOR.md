@@ -1,5 +1,7 @@
 # Executor
 
+> The Review stage that hosts this executor is hidden from the shipped UI: the interface ends at the offline Render stage, so no visible control can start a DRY RUN or LIVE queue. Everything below is preserved in code and tests, unchanged and unreachable from the interface.
+
 Execution is sequential and result-oriented. `SafeExecutor` routes plan actions by mode:
 
 - **READ ONLY / DRY RUN** — never mutate Logic. A valid action reports `dry_run`; an invalid one reports `not_executed` with the validator's message. DRY RUN is the UI default.

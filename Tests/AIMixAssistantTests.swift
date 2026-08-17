@@ -661,7 +661,7 @@ private func writeWAV(_ url: URL, seconds: Double = 0.5, sampleRate: Double = 44
     let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t")
     #expect(md.contains("EXACTLY ONE fenced json code block"))
     #expect(md.contains("in the language the user writes to you in"))
-    #expect(md.contains("Number the questions and propose a concrete default"))
+    #expect(md.contains("number the questions and propose a concrete default"))
     #expect(md.contains("Graph composition rules:"))
     #expect(md.contains("Account for every ISSUE"))
     #expect(md.contains("Every gain move is justified by the measured metrics"))
@@ -1876,12 +1876,17 @@ private final class FakeClampedFader {
     #expect(reason.contains("Rescan and validate the plan again"))
 }
 
-@Test func packageDescribesLiveExecutionHonestly() {
-    for delivery in [PackageDelivery.markdownOnly, .fullPackage] {
+/// The live path is hidden from the UI, so the shipped documents must not describe DRY RUN / LIVE execution at all —
+/// a document teaching controls the user cannot see is dishonest. The only execution claim left is the offline
+/// render's own: nothing renders (and nothing touches Logic) until the user explicitly presses Render.
+@Test func packageDescribesExecutionHonestlyWithTheLivePathHidden() {
+    for delivery in [PackageDelivery.markdownOnly, .fullPackage, .apiDelivery] {
         let md = AIPackageGenerator().make(snapshot: fixture(), sessionID: "t", delivery: delivery)
-        #expect(md.contains("By default (DRY RUN) the application executes nothing")) // stage-5 description matches the shipped executor
-        #expect(md.contains("By default (DRY RUN) nothing is written to Logic Pro"))
-        #expect(!md.contains("the application never modifies Logic")) // the pre-LIVE claim must be gone
+        #expect(!md.contains("DRY RUN")) // the hidden Review screen's modes must not be taught
+        #expect(!md.contains("By default (DRY RUN) nothing is written to Logic Pro"))
+        #expect(md.contains("only when the user explicitly presses Render"))
+        #expect(md.contains("nothing renders automatically"))
+        #expect(!md.contains("the application never modifies Logic")) // the pre-LIVE claim must stay gone
     }
 }
 
