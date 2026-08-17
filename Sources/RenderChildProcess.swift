@@ -54,8 +54,8 @@ enum RenderChildProcess {
 
     /// One full child render: writes the graph JSON next to the output, clears any stale result file, launches the
     /// app's own binary with the `mix-render` subcommand, waits (with the timeout above), and classifies the outcome
-    /// from the result file and the termination facts. Runs synchronously — call it off the main thread.
-    static func render(graph: MixGraph, audioFolder: URL, outputURL: URL, graphURL: URL, resultURL: URL) -> Result<RenderChildSuccess, RenderChildFailure> {
+    /// from the result file and the termination facts.
+    static func render(graph: MixGraph, audioFolder: URL, outputURL: URL, graphURL: URL, resultURL: URL) async -> Result<RenderChildSuccess, RenderChildFailure> {
         guard let executable = Bundle.main.executableURL else {
             return .failure(.init(message: "The app's own executable could not be located, so the render child process cannot be launched."))
         }
@@ -65,9 +65,9 @@ enum RenderChildProcess {
         try? FileManager.default.removeItem(at: resultURL)
         let run: RenderChildRun
         do {
-            run = try launchAndWait(executable: executable,
-                                    arguments: ["mix-render", audioFolder.path, graphURL.path, "--output", outputURL.path, "--result", resultURL.path],
-                                    timeoutSeconds: timeoutSeconds)
+            run = try await launchAndWait(executable: executable,
+                                          arguments: ["mix-render", audioFolder.path, graphURL.path, "--output", outputURL.path, "--result", resultURL.path],
+                                          timeoutSeconds: timeoutSeconds)
         } catch {
             return .failure(error as? RenderChildFailure ?? .init(message: error.localizedDescription))
         }
@@ -117,11 +117,29 @@ enum RenderChildProcess {
         var standardError: String
     }
 
-    /// Runs the child, draining stdout and stderr concurrently (a full pipe buffer would otherwise deadlock a chatty
-    /// child against a waiting parent), and enforces the timeout with SIGKILL — a hung plugin may ignore SIGTERM, and
-    /// the result file, not the exit, is the completion sentinel, so nothing of value is lost by killing hard.
-    /// Throws `RenderChildFailure` only when the process cannot be launched at all.
-    static func launchAndWait(executable: URL, arguments: [String], timeoutSeconds: Double) throws -> RenderChildRun {
+    /// How long the supervisor still waits after SIGKILL for the termination callback, and after termination for the
+    /// pipes' EOF. Deliberately short and, above all, FINITE: every wait in the supervisor is bounded, so a broken
+    /// callback or a lost EOF degrades into a named outcome with partial output instead of a hang.
+    private static let supervisorGraceSeconds: Double = 10
+
+    /// Runs the child and waits for it, asynchronously: the blocking waits (semaphores, pipe reads) run on a GCD
+    /// utility thread, never on the Swift Concurrency cooperative pool — parking a cooperative thread would starve
+    /// every other task in the process (in the app and, worse, in the test runner, where a handful of blocked tests
+    /// freeze the whole suite). Stdout and stderr are drained concurrently (a full pipe buffer would otherwise
+    /// deadlock a chatty child against a waiting parent), the timeout is enforced with SIGKILL — a hung plugin may
+    /// ignore SIGTERM, and the result file, not the exit, is the completion sentinel, so nothing of value is lost by
+    /// killing hard — and every wait is bounded. Throws `RenderChildFailure` only when the process cannot be
+    /// launched at all.
+    static func launchAndWait(executable: URL, arguments: [String], timeoutSeconds: Double) async throws -> RenderChildRun {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(with: supervise(executable: executable, arguments: arguments, timeoutSeconds: timeoutSeconds))
+            }
+        }
+    }
+
+    /// The blocking supervisor body; runs entirely on one GCD thread.
+    private static func supervise(executable: URL, arguments: [String], timeoutSeconds: Double) -> Result<RenderChildRun, RenderChildFailure> {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
@@ -133,35 +151,47 @@ enum RenderChildProcess {
         let finished = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in finished.signal() }
         do { try process.run() }
-        catch { throw RenderChildFailure(message: "The render child process could not be launched (\(executable.path)): \(error.localizedDescription)") }
+        catch { return .failure(.init(message: "The render child process could not be launched (\(executable.path)): \(error.localizedDescription)")) }
         standardOutput.startDraining()
         standardError.startDraining()
         var timedOut = false
         if finished.wait(timeout: .now() + timeoutSeconds) == .timedOut {
             timedOut = true
             kill(process.processIdentifier, SIGKILL)
-            finished.wait() // SIGKILL cannot be caught or ignored; termination follows promptly.
+            // SIGKILL cannot be caught or ignored, so termination follows promptly — but the wait for the callback
+            // is still bounded: a lost callback yields the honest timeout outcome instead of hanging forever.
+            _ = finished.wait(timeout: .now() + supervisorGraceSeconds)
         }
         let termination: RenderChildTermination = timedOut
             ? .timedOut(seconds: timeoutSeconds)
             : (process.terminationReason == .uncaughtSignal ? .signalled(signal: process.terminationStatus) : .exited(code: process.terminationStatus))
-        return RenderChildRun(termination: termination, standardOutput: standardOutput.drainedText(), standardError: standardError.drainedText())
+        return .success(RenderChildRun(termination: termination,
+                                       standardOutput: standardOutput.drainedText(timeoutSeconds: supervisorGraceSeconds),
+                                       standardError: standardError.drainedText(timeoutSeconds: supervisorGraceSeconds)))
     }
 
-    /// One pipe whose read end is drained to EOF on a background queue while the parent waits for the child. The
-    /// semaphore orders the single write of `collected` before the single read, so the type is safely Sendable.
+    /// One pipe whose read end is drained on a background queue while the parent waits for the child. The lock
+    /// guards `collected` between the draining thread and the final read; the semaphore marks EOF. The final read is
+    /// bounded: if EOF never arrives (nothing on a healthy system holds the write end open after the child died,
+    /// but the supervisor refuses to bet a hang on it), whatever was collected so far is returned.
     private final class DrainedPipe: @unchecked Sendable {
         let pipe = Pipe()
+        private let lock = NSLock()
         private var collected = Data()
         private let finished = DispatchSemaphore(value: 0)
         func startDraining() {
             DispatchQueue.global(qos: .utility).async {
-                self.collected = self.pipe.fileHandleForReading.readDataToEndOfFile()
+                while true {
+                    let chunk = self.pipe.fileHandleForReading.availableData // blocks until data or EOF
+                    if chunk.isEmpty { break }
+                    self.lock.lock(); self.collected.append(chunk); self.lock.unlock()
+                }
                 self.finished.signal()
             }
         }
-        func drainedText() -> String {
-            finished.wait()
+        func drainedText(timeoutSeconds: Double) -> String {
+            _ = finished.wait(timeout: .now() + timeoutSeconds)
+            lock.lock(); defer { lock.unlock() }
             return String(data: collected, encoding: .utf8) ?? ""
         }
     }

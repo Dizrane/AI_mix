@@ -72,9 +72,7 @@ struct RenderGraphRejection: Error { let message: String }
             let outputURL = renderDir.appendingPathComponent("mix.wav")
             let graphURL = renderDir.appendingPathComponent("mixgraph.json")
             let resultURL = renderDir.appendingPathComponent("render_result.json")
-            let outcome = await Task.detached(priority: .userInitiated) { () -> Result<RenderChildSuccess, RenderChildFailure> in
-                RenderChildProcess.render(graph: graph, audioFolder: audioDir, outputURL: outputURL, graphURL: graphURL, resultURL: resultURL)
-            }.value
+            let outcome = await RenderChildProcess.render(graph: graph, audioFolder: audioDir, outputURL: outputURL, graphURL: graphURL, resultURL: resultURL)
             switch outcome {
             case .success(let success):
                 var result = success.result

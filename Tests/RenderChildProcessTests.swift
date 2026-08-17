@@ -106,28 +106,28 @@ private func writeConstantStereoWAV(_ url: URL, frames: Int, amplitude: Float) t
 
 // MARK: - Launch plumbing (real child processes, no plugins)
 
-@Test func launchCollectsExitCodeStdoutAndStderr() throws {
-    let run = try RenderChildProcess.launchAndWait(executable: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", "echo out; echo err >&2; exit 3"], timeoutSeconds: 60)
+@Test func launchCollectsExitCodeStdoutAndStderr() async throws {
+    let run = try await RenderChildProcess.launchAndWait(executable: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", "echo out; echo err >&2; exit 3"], timeoutSeconds: 30)
     #expect(run.termination == .exited(code: 3))
     #expect(run.standardOutput.contains("out"))
     #expect(run.standardError.contains("err"))
 }
 
-@Test func launchReportsAnUncaughtSignal() throws {
-    let run = try RenderChildProcess.launchAndWait(executable: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", "kill -ABRT $$"], timeoutSeconds: 60)
+@Test func launchReportsAnUncaughtSignal() async throws {
+    let run = try await RenderChildProcess.launchAndWait(executable: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", "kill -ABRT $$"], timeoutSeconds: 30)
     #expect(run.termination == .signalled(signal: SIGABRT))
 }
 
-@Test func launchKillsAHungChildAtTheTimeout() throws {
+@Test func launchKillsAHungChildAtTheTimeout() async throws {
     let started = Date()
-    let run = try RenderChildProcess.launchAndWait(executable: URL(fileURLWithPath: "/bin/sleep"), arguments: ["60"], timeoutSeconds: 1)
+    let run = try await RenderChildProcess.launchAndWait(executable: URL(fileURLWithPath: "/bin/sleep"), arguments: ["60"], timeoutSeconds: 1)
     #expect(run.termination == .timedOut(seconds: 1))
     #expect(Date().timeIntervalSince(started) < 30)
 }
 
-@Test func launchRefusesAMissingExecutableByName() {
-    #expect(throws: RenderChildFailure.self) {
-        _ = try RenderChildProcess.launchAndWait(executable: URL(fileURLWithPath: "/nonexistent/binary"), arguments: [], timeoutSeconds: 1)
+@Test func launchRefusesAMissingExecutableByName() async {
+    await #expect(throws: RenderChildFailure.self) {
+        _ = try await RenderChildProcess.launchAndWait(executable: URL(fileURLWithPath: "/nonexistent/binary"), arguments: [], timeoutSeconds: 1)
     }
 }
 
