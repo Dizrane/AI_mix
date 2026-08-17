@@ -210,7 +210,9 @@ struct ApplicationLauncher: Sendable {
         default: WorkflowStage(rawValue: target.rawValue - 1).map(isComplete) ?? true
         }
     }
-    func go(to target: WorkflowStage) { if isAvailable(target) { stage = target } }
+    /// Navigation accepts only stages the interface exposes: the hidden Review stage (live execution) is unreachable
+    /// even programmatically, so no code path can land the UI on it.
+    func go(to target: WorkflowStage) { if WorkflowStage.visible.contains(target) && isAvailable(target) { stage = target } }
     @Published var scanProgress = 0
     private var scanWork: Task<RawSnapshot, Error>?
     /// The AX scan and normalization run off the main thread so the UI stays responsive; progress streams back and Cancel aborts cooperatively.

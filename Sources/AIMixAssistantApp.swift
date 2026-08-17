@@ -18,10 +18,15 @@ struct AIMixAssistantApp: App {
 
 // MARK: - Workflow model
 
-/// Only stages with a working backend are exposed. Execution lives inside Review: the validated plan can be dry-run
-/// (default, writes nothing) or executed LIVE through the verified channel-strip adapter after explicit confirmation.
+/// Only stages with a working backend are exposed. The UI ships the offline path alone: the workflow ends at Render.
+/// The Review stage — MixPlan validation, DRY RUN / LIVE execution in Logic and the post-apply verification — is
+/// hidden from the interface (`visible` below excludes it) while all of its code stays in place, so nothing in the
+/// shipped UI writes to Logic Pro.
 enum WorkflowStage: Int, CaseIterable, Identifiable {
     case connection, analysis, audio, aiPackage, assistant, render, review
+    /// The stages the interface exposes, in order. Review (the live-execution path into Logic) is deliberately not
+    /// shown: the sidebar, navigation and stage footers all use this list, so the live UI is unreachable, not deleted.
+    static let visible: [WorkflowStage] = allCases.filter { $0 != .review }
     var id: Int { rawValue }
     var number: String { String(format: "%02d", rawValue + 1) }
     var title: String { switch self { case .connection: "Connection"; case .analysis: "Analysis"; case .audio: "Audio"; case .aiPackage: "AI Package"; case .assistant: "Assistant"; case .render: "Render"; case .review: "Review" } }
@@ -200,7 +205,7 @@ struct Sidebar: View {
         VStack(alignment: .leading, spacing: 3) {
             Text("AI Mix Assistant").font(.system(.headline, design: .rounded)).padding(.bottom, 2)
             Text("Semi-automatic Logic Pro mixing").font(.caption).foregroundStyle(.secondary).padding(.bottom, 10)
-            ForEach(WorkflowStage.allCases) { stage in StepRow(stage: stage) }
+            ForEach(WorkflowStage.visible) { stage in StepRow(stage: stage) }
             Spacer()
             VStack(alignment: .leading, spacing: 8) {
                 StatusRow("Accessibility", model.connection.accessibilityTrusted ? "Granted" : "Required", model.connection.accessibilityTrusted ? .ok : .warn)
@@ -608,7 +613,6 @@ struct RenderScreen: View {
                     HStack { Button("Open Render Folder") { model.openRenderFolder() }; Spacer() }
                 }
             }
-            StageFooter(title: "Continue to Review", enabled: model.isAvailable(.review)) { model.go(to: .review) }
         }
     }
 }
