@@ -1,6 +1,6 @@
 # AI Mix Assistant
 
-macOS SwiftUI application foundation for a safe, LLM-directed Logic Pro mixing workflow. It is deliberately not a mixing expert system: musical judgement belongs to an external LLM; the app captures facts, validates a plan and executes only verified adapters.
+macOS SwiftUI application foundation for a safe, LLM-directed Logic Pro mixing workflow. It is deliberately not a mixing expert system: musical judgement belongs to an external LLM; the app captures facts, dry-validates the model's MixGraph and renders the mix offline with its own engine. A validated live-execution path into Logic exists in the codebase but is hidden from the interface — the shipped workflow ends at the Render stage and writes nothing to Logic Pro.
 
 ## Install (prebuilt app)
 
@@ -21,7 +21,7 @@ The test target uses Swift Testing (`import Testing`), which ships with the Swif
 
 - Analyzer and probes only call AX read APIs.
 - Unknown data remains `unknown`, `unavailable`, or `requires_probe`.
-- Default mode is READ ONLY. DRY RUN never mutates Logic.
-- LIVE executes only what is verified: the five channel-strip actions (`set_volume`, `set_pan`, `set_mute`, `set_solo`, and `set_send_level` on sends whose knob scale a scan proved) through documented AX mechanisms — AXPress for the switches, AXValue writes for the faders — each write calibrated against the strip's own displayed value (Logic's fader publishes raw units, so the scale is proven per control, never assumed), re-read afterwards and rolled back when it does not verify. LIVE requires an explicit mode choice plus a per-run confirmation; only validator-approved actions run; a failed action halts the queue and a fresh scan shows what really changed. Every other action still fails safely: no unverified write adapter exists.
+- The interface ships the offline path alone: the workflow ends at the Render stage, whose engine mixes the exported WAVs outside Logic and starts only on the explicit Render press. Nothing in the visible UI writes to Logic Pro.
+- The Review stage (MixPlan validation, DRY RUN / LIVE execution, post-apply verification) is hidden from the UI, its code preserved and tested. In that code, READ ONLY / DRY RUN never mutates Logic, and LIVE executes only what is verified: the five channel-strip actions (`set_volume`, `set_pan`, `set_mute`, `set_solo`, and `set_send_level` on sends whose knob scale a scan proved) through documented AX mechanisms — AXPress for the switches, AXValue writes for the faders — each write calibrated against the strip's own displayed value (Logic's fader publishes raw units, so the scale is proven per control, never assumed), re-read afterwards and rolled back when it does not verify. LIVE requires an explicit mode choice plus a per-run confirmation; only validator-approved actions run; a failed action halts the queue and a fresh scan shows what really changed. Every other action still fails safely: no unverified write adapter exists.
 
 See `Documentation/` for the architecture and schemas.
