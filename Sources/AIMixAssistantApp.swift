@@ -1,12 +1,12 @@
 import SwiftUI
 
-/// Process entry point. Debug builds accept the `mix-render` lab subcommand (offline MixEngine render, no UI, no
-/// Logic) before any app machinery starts; every other launch — and every release build — runs the SwiftUI app.
+/// Process entry point. Every build accepts the `mix-render` subcommand (offline MixEngine render, no UI, no Logic)
+/// before any app machinery starts: the Render stage launches the app's OWN binary with it, so each render runs in a
+/// short-lived child process and a plugin crash — at load, processing, or Audio Unit teardown — kills only that
+/// child, never the UI (see `RenderChildProcess`). Every other launch runs the SwiftUI app.
 @main enum AIMixAssistantMain {
     @MainActor static func main() {
-        #if DEBUG
         MixEngineCLI.runAndExitIfRequested(arguments: Array(CommandLine.arguments.dropFirst()))
-        #endif
         AIMixAssistantApp.main()
     }
 }
